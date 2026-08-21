@@ -953,8 +953,8 @@ def parse_args() -> argparse.Namespace:
         child.add_argument("--output", type=Path, required=True)
         child.add_argument("--cwd", type=Path, default=REPO)
     benchmark = subparsers.choices["benchmark"]
-    benchmark.add_argument("--pairs", type=int, default=15)
-    benchmark.add_argument("--warmup-pairs", type=int, default=3)
+    benchmark.add_argument("--pairs", type=int, default=32)
+    benchmark.add_argument("--warmup-pairs", type=int, default=4)
     benchmark.add_argument("--cell", action="append")
     args = parser.parse_args()
     args.binary = args.binary.resolve(strict=True)
@@ -964,8 +964,11 @@ def parse_args() -> argparse.Namespace:
     args.cwd = args.cwd.resolve(strict=True)
     args.output = args.output.resolve()
     args.started_unix = time.time()
-    if args.mode == "benchmark" and (args.pairs <= 0 or args.warmup_pairs < 0):
-        parser.error("pair counts must be positive/non-negative")
+    if args.mode == "benchmark":
+        if args.pairs < 32 or args.pairs % 4 != 0:
+            parser.error("formal pair count must be at least 32 and divisible by 4")
+        if args.warmup_pairs < 0:
+            parser.error("warmup pair count must be non-negative")
     return args
 
 

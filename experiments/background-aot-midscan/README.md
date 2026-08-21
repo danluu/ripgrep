@@ -18,7 +18,8 @@ The experiment asks two separate questions:
 2. **Does it make a fresh ordinary query faster?** `benchmark` launches a new
    process for every arm and runs the deliberately unregistered expression
    `a{0,99}b`. It compares the same candidate binary with the flag off and on,
-   in alternating AB/BA pairs. No application AOT cache is involved.
+   as adjacent AB/BA samples inside balanced triads that also time unmodified
+   upstream ripgrep. No application AOT cache is involved.
 
 The correctness gate is never a timing tool. The benchmark refuses to start if
 that environment variable is inherited and also removes it from every child
@@ -61,7 +62,7 @@ python3 experiments/background-aot-midscan/harness.py benchmark \
   --binary target/release/rg \
   --stock-binary /absolute/path/to/upstream/rg \
   --stock-source /absolute/path/to/upstream/source \
-  --pairs 31 --warmup-pairs 3 \
+  --pairs 32 --warmup-pairs 4 \
   --output experiments/background-aot-midscan/results/benchmark.json
 ```
 
