@@ -1,6 +1,316 @@
 # Background FRE AOT on actual queries: results
 
-## Conclusion
+## Current result: exact-Teddy V2 at `542b139` -- NO-GO
+
+The default-off exact-Teddy V2 experiment is correctness-qualified, but it is
+**not admission-ready**. Automatic selected no Teddy route in the frozen
+44-pattern intention-to-treat (ITT) cohort. Force selected and published the
+authenticated exact-Teddy route for the pre-timing 34-pattern compiler-fact
+stratum, but its pooled end-to-end ratio against the same candidate's normal
+path was only `0.979076567x`. The preregistered direct-viability threshold was
+`1.03x`. The answer is therefore **NO-GO**: leave V2 default-off and do not
+promote either the forced route or a derived automatic policy from these data.
+
+Force did materially improve the selected route relative to Automatic, which
+used the ordinary DFA, but that is not the deployment comparison. On the
+primary automatic-profile/default-thread count panel, the pooled selected-34
+Force/Automatic effect was `DN=1.452377920`, while Force versus normal remained
+below parity. The stock-normalized alignment statistic was `K=1.002264845`, so
+the observed Force effect is internally aligned; it simply does not make
+background AOT faster than normal ripgrep.
+
+This section records the complete authenticated chain: the initial census at
+`d0711c3`, the corrected qualification at `542b139`, formal Automatic-then-Force
+round 1, preregistered reverse-order Force-then-Automatic round 2, and the
+separate frozen FRE holdout at `9b19adf`. The older SelectedEnd and Span results
+remain below as historical baselines.
+
+### Census and qualification
+
+The result-blind `frozen-structural-44-v1` cohort contains 14 OOT and 30 wider
+patterns. Its ordered manifest SHA-256 is
+`35b0037122bf2ab9a2c1641a562f23f12b88856ceb66c713ceb9403adb541823`;
+the transported 212-case source manifest is
+`cf5960da72a770c96eb2a7e5532472f5feeca9df8214489d73baed9e35b1bb2e`.
+The selection transport itself is
+`8b18839dc473f4b3f8b7a0590e5e29964f9e748e09ca251de5440df748d7c888`.
+
+The first clean c9g census used ripgrep commit
+`d0711c31771f96b7ff68e831f00ec7e2c04eb822`, tree
+`9b9595d699a5d42adea9751532f9c6e8bc73b50c`, and binary
+`07a5c68de7f9a3bb3f8a98e3bc0b374855dbfa4382523fea320456470a78c7b7`.
+It discovered the stable per-profile compiler outcome: Force published Teddy
+for 34 cases, nine remained ready on `ordered_dfa`, and `wider-0121` declined
+at `compile_object`; Automatic published zero Teddy routes and retained all 44
+on `ordered_dfa`. The then-current harness classified the ten Force
+nonselections as invalid, so timing stopped. That discovery run was evidence,
+not qualification.
+
+Commit `542b139178eab59ea29781f4f413b0a5f0622e2d`, tree
+`e9e904f655c741135cea9f51a4441b000ba1045c`, corrected the fail-closed
+nonselection validation without changing the frozen cohort. A new isolated
+build produced candidate binary
+`7c11e0c5009d01bd2f19b754e100e0aa8e0ffaead75fd861272a6fa24d8c2d73`.
+The stock source remained clean `f9c05a949d1a0dc8e16dee28ca9605d38611faeb`,
+tree `ce81df4f8cad2dbfd1afb6b3ba53fd19846a5794`, binary
+`e6719a285a9a82442291f93032ed5a72c2be95fd0f53da65a9077dde2dffd933`.
+All direct FRE dependencies and lock entries pinned clean commit
+`d2b352b7a051628bbcf8afc7f23d1362a850cb25`, tree
+`fc129a6436035103c3f5d3c589127a08f93ab3a0`. The searched FRE corpus stayed
+at frozen commit `6f961465d00ff50f2096cfb05520c0653a87d2cd`.
+
+The corrected settled censuses were identical on `auto`, `asimd`, `sve`, and
+`sve2`:
+
+| Policy | Teddy | ready ordinary DFA | `compile_object` | invalid |
+|---|---:|---:|---:|---:|
+| Automatic | 0 | 44 | 0 | 0 |
+| Force | 34 | 9 | 1 | 0 |
+
+Force authenticated the exact hard-pinned selected-34 set (11 OOT/23 wider),
+and authenticated the exact nine-ready/one-decline complement. Its synthetic
+exact-Teddy gate strictly selected on every profile. Automatic and Force then
+each passed the complete 408-row qualification matrix: 14 default-output plus
+44 default-thread count plus 44 one-thread count cases per profile. All
+normal/background and stock/normal outputs and statuses matched; receipts,
+policy, target, source, binary, corpus, and manifest bindings passed; no fault,
+timeout, or unexpected temporary artifact occurred.
+
+Those policy probes were classification/correctness evidence, not performance
+runs. Their 408 historical-query rows and fixed exact-Teddy gates were run with
+timing collection disabled. The historical `542b139` probe implementation
+still sampled unused clock fields in the separate synthetic forced-midscan
+gate; no aggregate or formal timing consumed them. The current hygiene change
+passes `collect_timing=False` to all three forced-midscan arms as well, so
+future probe records contain no `elapsed_ns`, `user_ns`, or `system_ns` fields.
+Output, receipt, and midscan-cutover validation are unchanged.
+
+### Formal design and independent reconstruction
+
+Round 1 ran Automatic and then Force. The preregistered confirmation reversed
+the order: Force and then Automatic. Within every policy, profiles ran
+`auto`, `asimd`, `sve`, `sve2`; every row had two discarded warmup pairs and
+12 measured pairs in the same four-order stock/normal/background rotation.
+Each policy therefore contains 408 rows, 4,896 measured triplets and 14,688
+timed child invocations. The pinned harness control flow supplies another
+2,448 untabulated warmup invocations per policy. Across both orders, 58,752
+measured child invocations completed; the pinned control flow accounts for
+9,792 additional discarded warmup child invocations.
+
+For pattern `i` and policy `p`, the direct estimators are:
+
+```text
+R_i^p = median_k(normal_i,k^p / background_i,k^p)
+Q_i^p = median_k(stock_i,k^p / background_i,k^p)
+DN = GM_i(R_i^Force / R_i^Automatic)
+DS = GM_i(Q_i^Force / Q_i^Automatic)
+K  = DN / DS
+```
+
+`RA` and `RF` below are the equal-pattern geometric means of `R` under
+Automatic and Force. `K` is the stock-normalized alignment check; `DS` is not
+a control-drift estimate. Equal-order pooling first takes each pattern's
+geometric mean across rounds and only then takes the equal-pattern geometric
+mean. No pooled confidence interval was invented.
+
+Both standalone auditors recomputed every row median and complete public
+aggregate tree from private samples without importing the workload harness.
+They verified exact pair indices/order, all outputs and statuses, invocation
+counts, absence of timed receipts, probe/campaign/source/binary/corpus
+bindings, cross-policy workload identity, cross-generation identity, and the
+Automatic-Force/Force-Automatic chronology. Round 1 ended with
+`INDEPENDENT_FORMAL_AUDIT_OK`; the reverse audit ended with
+`INDEPENDENT_REVERSE_AUDIT_OK`. Recomputed/public floating differences were
+only cross-libm rounding, at most three ULP.
+
+### Pooled 12-cell ITT result
+
+This table contains all 12 profile/panel ITT cells. The output panel has the
+14 applicable OOT patterns; both count panels have all 44. Values are the
+equal-order pooled point estimates.
+
+| Profile | Panel | n | RA | RF | DN | DS | K |
+|---|---|---:|---:|---:|---:|---:|---:|
+| auto | default output | 14 | 0.944285350 | 0.988877985 | 1.047223686 | 1.027362328 | 1.019332379 |
+| auto | count, default threads | 44 | 0.632714891 | 0.853549785 | 1.349027496 | 1.344052176 | 1.003701731 |
+| auto | count, one thread | 44 | 0.427799327 | 0.676184058 | 1.580610384 | 1.581183024 | 0.999637841 |
+| asimd | default output | 14 | 0.994776396 | 0.980954916 | 0.986105943 | 1.009103861 | 0.977209562 |
+| asimd | count, default threads | 44 | 0.638944000 | 0.846291393 | 1.324515753 | 1.325599545 | 0.999182413 |
+| asimd | count, one thread | 44 | 0.427514050 | 0.664151095 | 1.553518755 | 1.553968065 | 0.999710863 |
+| sve | default output | 14 | 0.992905089 | 0.994395188 | 1.001500747 | 0.977008521 | 1.025068590 |
+| sve | count, default threads | 44 | 0.619825687 | 0.846179708 | 1.365189803 | 1.375149192 | 0.992757594 |
+| sve | count, one thread | 44 | 0.429952115 | 0.689240527 | 1.603063466 | 1.602948185 | 1.000071918 |
+| sve2 | default output | 14 | 0.976171181 | 1.022433684 | 1.047391793 | 0.974481847 | 1.074819194 |
+| sve2 | count, default threads | 44 | 0.755025681 | 0.889018169 | 1.177467458 | 1.169791474 | 1.006561840 |
+| sve2 | count, one thread | 44 | 0.585529742 | 0.741851861 | 1.266975539 | 1.266883279 | 1.000072825 |
+
+Force never clears the `RF >= 1.03` direct-viability threshold in an ITT
+cell. Its strongest pooled ITT point is the small SVE2 default-output cell at
+`1.022433684x`; every count cell remains below normal, often substantially.
+
+### Primary cell, compiler-fact strata, and uncertainty
+
+The preregistered primary cell is `auto/fre-count-default-threads`. Values are
+shown as `round 1 / reverse round 2 / equal-order pooled`:
+
+| Stratum | n | RF | DN | DS | K |
+|---|---:|---:|---:|---:|---:|
+| ITT | 44 | 0.855057087 / 0.852045140 / 0.853549785 | 1.351565724 / 1.346494034 / 1.349027496 | 1.329001325 / 1.359273478 / 1.344052176 | 1.016978463 / 0.990598328 / 1.003701731 |
+| Force-selected | 34 | 0.984197024 / 0.973982750 / 0.979076567 | 1.461916595 / 1.442901483 / 1.452377920 | 1.430860080 / 1.467564215 / 1.449095942 | 1.021704788 / 0.983194785 / 1.002264845 |
+| Force complement | 10 | 0.530028871 / 0.540705957 / 0.535340796 | 1.035015181 / 1.064375320 / 1.049592594 | 1.033906942 / 1.047417736 / 1.040640413 | 1.001071894 / 1.016189896 / 1.008602570 |
+
+Primary order changes were all under 5%: ITT `DN` and `RF` round-2/round-1
+ratios were `0.996247544` and `0.996477490`; selected-34 ratios were
+`0.986993026` and `0.989621718`; complement-10 ratios were `1.028366868` and
+`1.020144349`. No primary `DN` or `RF` estimate straddled 1 or the `1.03`
+viability cutoff. Primary ITT and selected-34 `K` did straddle 1 across the
+two orders, while staying in their `[0.97,1.03]` alignment band in both
+orders and pooled.
+
+Round 1 additionally received a transparent 10,000-draw conditional
+hierarchical percentile bootstrap. It resampled pattern IDs, then resampled
+the 12 complete normal/background/stock triplets jointly within each policy
+but independently across the two policy campaigns. The documentation
+reproduction uses the first eight bytes, interpreted as an unsigned
+big-endian integer, of
+`SHA256(ASCII("rg-aot-v2-r1-conditional-bootstrap-v1") || 0x00 ||
+decode_hex(automatic-private-sha256) ||
+decode_hex(force-private-sha256))`, where each decoded digest is exactly 32
+bytes. The resulting seed digest is
+`42f3d527eb892501e9a80a4a0746105ca2b1540b471d28de7c56ea47ce1adef3`,
+seed `4824433993276007681`. Targets are drawn in table order; within each draw,
+pattern indices precede Automatic triplet indices and then Force triplet
+indices. Percentiles use `round((10,000 - 1) * p)`, giving 0-based indices
+250 and 9749 after sorting 10,000 draws. This explicit seed is a documentation
+reproduction, not a change to the preregistered analysis. These intervals are
+**round-1 conditional intervals only**:
+
+| Estimate | Round-1 point | Conditional 95% interval |
+|---|---:|---:|
+| primary ITT RF | 0.855057 | [0.763303, 0.936292] |
+| primary ITT DN | 1.351566 | [1.219262, 1.494083] |
+| primary ITT DS | 1.329001 | [1.196312, 1.464352] |
+| primary ITT K | 1.016978 | [0.982807, 1.057480] |
+| selected-34 DN | 1.461917 | [1.303173, 1.641762] |
+| complement-10 DN | 1.035015 | [0.952295, 1.114475] |
+| auto/count-one-thread ITT DN | 1.581296 | [1.393533, 1.801341] |
+| auto/default-output ITT RF | 1.004006 | [0.965608, 1.056194] |
+
+The primary ITT interval excludes direct viability by a wide margin. The
+complement point-estimate neutrality rule, `DN` in `[0.97,1.03]`, fails in
+round 1, round 2, and pooled (`1.035015181`, `1.064375320`, and
+`1.049592594`), although the round-1 conditional interval contains neutrality.
+
+Round-1 descriptive primary subgroups were:
+
+| Subgroup | n | RF | DN | DS | K |
+|---|---:|---:|---:|---:|---:|
+| OOT | 14 | 0.864688 | 1.252719 | 1.230812 | 1.017799 |
+| wider | 30 | 0.850599 | 1.400327 | 1.377467 | 1.016596 |
+| matched | 42 | 0.857432 | 1.370727 | 1.345930 | 1.018424 |
+| miss | 2 | 0.806680 | 1.005651 | 1.018801 | 0.987092 |
+| 4 arms | 20 | 1.003115 | 1.301003 | 1.259743 | 1.032753 |
+| 5--7 arms | 15 | 0.874024 | 1.509049 | 1.501468 | 1.005049 |
+| at least 8 arms | 9 | 0.578084 | 1.224216 | 1.221406 | 1.002300 |
+| minimum width 3--4 | 14 | 0.706376 | 1.315728 | 1.276163 | 1.031003 |
+| minimum width 5--8 | 11 | 0.847166 | 1.514122 | 1.558630 | 0.971444 |
+| minimum width at least 9 | 19 | 0.989588 | 1.290866 | 1.248632 | 1.033824 |
+
+These shape cells are descriptive, especially the two-pattern miss cell. They
+do not define a post-hoc admission rule. Across the complete 36-cell reverse
+audit, four complement `DN` cells and one complement `RF` cell changed by more
+than 5%; 14 cells had `K` outside the alignment band in at least one
+order/pooled estimate. The primary cell was stable, but the global follow-up
+trigger fired and is another reason not to promote from this experiment.
+
+### Separate V2 holdout correctness gate
+
+The clock-free holdout used clean FRE commit
+`9b19adfab3b013cb47c76588878ca0cf311ee779`, tree
+`4a9ba5ff172bdfeb1daa4d4cfcce02ea671e69d6`, release binary
+`2104419187f332e5c99c7c83ed4bb29a71521b69b0bbf7d32e787fd3184f87c6`,
+and the same c9g AArch64/SVE-VL16 target. All 19 frozen cases were
+structurally ineligible for V2: `0/19` eligible, `19/19` ineligible, zero
+declines, zero faults, and zero eligible windows. Both Automatic and Force
+settled ready on the incumbent. All `676/676` comparisons passed: 169 expanded
+inputs times full and nonzero-bounded windows times two policies.
+
+This is useful non-target regression evidence, not selected-route coverage.
+The next holdout must add a separately frozen eligible cohort before it can
+make a generalization claim about the V2 Teddy route itself.
+
+### Exact artifact roots and hashes
+
+Private artifacts remain mode `0600` and outside Git. The authenticated local
+roots are:
+
+```text
+/Users/danluu/dev/fre-teddy-v2-c9g-probe-results-d0711c-r1
+/Users/danluu/dev/fre-teddy-v2-c9g-qual-results-542b139-r1
+/Users/danluu/dev/fre-teddy-v2-c9g-formal-results-542b139-r1
+/Users/danluu/dev/fre-teddy-v2-c9g-formal-reverse-results-542b139-r2
+/Users/danluu/dev/fre-holdout-v2-results-9b19adf-c9g-r1
+```
+
+The formal remote root is preserved at
+`/private/tmp/rg-fre-v2-542b139-c9g-qual-r1`; the holdout root is preserved at
+`/private/tmp/fre-holdout-v2-9b19adf-c9g-r1`.
+
+| Root | File | SHA-256 |
+|---|---|---|
+| discovery | `results/census-automatic.private.json` | `b7d6e9e723d8939a4862ae2192aa6b407d0dcf0d36b21b248066631860c09c7f` |
+| discovery | `results/census-automatic.public.json` | `256fb9216b56bbeda660dfa8a53ba80eda79a0e28b5b64413dec04a37055a45c` |
+| discovery | `results/census-force.private.json` | `976427ba5abe65ca8d895b8b910208914d87aca2aed3a20831bf1186d0c842d5` |
+| discovery | `results/census-force.public.json` | `92a32ddbcbbf8747ae9dadde4c61ec012b857c8444a617383d77fe5b55dafbd5` |
+| qualification | `results/census-automatic.private.json` | `f2d123a59ad5bcbb0f5a1483f6d0b881847b4941fb59b69f621af775aec74246` |
+| qualification | `results/census-automatic.public.json` | `841769124f9ef84808aa8ab0ca6605d8991ebc1790480595f2ccb5b5bb9f5e50` |
+| qualification | `results/census-force.private.json` | `561957b9cd8727160ad4bf1c405bf58e508e80f33ab2b4998162c1b86701cc34` |
+| qualification | `results/census-force.public.json` | `fe111f87b1fa7234d4d1b11a0169f13087127fed9e6ecf7f70d5ff1a6488924b` |
+| qualification/formal | `results/probe-automatic.private.json` | `04895bf1a86df16a6e0e8c3f7fc4b0575493e49a0a954947d3d3145d3b51f1d5` |
+| qualification/formal | `results/probe-automatic.public.json` | `9e6235445f499296c808f675f5e010dffbd45aad0bab90a31622ffd1f015df25` |
+| qualification/formal | `results/probe-force.private.json` | `28355e1f68a2907c1d3c034c0d9ac95dd47d99604d04a8b75c6f8043d38bb001` |
+| qualification/formal | `results/probe-force.public.json` | `82f6256c0dc022fbfe55bdad30521d73d0d6d44a62b78243ce146444f3dbf796` |
+| formal r1 | `results/benchmark-automatic.formal-r1.private.json` | `0cba838549635e57cb14d3eaddfffe26351f886cb22ce79520ce32656d54899a` |
+| formal r1 | `results/benchmark-automatic.formal-r1.public.json` | `4151ed85517c30cc55756eb9a35331fe07013bfe45a4b8e6e8fbac9101abde5e` |
+| formal r1 | `results/benchmark-force.formal-r1.private.json` | `156211b58a104e5a14997446630cee6181bb682c735e72bffab0aa37a89e0946` |
+| formal r1 | `results/benchmark-force.formal-r1.public.json` | `606400a1a9a3b9f5d2faa8ee973dda425697b06fab8137e56d883d0bd142d74e` |
+| formal r1 | `audit/audit_formal.py` | `19ea56f6e13b1f49403d620277652e9dff6adc88af429a23db9a1c2697ad6c29` |
+| reverse r2 | `results/benchmark-force.formal-r2.private.json` | `ec207493311f314af45484397a9ae77e200a9af36c6e7863fe38a0a5b00b66f0` |
+| reverse r2 | `results/benchmark-force.formal-r2.public.json` | `67496c220dcb52d5582ab55f6c8f24298bb2b5ed4cea111fe80dea98fe4b223d` |
+| reverse r2 | `results/benchmark-automatic.formal-r2.private.json` | `befcb62602cc42124c52190bee1b88268292d690ac4a6aa6b99ce81482430173` |
+| reverse r2 | `results/benchmark-automatic.formal-r2.public.json` | `73b49f2ee73d823b3789c800e573714790243be1847eecc8e6264075e36d46e2` |
+| reverse r2 | `audit/audit_reverse.py` | `a6463117af9896c06df1da479ebe367e645cff74167c06915dc001fc4e690adc` |
+| holdout | `results/correctness.json` | `6171ffc64e289c016fe6a1fe95fcbceb6c72e01ce1015a798d8327e8ad2fb808` |
+| holdout | `logs/correctness.log` | `32df15f6e9c527659c95f2d6b71df28172c27aa25bef51a64cc85ad4383d9e61` |
+
+The exact executed formal command files are preserved beside the logs. Round
+1 Automatic/Force command SHA-256 values are
+`4faca8134ec558781bfac1f55123605c20a21a53efebad5fa4d4acd4a2c1a67d`
+and `705ae6b5fc25d8d9ea5e3e4f24e0936a16f213a83522f50072b90a731a256cfc`;
+round 2 Force/Automatic values are
+`4bc7f6eab2cffd5b144c05b5770d0079463415640dec8bff0187626e1ac688c6`
+and `b4e2e63bca06d47fa2058ad6e0ca11157d1d9ead5ef94c16c3f6a55ab6b134d6`.
+The formal evidence pins the historical harness SHA-256
+`082c5b6ababcb859cafc567bdc5c51e5a9c70811d1f6727e010604fdfabb0e87`;
+the later clock-free forced-midscan hygiene edit does not rewrite or
+reinterpret those artifacts.
+
+### Decision and next work
+
+1. Keep exact-Teddy V2 default-off. Do not infer an Automatic admission rule
+   from the forced selected-34 or from descriptive shape strata.
+2. Improve the generated route or its admission economics until a new frozen
+   selected cohort clears direct `RF >= 1.03`, not merely Force/Automatic
+   `DN > 1`.
+3. Explain and eliminate the complement point-effect before reusing the
+   policy comparison; preserve ITT44 as primary.
+4. Freeze an eligible non-Rebar holdout cohort. The current 0/19 holdout proves
+   incumbent parity only.
+5. If a materially new candidate earns timing, repeat settled clock-free
+   qualification first, preregister both policy orders, and keep order-specific
+   intervals separate unless a pooled interval method is frozen in advance.
+
+## Prior SelectedEnd conclusion
 
 The SelectedEnd iteration compiled roughly **18--22% faster** on the count
 probes, but it did not improve end-to-end search. Against the prior Span
@@ -25,7 +335,7 @@ compiler work and removes reverse-start recovery from candidate discovery, but
 the forward matcher still needs query specialization or selective admission.
 The prior Span result is retained below as an explicitly labeled baseline.
 
-## Newest result: SelectedEnd at `c568c42917`
+## Prior result: SelectedEnd at `c568c42917`
 
 ### EC2 timing results
 

@@ -1,15 +1,18 @@
 # Representative background-AOT experiment
 
-The completed local and EC2 results are in [RESULTS.md](RESULTS.md). Those
-checked-in results are historical Span-entry runs with v3 receipts. The
-current harness emits `ripgrep.fre-aot-background.v6` SelectedEnd receipts and
-continues to validate existing v4/v5 evidence without reinterpreting v3
-results. V5 added an authenticated primary-native-route record and kept a
-Teddy leaf's retained semantic-DFA incumbent explicitly separate from that
-primary route. V6 preserves those fields and adds the supplemental exact-Teddy
-V2 compile receipt described below. It also attests whether receipt-only
-compiler settlement was requested and whether the compiler thread reached a
-definitive outcome.
+The completed local and EC2 results are in [RESULTS.md](RESULTS.md). The
+newest checked-in result is the authenticated exact-Teddy V2 census,
+qualification, formal round, and reverse-order confirmation; it is a clear
+NO-GO. Historical SelectedEnd and Span-entry results remain in that file as
+explicitly labeled baselines. The current harness emits
+`ripgrep.fre-aot-background.v6` SelectedEnd receipts and continues to validate
+existing v4/v5 evidence without reinterpreting v3 results. V5 added an
+authenticated primary-native-route record and kept a Teddy leaf's retained
+semantic-DFA incumbent explicitly separate from that primary route. V6
+preserves those fields and adds the supplemental exact-Teddy V2 compile
+receipt described below. It also attests whether receipt-only compiler
+settlement was requested and whether the compiler thread reached a definitive
+outcome.
 
 This harness tests the normal ripgrep path against the same binary with
 `--fre-aot-background` on frozen, actual ripgrep query shapes. It does not use
@@ -255,17 +258,20 @@ Stock follow-up work uses the separate `stock_span_calls`, `stock_span_bytes`,
 `stock_capture_calls`, and `stock_capture_bytes` counters.
 
 Before the historical-query matrix, the probe also runs one synthetic,
-correctness-only SelectedEnd gate for each CPU profile. A single 16 MiB
-newline-dense file contains exactly two bounded-repeat matches, one before and
-one on the final line after a deterministic 4 MiB publication barrier. Candidate-normal,
-candidate-background, and upstream ripgrep must produce identical literal
-`--only-matching --byte-offset --line-number` output. The background receipt
+correctness-only, clock-free SelectedEnd gate for each CPU profile. A single
+16 MiB newline-dense file contains exactly two bounded-repeat matches, one
+before and one on the final line after a deterministic 4 MiB publication
+barrier. Candidate-normal, candidate-background, and upstream ripgrep must
+produce identical literal `--only-matching --byte-offset --line-number`
+output. The background receipt
 must prove one real same-file mid-scan transition, positive stock and AOT
 candidate work, in-memory publication with no native-call failure, the
 `selected_end_search_v1` ABI, and no selected reverse-start-recovery pass.
 The barrier environment variable is scrubbed from every historical-query
-probe and every timed invocation; this synthetic gate is never included in a
-speedup aggregate.
+probe and every timed invocation. All three synthetic-gate arms explicitly
+disable timing collection, and their records omit `elapsed_ns`, `user_ns`, and
+`system_ns`; output, status, receipt, and route validation remain mandatory.
+This synthetic gate is never included in a speedup aggregate.
 
 ## Small remote selection manifest
 

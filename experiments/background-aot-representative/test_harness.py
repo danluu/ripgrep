@@ -1632,6 +1632,70 @@ class HarnessTests(unittest.TestCase):
         self.assertIn("forced_midscan_normal_evidence_mismatch", failures)
         self.assertIn("forced_midscan_normal_unexpected_stdout", failures)
 
+    def test_forced_midscan_gate_is_clock_free_and_still_validated(self) -> None:
+        receipt = ready_receipt(
+            test_min_stock_bytes=HARNESS.FORCED_MIDSCAN_STOCK_BYTES,
+            total_file_attempts=1,
+            candidate_stock_files=1,
+            candidate_fre_aot_files=1,
+            candidate_mixed_engine_files=1,
+            candidate_midscan_cutover_files=1,
+            candidate_stock_windows=4,
+            candidate_fre_aot_windows=1,
+            candidate_stock_window_bytes=5 * 1024 * 1024,
+            candidate_stock_committed_bytes=4 * 1024 * 1024,
+            candidate_fre_aot_window_bytes=12 * 1024 * 1024,
+            first_candidate_midscan_cutover_file_ordinal=1,
+            first_candidate_midscan_cutover_ns_since_start=20,
+            first_candidate_midscan_cutover_stock_committed_bytes=(
+                HARNESS.FORCED_MIDSCAN_STOCK_BYTES
+            ),
+        )
+        stdout_raw = HARNESS.forced_midscan_expected_stdout()
+        stderr_raw = b""
+
+        def invoke(**kwargs):
+            return {
+                "timed_out": False,
+                "status": 0,
+                "stdout": HARNESS.output_record(stdout_raw),
+                "stderr": HARNESS.output_record(stderr_raw),
+                "stdout_raw": stdout_raw,
+                "stderr_raw": stderr_raw,
+                "receipt": receipt if kwargs["background"] else None,
+                "receipt_parse_error": False,
+                "unexpected_temporary_artifacts": 0,
+            }
+
+        with mock.patch.object(
+            HARNESS, "run_once", side_effect=invoke
+        ) as run:
+            gate = HARNESS.run_forced_midscan_gate(
+                corpus=Path("corpus"),
+                candidate=Path("candidate"),
+                stock=Path("stock"),
+                cwd=Path("."),
+                cpu_profile="auto",
+                timeout_seconds=1.0,
+            )
+
+        self.assertEqual(3, run.call_count)
+        for call in run.call_args_list:
+            self.assertIs(False, call.kwargs["collect_timing"])
+        for arm in ("normal", "background", "stock"):
+            for field in ("elapsed_ns", "user_ns", "system_ns"):
+                self.assertNotIn(field, gate[arm])
+        self.assertEqual([], gate["failures"])
+        self.assertEqual(
+            [], HARNESS.validate_forced_midscan_gate_record(gate, "auto")
+        )
+
+        gate["stock"]["stdout"] = HARNESS.output_record(b"wrong\n")
+        self.assertIn(
+            "forced_midscan_stock_evidence_mismatch",
+            HARNESS.validate_forced_midscan_gate_record(gate, "auto"),
+        )
+
     def test_ready_receipt_requires_publication_timestamp(self) -> None:
         receipt = ready_receipt(ready_ns_since_start=None)
         failures = HARNESS.validate_receipt(receipt, "auto")

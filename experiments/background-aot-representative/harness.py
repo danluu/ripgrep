@@ -2907,17 +2907,20 @@ def run_forced_midscan_gate(
         binary=candidate, args=args, cwd=cwd, background=False,
         capture_receipt=False, cpu_profile=cpu_profile,
         timeout_seconds=timeout_seconds,
+        collect_timing=False,
     )
     background = run_once(
         binary=candidate, args=args, cwd=cwd, background=True,
         capture_receipt=True, cpu_profile=cpu_profile,
         timeout_seconds=timeout_seconds,
         test_min_stock_bytes=FORCED_MIDSCAN_STOCK_BYTES,
+        collect_timing=False,
     )
     stock_result = run_once(
         binary=stock, args=args, cwd=cwd, background=False,
         capture_receipt=False, cpu_profile=cpu_profile,
         timeout_seconds=timeout_seconds,
+        collect_timing=False,
     )
     exact_normal_background = outputs_equal(
         normal, background, "literal"
