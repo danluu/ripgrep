@@ -2,8 +2,12 @@
 
 The completed local and EC2 results are in [RESULTS.md](RESULTS.md). Those
 checked-in results are historical Span-entry runs with v3 receipts. The
-current harness accepts the exact `ripgrep.fre-aot-background.v4` receipt for
-SelectedEnd runs; it does not reinterpret a v3 probe as v4 evidence.
+current harness emits `ripgrep.fre-aot-background.v5` SelectedEnd receipts and
+continues to validate existing v4 evidence without reinterpreting v3 results.
+V5 adds an authenticated primary-native-route record and keeps a Teddy leaf's
+retained semantic-DFA incumbent explicitly separate from that primary route.
+It also attests whether receipt-only compiler settlement was requested and
+whether the compiler thread reached a definitive outcome.
 
 This harness tests the normal ripgrep path against the same binary with
 `--fre-aot-background` on frozen, actual ripgrep query shapes. It does not use
@@ -29,6 +33,36 @@ cases whose retained semantics required normalization. Public JSON contains aggr
 private JSON contains the exact patterns and per-process observations and is
 ignored by Git.
 
+## Fast exact-Teddy census
+
+Before designing a timed gate, `exact-teddy-census` runs each of the frozen
+212 queries exactly once per requested CPU profile on the canonical
+single-thread count panel. It invokes only the background candidate, records
+no timing samples, and selects IDs solely from the authenticated compiler
+primary-route receipt after a hidden receipt-only teardown join has settled
+the compiler. Both `wait_requested` and `compiler_settled` must be true and
+the outcome must be non-`unfinished`. Ordinary probes never request this wait
+and do not embed or claim a compiler-selected census. The private result contains fully qualified
+`profile/cohort/private-id` sets; the public result contains counts and
+tier/ISA/scanner contracts only. This diagnostic does not claim benchmark
+eligibility:
+
+```sh
+python3 experiments/background-aot-representative/harness.py exact-teddy-census \
+  --binary target/release/rg \
+  --candidate-source . \
+  --stock-binary /Users/danluu/dev/ripgrep/target/release/rg \
+  --stock-source /Users/danluu/dev/ripgrep \
+  --inventory-root /Users/danluu/dev/rg-aot \
+  --database /Users/danluu/.codex/thread_history_1.sqlite \
+  --ripgrep-corpus-repo /Users/danluu/dev/ripgrep \
+  --ripgrep-corpus-commit f9c05a949d1a0dc8e16dee28ca9605d38611faeb \
+  --fre-corpus-repo /Users/danluu/dev/fre-teddy-census-0ed0d09a-20260821 \
+  --fre-corpus-commit 6f961465d00ff50f2096cfb05520c0653a87d2cd \
+  --private-output experiments/background-aot-representative/results/teddy-census.private.json \
+  --public-output experiments/background-aot-representative/results/teddy-census.public.json
+```
+
 ## Probe first
 
 Build the stock and candidate binaries, then run the correctness and
@@ -44,14 +78,14 @@ python3 experiments/background-aot-representative/harness.py probe \
   --database /Users/danluu/.codex/thread_history_1.sqlite \
   --ripgrep-corpus-repo /Users/danluu/dev/ripgrep \
   --ripgrep-corpus-commit f9c05a949d1a0dc8e16dee28ca9605d38611faeb \
-  --fre-corpus-repo /Users/danluu/dev/fre-rg-midscan-deps-20260820 \
+  --fre-corpus-repo /Users/danluu/dev/fre-teddy-census-0ed0d09a-20260821 \
   --fre-corpus-commit 6f961465d00ff50f2096cfb05520c0653a87d2cd \
   --private-output experiments/background-aot-representative/results/probe.private.json \
   --public-output experiments/background-aot-representative/results/probe.public.json
 ```
 
 The clean `--fre-corpus-repo` checkout must be at the exact FRE revision pinned
-by the candidate (`abad8a8e9007409ae483c9627397886d09a9fdf6` for this
+by the candidate (`0ed0d09a2816716f47b244d44711a1070e52f3c1` for this
 iteration), while `--fre-corpus-commit` deliberately remains the older frozen
 `6f96146` corpus. The harness verifies both independently. This keeps the
 searched bytes constant as compiler dependencies evolve.
@@ -68,7 +102,7 @@ order, for example `--cpu-profile auto --cpu-profile sve --cpu-profile sve2`.
 `asimd` is also accepted as an optional control. An unsupported requested
 profile is recorded as a decline, never silently replaced with `auto`.
 Receipts report the requested, host, and effective feature masks plus the
-compiler engine and actual start accelerator. A successfully compiled v4
+compiler engine and actual start accelerator. A successfully compiled v4/v5
 receipt also identifies the `selected_end` output contract, the
 `selected_end_search_v1` entry ABI, the source of any reported machine
 geometry, forward/reverse analysis state counts, and whether the compiler
@@ -88,7 +122,7 @@ timing, the complete probe matrix must nevertheless contain at least one fully
 target-validated receipt for every requested CPU profile, all with one common
 host feature mask.
 
-The v4 route counters describe candidate discovery only. A mixed-engine file
+The v4/v5 route counters describe candidate discovery only. A mixed-engine file
 can merely reflect different matcher operations. A genuine mid-scan cutover is
 counted separately and requires a nonempty, line-aligned stock prefix to be
 committed before AOT scans a later suffix. Candidate file/byte totals and the

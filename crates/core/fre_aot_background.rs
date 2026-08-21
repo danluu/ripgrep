@@ -29,11 +29,18 @@ use grep::{
 };
 
 const RECEIPT_ENV: &str = "RG_FRE_AOT_BACKGROUND_RECEIPT";
+const RECEIPT_WAIT_FOR_COMPILER_ENV: &str =
+    "RG_FRE_AOT_BACKGROUND_RECEIPT_WAIT_FOR_COMPILER";
 const CPU_PROFILE_ENV: &str = "RG_FRE_AOT_BACKGROUND_CPU_PROFILE";
 const TEST_MIN_STOCK_BYTES_ENV: &str =
     "RG_FRE_AOT_BACKGROUND_TEST_MIN_STOCK_BYTES";
-const RECEIPT_SCHEMA: &str = "ripgrep.fre-aot-background.v4";
+const RECEIPT_SCHEMA: &str = "ripgrep.fre-aot-background.v5";
 const PENDING_SCAN_QUANTUM: usize = 1 << 20;
+const EXACT_TEDDY_INPUT_FLOOR_BYTES: usize = 4096;
+const EXACT_TEDDY_RUNTIME_VERIFICATION_BUDGET: u16 = 64;
+const EXACT_TEDDY_BYTE_FREQUENCY_DENOMINATOR: u16 = 256;
+const EXACT_TEDDY_LITERAL_DISPATCH_UNITS: u128 = 8;
+const EXACT_TEDDY_LITERAL_BYTE_UNITS: u128 = 11;
 static RECEIPT_NONCE: AtomicU64 = AtomicU64::new(0);
 
 /// A published, reentrant direct-native `SelectedEnd` entry. The published
@@ -85,6 +92,9 @@ struct ReceiptClassification {
     compiled_forward_states: Option<u64>,
     compiled_reverse_states: Option<u64>,
     compiled_reverse_start_recovery: Option<bool>,
+    compiled_primary_native_route: Option<&'static str>,
+    exact_finite_selected_end_teddy_aot:
+        Option<fre_aot_regex::ExactFiniteSelectedEndTeddyAotReport>,
     publication_stage: &'static str,
     publication_refusal_class: Option<&'static str>,
     runtime_helper_required: bool,
@@ -109,6 +119,8 @@ impl ReceiptClassification {
             compiled_forward_states: None,
             compiled_reverse_states: None,
             compiled_reverse_start_recovery: None,
+            compiled_primary_native_route: None,
+            exact_finite_selected_end_teddy_aot: None,
             publication_stage: "not_started",
             publication_refusal_class: None,
             runtime_helper_required: false,
@@ -178,6 +190,14 @@ struct CompileTask<'a> {
     receipt_classification: &'a Mutex<ReceiptClassification>,
 }
 
+struct CompilerSettlementGuard(Arc<AtomicBool>);
+
+impl Drop for CompilerSettlementGuard {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Release);
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 struct Cutover {
     file_ordinal: u64,
@@ -191,6 +211,8 @@ struct CompileState {
     outcome: OnceLock<CompileOutcome>,
     join: Mutex<Option<JoinHandle<()>>>,
     cancelled: Arc<AtomicBool>,
+    wait_requested: bool,
+    compiler_settled: Arc<AtomicBool>,
     compile_ns: Arc<AtomicU64>,
     publish_ns: Arc<AtomicU64>,
     prepare_ns: Arc<AtomicU64>,
@@ -216,6 +238,8 @@ struct CompileState {
     #[cfg(test)]
     test_publish_after_stock_commit:
         Mutex<Option<(u64, Arc<NativeAotFactory>)>>,
+    #[cfg(test)]
+    test_wait_join_entered: AtomicBool,
     receipt_classification: Arc<Mutex<ReceiptClassification>>,
     receipt_path: Option<PathBuf>,
     telemetry_enabled: bool,
@@ -251,6 +275,23 @@ impl CompileState {
             .and_then(|value| value.parse().ok())
             .unwrap_or(0);
         let receipt_path = std::env::var_os(RECEIPT_ENV).map(PathBuf::from);
+        let wait_requested = receipt_path.is_some()
+            && std::env::var_os(RECEIPT_WAIT_FOR_COMPILER_ENV)
+                .is_some_and(|value| value == OsString::from("1"));
+        Self::empty_with_receipt_options(
+            receipt_classification,
+            receipt_path,
+            wait_requested,
+            test_min_stock_bytes,
+        )
+    }
+
+    fn empty_with_receipt_options(
+        receipt_classification: ReceiptClassification,
+        receipt_path: Option<PathBuf>,
+        wait_requested: bool,
+        test_min_stock_bytes: u64,
+    ) -> Arc<Self> {
         let telemetry_enabled =
             receipt_path.is_some() || test_min_stock_bytes > 0 || cfg!(test);
         Arc::new(Self {
@@ -258,6 +299,8 @@ impl CompileState {
             outcome: OnceLock::new(),
             join: Mutex::new(None),
             cancelled: Arc::new(AtomicBool::new(false)),
+            wait_requested,
+            compiler_settled: Arc::new(AtomicBool::new(false)),
             compile_ns: Arc::new(AtomicU64::new(0)),
             publish_ns: Arc::new(AtomicU64::new(0)),
             prepare_ns: Arc::new(AtomicU64::new(0)),
@@ -282,6 +325,8 @@ impl CompileState {
             test_min_stock_bytes,
             #[cfg(test)]
             test_publish_after_stock_commit: Mutex::new(None),
+            #[cfg(test)]
+            test_wait_join_entered: AtomicBool::new(false),
             receipt_classification: Arc::new(Mutex::new(
                 receipt_classification,
             )),
@@ -310,6 +355,7 @@ impl CompileState {
             "FRE AOT background decline: {failure}; using stock Rust regex"
         );
         let _ = state.outcome.set(Err(failure));
+        state.compiler_settled.store(true, Ordering::Release);
         state
     }
 
@@ -328,6 +374,7 @@ impl CompileState {
                     "FRE AOT background decline: {reason}; using stock Rust regex"
                 );
                 let _ = state.outcome.set(Err(reason.to_owned()));
+                state.compiler_settled.store(true, Ordering::Release);
                 return state;
             }
         };
@@ -340,10 +387,13 @@ impl CompileState {
         let publish_ns = Arc::clone(&state.publish_ns);
         let prepare_ns = Arc::clone(&state.prepare_ns);
         let receipt_classification = Arc::clone(&state.receipt_classification);
+        let compiler_settled = Arc::clone(&state.compiler_settled);
         log::debug!("FRE AOT background compilation started");
         let spawn = std::thread::Builder::new()
             .name("rg-fre-aot".to_owned())
             .spawn(move || {
+                let _settlement =
+                    CompilerSettlementGuard(compiler_settled);
                 let prepare_started = Instant::now();
                 let outcome = compile_native_factory(
                     pattern,
@@ -422,9 +472,17 @@ impl CompileState {
                 );
                 log::debug!("FRE AOT background decline: {reason}");
                 let _ = state.outcome.set(Err(reason));
+                state.compiler_settled.store(true, Ordering::Release);
             }
         }
         state
+    }
+
+    fn join_compiler(&self) {
+        let join = self.join.lock().unwrap().take();
+        if let Some(join) = join {
+            let _ = join.join();
+        }
     }
 
     fn next_file_ordinal(&self) -> u64 {
@@ -467,6 +525,10 @@ impl CompileState {
         };
         let classification =
             self.receipt_classification.lock().unwrap().clone();
+        let exact_finite_selected_end_teddy_aot = classification
+            .exact_finite_selected_end_teddy_aot
+            .as_ref()
+            .map(exact_finite_selected_end_teddy_receipt_json);
         let mut receipt = serde_json::json!({
             "schema": RECEIPT_SCHEMA,
             "outcome": outcome,
@@ -484,6 +546,10 @@ impl CompileState {
             "compiled_forward_states": classification.compiled_forward_states,
             "compiled_reverse_states": classification.compiled_reverse_states,
             "compiled_reverse_start_recovery": classification.compiled_reverse_start_recovery,
+            "compiled_primary_native_route": classification.compiled_primary_native_route,
+            "exact_finite_selected_end_teddy_aot": exact_finite_selected_end_teddy_aot,
+            "wait_requested": self.wait_requested,
+            "compiler_settled": self.compiler_settled.load(Ordering::Acquire),
             "publication_stage": classification.publication_stage,
             "publication_refusal_class": classification.publication_refusal_class,
             "runtime_helper_required": classification.runtime_helper_required,
@@ -821,6 +887,20 @@ impl Clone for BackgroundFreMatcher {
             file_candidate_mixed_recorded: AtomicBool::new(false),
             file_candidate_midscan_cutover_recorded: AtomicBool::new(false),
             file_candidate_stock_committed_bytes: AtomicU64::new(0),
+        }
+    }
+}
+
+impl Drop for BackgroundFreMatcher {
+    fn drop(&mut self) {
+        if self.shared.wait_requested {
+            // Joining from the matcher keeps a strong state reference alive,
+            // so the compiler can finish its final Weak upgrade, publish its
+            // definitive outcome and settle the receipt. This hidden mode is
+            // used only by the receipt-only single-thread census.
+            #[cfg(test)]
+            self.shared.test_wait_join_entered.store(true, Ordering::Release);
+            self.shared.join_compiler();
         }
     }
 }
@@ -1273,6 +1353,610 @@ fn entry_abi_name(entry_abi: fre_aot_regex::EntryAbi) -> &'static str {
     }
 }
 
+fn exact_finite_selected_end_teddy_target_tier_name(
+    tier: fre_aot_regex::ExactFiniteSelectedEndTeddyAotTargetTier,
+) -> &'static str {
+    use fre_aot_regex::ExactFiniteSelectedEndTeddyAotTargetTier;
+
+    match tier {
+        ExactFiniteSelectedEndTeddyAotTargetTier::X86Avx2 => "x86_avx2",
+        ExactFiniteSelectedEndTeddyAotTargetTier::X86Avx512Bw => {
+            "x86_avx512bw"
+        }
+        ExactFiniteSelectedEndTeddyAotTargetTier::Aarch64Asimd => {
+            "aarch64_asimd"
+        }
+        ExactFiniteSelectedEndTeddyAotTargetTier::Aarch64Sve => "aarch64_sve",
+        ExactFiniteSelectedEndTeddyAotTargetTier::Aarch64Sve2 => {
+            "aarch64_sve2"
+        }
+    }
+}
+
+fn exact_finite_selected_end_teddy_isa_name(
+    isa: fre_aot_regex::ExactFiniteSelectedEndTeddyAotIsa,
+) -> &'static str {
+    use fre_aot_regex::ExactFiniteSelectedEndTeddyAotIsa;
+
+    match isa {
+        ExactFiniteSelectedEndTeddyAotIsa::X86Avx2 => "x86_avx2",
+        ExactFiniteSelectedEndTeddyAotIsa::Aarch64Asimd => "aarch64_asimd",
+        ExactFiniteSelectedEndTeddyAotIsa::Aarch64Sve => "aarch64_sve",
+    }
+}
+
+fn target_architecture_name(
+    architecture: fre_aot_regex::Architecture,
+) -> &'static str {
+    match architecture {
+        fre_aot_regex::Architecture::X86_64 => "x86_64",
+        fre_aot_regex::Architecture::Aarch64 => "aarch64",
+    }
+}
+
+fn target_operating_system_name(
+    operating_system: fre_aot_regex::OperatingSystem,
+) -> &'static str {
+    match operating_system {
+        fre_aot_regex::OperatingSystem::Linux => "linux",
+        fre_aot_regex::OperatingSystem::Macos => "macos",
+    }
+}
+
+fn target_abi_name(abi: fre_aot_regex::CallAbi) -> &'static str {
+    match abi {
+        fre_aot_regex::CallAbi::SystemV => "system_v",
+        fre_aot_regex::CallAbi::Aapcs64 => "aapcs64",
+    }
+}
+
+fn sha256_hex(digest: &[u8; 32]) -> String {
+    use std::fmt::Write as _;
+
+    let mut encoded = String::with_capacity(64);
+    for byte in digest {
+        write!(&mut encoded, "{byte:02x}")
+            .expect("writing to a String cannot fail");
+    }
+    encoded
+}
+
+fn exact_finite_selected_end_teddy_receipt_json(
+    report: &fre_aot_regex::ExactFiniteSelectedEndTeddyAotReport,
+) -> serde_json::Value {
+    let incumbent = report.incumbent_complete_dfa;
+    let target = serde_json::json!({
+        "architecture": target_architecture_name(report.target.architecture),
+        "operating_system": target_operating_system_name(report.target.operating_system),
+        "abi": target_abi_name(report.target.abi),
+        "feature_bits": report.target.features.bits(),
+    });
+    let incumbent = serde_json::json!({
+        "semantic_dfa_sha256": sha256_hex(&incumbent.semantic_dfa_sha256),
+        "forward_states": u64_len(incumbent.forward_states),
+        "alphabet_classes": u64_len(incumbent.alphabet_classes),
+        "transition_cells": u64_len(incumbent.transition_cells),
+        "minimum_native_data_bytes": u64_len(incumbent.minimum_native_data_bytes),
+        "native_data_bytes": u64_len(incumbent.native_data_bytes),
+        "hot_loads_per_byte": u64_len(incumbent.hot_loads_per_byte),
+        "hot_branches_per_byte": u64_len(incumbent.hot_branches_per_byte),
+        "has_accelerator": incumbent.has_accelerator,
+        "scanner": start_accelerator_name(incumbent.scanner),
+        "native_code_sha256": sha256_hex(&report.incumbent_code_sha256),
+        "native_data_sha256": sha256_hex(&report.incumbent_data_sha256),
+        "relocations_sha256": sha256_hex(&report.incumbent_relocations_sha256),
+        "native_code_offset": u64_len(report.incumbent_code_offset),
+        "native_code_bytes": u64_len(report.incumbent_code_bytes),
+        "relocation_count": u64_len(report.incumbent_relocation_count),
+    });
+    let mut receipt = serde_json::json!({
+        // The compiler only exposes this report after the native module has
+        // authenticated it. `copy_authenticated_exact_finite_selected_end_teddy`
+        // additionally binds the copied report to this exact compiled
+        // program and receipt before publication consumes `CompiledRegex`.
+        "authenticated_compiler_report": true,
+        "artifact_identity_sha256": sha256_hex(&report.artifact_identity),
+        "output_contract": output_contract_name(report.output),
+        "literal_sha256": sha256_hex(&report.literal_sha256),
+        "prefix_plan_sha256": sha256_hex(&report.prefix_plan_sha256),
+        "native_code_sha256": sha256_hex(&report.native_code_sha256),
+        "native_data_sha256": sha256_hex(&report.native_data_sha256),
+        "relocations_sha256": sha256_hex(&report.relocations_sha256),
+        "source_count": report.source_count,
+        "source_bytes": u64_len(report.source_bytes),
+        "minimum_width": report.minimum_width,
+        "maximum_width": report.maximum_width,
+        "root_members": report.root_members,
+    });
+    let plan = serde_json::json!({
+        "columns": report.columns,
+        "bucket_count": report.bucket_count,
+        "literal_count": report.literal_count,
+        "candidate_fingerprint_upper_bound": report.candidate_fingerprint_upper_bound,
+        "candidate_frequency_upper_bound": report.candidate_frequency_upper_bound,
+        "fingerprint_space": report.fingerprint_space,
+        "plan_scan_instruction_units": report.plan_scan_instruction_units,
+        "emitted_scan_instruction_units": report.emitted_scan_instruction_units,
+        "guaranteed_vector_bytes": report.guaranteed_vector_bytes,
+        "gate_table_bytes": u64_len(report.gate_table_bytes),
+        "selected_target_tier": exact_finite_selected_end_teddy_target_tier_name(report.selected_target_tier),
+        "emitted_isa": exact_finite_selected_end_teddy_isa_name(report.emitted_isa),
+        "scanner": start_accelerator_name(report.scanner),
+        "target": target,
+    });
+    let selection = serde_json::json!({
+        "input_floor_bytes": u64_len(report.input_floor_bytes),
+        "selection_horizon_bytes": u64_len(report.selection_horizon_bytes),
+        // JSON implementations do not all preserve arbitrary u128 integers.
+        // Decimal strings keep the authenticated cost values exact.
+        "selection_gate_cost_units_decimal": report.selection_gate_cost_units.to_string(),
+        "selection_expected_verification_cost_units_decimal": report.selection_expected_verification_cost_units.to_string(),
+        "selection_full_cost_units_decimal": report.selection_full_cost_units.to_string(),
+        "selection_incumbent_cost_units_decimal": report.selection_incumbent_cost_units.to_string(),
+        "selection_root_frequency_units": report.selection_root_frequency_units,
+        "selection_no_candidate_numerator_decimal": report.selection_no_candidate_numerator.to_string(),
+        "selection_probability_denominator_decimal": report.selection_probability_denominator.to_string(),
+        "runtime_verification_budget": report.runtime_verification_budget,
+        "table_base": report.table_base,
+        "table_end": report.table_end,
+        "bucket_ordinal_masks_offset": report.bucket_ordinal_masks_offset,
+        "literal_descriptors_offset": report.literal_descriptors_offset,
+        "literal_bytes_offset": report.literal_bytes_offset,
+        "literal_bytes_end": report.literal_bytes_end,
+        "native_data_bytes": u64_len(report.native_data_bytes),
+        "incumbent": incumbent,
+    });
+    let object = receipt.as_object_mut().expect("Teddy receipt is an object");
+    object.extend(plan.as_object().expect("Teddy plan is an object").clone());
+    object.extend(
+        selection.as_object().expect("Teddy selection is an object").clone(),
+    );
+    receipt
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ExactTeddyTierGeometry {
+    plan_scan_instruction_units: u16,
+    emitted_scan_instruction_units: u16,
+    guaranteed_vector_bytes: u16,
+    table_alignment: usize,
+    table_extent_bytes: usize,
+    gate_table_bytes: usize,
+    auxiliary_table_bytes: usize,
+}
+
+fn target_has_feature(
+    target: fre_aot_regex::Target,
+    feature: fre_aot_regex::CpuFeature,
+) -> bool {
+    target.features.contains(fre_aot_regex::FeatureSet::of(feature))
+}
+
+fn exact_teddy_tier_geometry(
+    report: &fre_aot_regex::ExactFiniteSelectedEndTeddyAotReport,
+) -> Option<ExactTeddyTierGeometry> {
+    use fre_aot_regex::{
+        Architecture, CpuFeature, ExactFiniteSelectedEndTeddyAotIsa,
+        ExactFiniteSelectedEndTeddyAotTargetTier, OperatingSystem,
+        StartAccelerator,
+    };
+
+    report.target.validate().ok()?;
+    let columns = usize::from(report.columns);
+    let plan_scan_instruction_units =
+        u16::from(report.columns).checked_mul(8)?.checked_sub(1)?;
+    let aarch64_scan_instruction_units =
+        plan_scan_instruction_units.checked_sub(u16::from(report.columns))?;
+    let logical_table_bytes = columns.checked_mul(32)?;
+    let has_avx2 = target_has_feature(report.target, CpuFeature::X86Avx2);
+    let has_avx512f =
+        target_has_feature(report.target, CpuFeature::X86Avx512F);
+    let has_avx512bw =
+        target_has_feature(report.target, CpuFeature::X86Avx512Bw);
+    let has_asimd =
+        target_has_feature(report.target, CpuFeature::Aarch64Asimd);
+    let has_sve = target_has_feature(report.target, CpuFeature::Aarch64Sve);
+    let has_sve2 = target_has_feature(report.target, CpuFeature::Aarch64Sve2);
+    let (
+        tier_is_valid,
+        emitted_isa,
+        scanner,
+        emitted_scan_instruction_units,
+        guaranteed_vector_bytes,
+        table_alignment,
+        table_extent_bytes,
+        gate_table_bytes,
+        auxiliary_table_bytes,
+    ) = match report.selected_target_tier {
+        ExactFiniteSelectedEndTeddyAotTargetTier::X86Avx2 => (
+            report.target.architecture == Architecture::X86_64
+                && has_avx2
+                && !(has_avx512f && has_avx512bw),
+            ExactFiniteSelectedEndTeddyAotIsa::X86Avx2,
+            StartAccelerator::X86Avx2,
+            plan_scan_instruction_units,
+            32,
+            32,
+            logical_table_bytes.checked_mul(2)?.checked_add(32)?,
+            logical_table_bytes.checked_mul(2)?.checked_add(32)?,
+            0,
+        ),
+        ExactFiniteSelectedEndTeddyAotTargetTier::X86Avx512Bw => (
+            report.target.architecture == Architecture::X86_64
+                && has_avx2
+                && has_avx512f
+                && has_avx512bw,
+            ExactFiniteSelectedEndTeddyAotIsa::X86Avx2,
+            StartAccelerator::X86Avx2,
+            plan_scan_instruction_units,
+            32,
+            32,
+            logical_table_bytes.checked_mul(2)?.checked_add(32)?,
+            logical_table_bytes.checked_mul(2)?.checked_add(32)?,
+            0,
+        ),
+        ExactFiniteSelectedEndTeddyAotTargetTier::Aarch64Asimd => (
+            report.target.architecture == Architecture::Aarch64
+                && has_asimd
+                && !(report.target.operating_system == OperatingSystem::Linux
+                    && has_sve),
+            ExactFiniteSelectedEndTeddyAotIsa::Aarch64Asimd,
+            StartAccelerator::Aarch64Asimd,
+            aarch64_scan_instruction_units,
+            16,
+            16,
+            logical_table_bytes,
+            logical_table_bytes.checked_add(16)?,
+            16,
+        ),
+        ExactFiniteSelectedEndTeddyAotTargetTier::Aarch64Sve => (
+            report.target.architecture == Architecture::Aarch64
+                && report.target.operating_system == OperatingSystem::Linux
+                && has_sve
+                && !has_sve2,
+            ExactFiniteSelectedEndTeddyAotIsa::Aarch64Sve,
+            StartAccelerator::Aarch64Sve,
+            aarch64_scan_instruction_units,
+            16,
+            16,
+            logical_table_bytes,
+            logical_table_bytes,
+            0,
+        ),
+        ExactFiniteSelectedEndTeddyAotTargetTier::Aarch64Sve2 => (
+            report.target.architecture == Architecture::Aarch64
+                && report.target.operating_system == OperatingSystem::Linux
+                && has_sve
+                && has_sve2,
+            ExactFiniteSelectedEndTeddyAotIsa::Aarch64Sve,
+            StartAccelerator::Aarch64Sve,
+            aarch64_scan_instruction_units,
+            16,
+            16,
+            logical_table_bytes,
+            logical_table_bytes,
+            0,
+        ),
+    };
+    if !tier_is_valid
+        || report.emitted_isa != emitted_isa
+        || report.scanner != scanner
+    {
+        return None;
+    }
+    Some(ExactTeddyTierGeometry {
+        plan_scan_instruction_units,
+        emitted_scan_instruction_units,
+        guaranteed_vector_bytes,
+        table_alignment,
+        table_extent_bytes,
+        gate_table_bytes,
+        auxiliary_table_bytes,
+    })
+}
+
+fn exact_teddy_report_invariants_authenticate(
+    report: &fre_aot_regex::ExactFiniteSelectedEndTeddyAotReport,
+    receipt: &fre_aot_regex::CompileReceipt,
+) -> bool {
+    let Some(geometry) = exact_teddy_tier_geometry(report) else {
+        return false;
+    };
+    (|| {
+        let source_count = usize::try_from(report.source_count).ok()?;
+        let literal_count = usize::from(report.literal_count);
+        let columns = usize::from(report.columns);
+        let minimum_width = usize::try_from(report.minimum_width).ok()?;
+        let maximum_width = usize::try_from(report.maximum_width).ok()?;
+        let minimum_source_bytes = minimum_width.checked_mul(source_count)?;
+        let maximum_source_bytes = maximum_width.checked_mul(source_count)?;
+        let fingerprint_space =
+            1_u64.checked_shl(u32::try_from(columns.checked_mul(8)?).ok()?)?;
+        let collision_ceiling =
+            u64::try_from(literal_count).ok()?.checked_mul(8)?;
+        let horizon = u128::try_from(report.selection_horizon_bytes).ok()?;
+        let denominator = u128::from(report.fingerprint_space);
+        let expected_candidate_numerator = horizon
+            .checked_mul(u128::from(report.candidate_frequency_upper_bound))?;
+        let no_candidate_numerator =
+            denominator.checked_sub(expected_candidate_numerator)?;
+        let verification_units = u128::try_from(literal_count)
+            .ok()?
+            .checked_mul(EXACT_TEDDY_LITERAL_DISPATCH_UNITS)?
+            .checked_add(
+                u128::try_from(report.source_bytes)
+                    .ok()?
+                    .checked_mul(EXACT_TEDDY_LITERAL_BYTE_UNITS)?,
+            )?;
+        let expected_verification_cost = verification_units
+            .checked_mul(expected_candidate_numerator)?
+            .checked_add(denominator.checked_sub(1)?)?
+            .checked_div(denominator)?;
+        let vector_bytes = u128::from(geometry.guaranteed_vector_bytes);
+        let scan_blocks = horizon
+            .checked_add(vector_bytes.checked_sub(1)?)?
+            .checked_div(vector_bytes)?;
+        let table_cache_lines = u128::try_from(geometry.gate_table_bytes)
+            .ok()?
+            .checked_add(63)?
+            .checked_div(64)?;
+        let gate_cost = scan_blocks
+            .checked_mul(u128::from(geometry.emitted_scan_instruction_units))?
+            .checked_add(table_cache_lines)?;
+        let full_cost = gate_cost
+            .checked_mul(4)?
+            .checked_add(expected_verification_cost)?;
+        let incumbent = report.incumbent_complete_dfa;
+        let incumbent_per_byte = u128::try_from(incumbent.hot_loads_per_byte)
+            .ok()?
+            .checked_mul(4)?
+            .checked_add(
+                u128::try_from(incumbent.hot_branches_per_byte)
+                    .ok()?
+                    .checked_mul(3)?,
+            )?;
+        let incumbent_cost = horizon.checked_mul(incumbent_per_byte)?;
+        let root_frequency = u128::from(report.selection_root_frequency_units);
+        let root_cardinality = report
+            .root_members
+            .iter()
+            .map(|members| members.count_ones())
+            .sum::<u32>();
+        let per_byte_scan_units =
+            u128::from(geometry.emitted_scan_instruction_units)
+                .checked_add(vector_bytes.checked_sub(1)?)?
+                .checked_div(vector_bytes)?
+                .max(1);
+        let ordinary_profitable =
+            gate_cost.checked_mul(8)?.checked_mul(denominator)?.checked_mul(
+                u128::from(EXACT_TEDDY_BYTE_FREQUENCY_DENOMINATOR),
+            )? <= horizon
+                .checked_mul(root_frequency)?
+                .checked_mul(4)?
+                .checked_mul(7)?
+                .checked_mul(no_candidate_numerator)?;
+        let dense_root_rate = per_byte_scan_units.checked_mul(4)?.max(8);
+        let dense_gain = per_byte_scan_units.checked_mul(1024)?;
+        let dense_profitable = root_cardinality >= 2
+            && root_frequency >= dense_root_rate
+            && root_frequency.checked_mul(denominator)?
+                >= dense_gain
+                    .checked_mul(u128::from(
+                        EXACT_TEDDY_BYTE_FREQUENCY_DENOMINATOR,
+                    ))?
+                    .checked_mul(u128::from(
+                        report.candidate_frequency_upper_bound,
+                    ))?
+            && gate_cost.checked_mul(8)?.checked_mul(denominator)?
+                <= horizon
+                    .checked_mul(4)?
+                    .checked_mul(7)?
+                    .checked_mul(no_candidate_numerator)?;
+        let table_base = usize::try_from(report.table_base).ok()?;
+        let table_end = usize::try_from(report.table_end).ok()?;
+        let expected_table_base = report
+            .incumbent_data_bytes
+            .checked_add(geometry.table_alignment.checked_sub(1)?)?
+            & !(geometry.table_alignment - 1);
+        let expected_table_end =
+            expected_table_base.checked_add(geometry.table_extent_bytes)?;
+        let after_auxiliary =
+            expected_table_end.checked_add(geometry.auxiliary_table_bytes)?;
+        let expected_masks_offset = after_auxiliary.checked_add(7)? & !7;
+        let expected_descriptors_offset =
+            expected_masks_offset.checked_add(64)?;
+        let expected_literal_bytes_offset = expected_descriptors_offset
+            .checked_add(source_count.checked_mul(8)?)?;
+        let expected_literal_bytes_end =
+            expected_literal_bytes_offset.checked_add(report.source_bytes)?;
+        let incumbent_code_end = report
+            .incumbent_code_offset
+            .checked_add(report.incumbent_code_bytes)?;
+        Some(
+            (4..=64).contains(&source_count)
+                && source_count == literal_count
+                && minimum_width >= 3
+                && minimum_width >= columns
+                && minimum_width <= maximum_width
+                && report.source_bytes >= minimum_source_bytes
+                && report.source_bytes <= maximum_source_bytes
+                && matches!(report.columns, 3 | 4)
+                && report.bucket_count
+                    == u8::try_from(literal_count.min(8)).ok()?
+                && report.fingerprint_space == fingerprint_space
+                && report.candidate_fingerprint_upper_bound != 0
+                && report.candidate_fingerprint_upper_bound
+                    <= collision_ceiling
+                && report.candidate_fingerprint_upper_bound
+                    <= report.fingerprint_space
+                && report.candidate_frequency_upper_bound != 0
+                && report.candidate_frequency_upper_bound
+                    <= report.fingerprint_space
+                && expected_candidate_numerator.checked_mul(2)? <= denominator
+                && report.plan_scan_instruction_units
+                    == geometry.plan_scan_instruction_units
+                && report.emitted_scan_instruction_units
+                    == geometry.emitted_scan_instruction_units
+                && report.guaranteed_vector_bytes
+                    == geometry.guaranteed_vector_bytes
+                && report.gate_table_bytes == geometry.gate_table_bytes
+                && report.input_floor_bytes == EXACT_TEDDY_INPUT_FLOOR_BYTES
+                && report.selection_horizon_bytes
+                    == EXACT_TEDDY_INPUT_FLOOR_BYTES
+                && report.runtime_verification_budget
+                    == EXACT_TEDDY_RUNTIME_VERIFICATION_BUDGET
+                && report.selection_probability_denominator == denominator
+                && report.selection_no_candidate_numerator
+                    == no_candidate_numerator
+                && report.selection_gate_cost_units == gate_cost
+                && report.selection_expected_verification_cost_units
+                    == expected_verification_cost
+                && report.selection_full_cost_units == full_cost
+                && report.selection_incumbent_cost_units == incumbent_cost
+                && full_cost.checked_mul(8)?
+                    <= incumbent_cost.checked_mul(7)?
+                && (1..=EXACT_TEDDY_BYTE_FREQUENCY_DENOMINATOR)
+                    .contains(&report.selection_root_frequency_units)
+                && root_cardinality != 0
+                && (ordinary_profitable || dense_profitable)
+                && incumbent.forward_states != 0
+                && (1..=256).contains(&incumbent.alphabet_classes)
+                && incumbent.transition_cells
+                    == incumbent
+                        .forward_states
+                        .checked_mul(incumbent.alphabet_classes)?
+                && incumbent.minimum_native_data_bytes != 0
+                && incumbent.native_data_bytes
+                    >= incumbent.minimum_native_data_bytes
+                && incumbent.hot_loads_per_byte != 0
+                && incumbent.hot_branches_per_byte != 0
+                && !incumbent.has_accelerator
+                && incumbent.scanner == fre_aot_regex::StartAccelerator::None
+                && report.incumbent_data_bytes == incumbent.native_data_bytes
+                && table_base == expected_table_base
+                && table_end == expected_table_end
+                && usize::try_from(report.bucket_ordinal_masks_offset).ok()?
+                    == expected_masks_offset
+                && usize::try_from(report.literal_descriptors_offset).ok()?
+                    == expected_descriptors_offset
+                && usize::try_from(report.literal_bytes_offset).ok()?
+                    == expected_literal_bytes_offset
+                && usize::try_from(report.literal_bytes_end).ok()?
+                    == expected_literal_bytes_end
+                && report.native_data_bytes == expected_literal_bytes_end
+                && report.native_data_bytes == receipt.data_bytes
+                && incumbent_code_end <= receipt.code_bytes,
+        )
+    })()
+    .unwrap_or(false)
+}
+
+/// Copy the transient direct-Teddy report while `CompiledRegex` still owns
+/// both its semantic program and authenticated module. The module installs
+/// this report only after checking its code, data, relocations, literal plan,
+/// costs and retained DFA. These checks bind that installed report to the
+/// public compile receipt before the loader consumes the compilation.
+fn copy_authenticated_exact_finite_selected_end_teddy(
+    compiled: &fre_aot_regex::CompiledRegex,
+) -> Result<
+    Option<fre_aot_regex::ExactFiniteSelectedEndTeddyAotReport>,
+    &'static str,
+> {
+    let receipt = compiled.receipt();
+    let receipt_report = receipt.exact_finite_selected_end_teddy_aot;
+    let module_report = compiled
+        .module()
+        .exact_finite_selected_end_teddy_aot_report()
+        .copied();
+    if receipt_report != module_report {
+        return Err("compiled_teddy_report_module_mismatch");
+    }
+    let Some(report) = receipt_report else { return Ok(None) };
+    let incumbent = report.incumbent_complete_dfa;
+    let hashes = [
+        report.artifact_identity,
+        report.literal_sha256,
+        report.prefix_plan_sha256,
+        report.native_code_sha256,
+        report.native_data_sha256,
+        report.relocations_sha256,
+        report.incumbent_code_sha256,
+        report.incumbent_data_sha256,
+        report.incumbent_relocations_sha256,
+        incumbent.semantic_dfa_sha256,
+    ];
+    let code_end =
+        report.incumbent_code_offset.checked_add(report.incumbent_code_bytes);
+    if report.artifact_identity != compiled.program().artifact_identity()
+        || report.artifact_identity != receipt.program_sha256
+        || report.output != fre_aot_regex::OutputContract::SelectedEnd
+        || report.output != receipt.output
+        || receipt.entry_abi != fre_aot_regex::EntryAbi::SelectedEndSearchV1
+        || report.target != receipt.target
+        || report.scanner != receipt.start_accelerator
+        || !exact_teddy_report_invariants_authenticate(&report, receipt)
+        || hashes.contains(&[0; 32])
+        || report.source_count == 0
+        || report.literal_count
+            != u16::try_from(report.source_count).unwrap_or(0)
+        || report.minimum_width == 0
+        || report.minimum_width > report.maximum_width
+        || !matches!(report.columns, 3 | 4)
+        || report.bucket_count == 0
+        || report.candidate_fingerprint_upper_bound == 0
+        || report.candidate_fingerprint_upper_bound > report.fingerprint_space
+        || report.candidate_frequency_upper_bound == 0
+        || report.candidate_frequency_upper_bound > report.fingerprint_space
+        || report.input_floor_bytes == 0
+        || report.selection_horizon_bytes < report.input_floor_bytes
+        || report.selection_probability_denominator == 0
+        || report.selection_no_candidate_numerator
+            > report.selection_probability_denominator
+        || report.selection_full_cost_units
+            > report.selection_incumbent_cost_units
+        || report.runtime_verification_budget == 0
+        || report.table_base >= report.table_end
+        || report.incumbent_data_bytes != incumbent.native_data_bytes
+        || report.incumbent_data_bytes > report.native_data_bytes
+        || report.native_data_bytes != receipt.data_bytes
+        || code_end.is_none_or(|end| end > receipt.code_bytes)
+        || incumbent.forward_states == 0
+        || incumbent.alphabet_classes == 0
+        || incumbent.transition_cells == 0
+    {
+        return Err("compiled_teddy_report_authentication_failed");
+    }
+    Ok(Some(report))
+}
+
+/// Identify the actual native entry route. In particular, the semantic DFA
+/// retained behind Teddy's short-input and budget tail edges is never called
+/// the primary route.
+fn selected_primary_native_route(
+    receipt: &fre_aot_regex::CompileReceipt,
+) -> &'static str {
+    if receipt.exact_finite_selected_end_teddy_aot.is_some() {
+        return "exact_finite_selected_end_teddy";
+    }
+    if receipt.slow_context_aot.is_some() {
+        return "slow_context_dfa";
+    }
+    if receipt.compiler_k0_aot.is_some() {
+        return "compiler_k0_dfa";
+    }
+    if receipt.slow_aot.is_some() {
+        return "slow_dfa";
+    }
+    if receipt.ordered_finite_language_aot.is_some() {
+        return "ordered_finite_language";
+    }
+    match receipt.engine {
+        fre_aot_regex::EngineKind::OrderedNfa => "ordered_nfa",
+        fre_aot_regex::EngineKind::OrderedDfa => "ordered_dfa",
+        fre_aot_regex::EngineKind::OrderedContextDfa => "ordered_context_dfa",
+    }
+}
+
 /// Return the most specific complete forward/reverse geometry authenticated
 /// by the compile receipt. Optimizer-selected contextual, compiler-K0 and slow
 /// DFA sidecars take precedence over the stable semantic DFA. An installed
@@ -1282,6 +1966,13 @@ fn entry_abi_name(entry_abi: fre_aot_regex::EntryAbi) -> &'static str {
 fn selected_machine_states(
     receipt: &fre_aot_regex::CompileReceipt,
 ) -> (Option<&'static str>, Option<u64>, Option<u64>) {
+    if let Some(report) = &receipt.exact_finite_selected_end_teddy_aot {
+        return (
+            Some("exact_finite_selected_end_teddy_incumbent"),
+            Some(u64_len(report.incumbent_complete_dfa.forward_states)),
+            Some(0),
+        );
+    }
     if let Some(report) = &receipt.slow_context_aot {
         return (
             Some("slow_context_aot"),
@@ -1489,6 +2180,17 @@ fn compile_native_factory(
     if cancelled.load(Ordering::SeqCst) {
         return Err("compilation_cancelled".to_owned());
     }
+    let exact_finite_selected_end_teddy_aot =
+        match copy_authenticated_exact_finite_selected_end_teddy(&compiled) {
+            Ok(report) => report,
+            Err(refusal_class) => {
+                let mut classification =
+                    receipt_classification.lock().unwrap();
+                classification.publication_stage = "artifact_validation";
+                classification.publication_refusal_class = Some(refusal_class);
+                return Err(refusal_class.to_owned());
+            }
+        };
     let receipt = compiled.receipt();
     let (
         compiled_state_source,
@@ -1515,6 +2217,10 @@ fn compile_native_factory(
             Some(receipt.passes.contains(
                 &fre_aot_regex::OptimizationPass::ReverseStartRecovery,
             ));
+        classification.compiled_primary_native_route =
+            Some(selected_primary_native_route(receipt));
+        classification.exact_finite_selected_end_teddy_aot =
+            exact_finite_selected_end_teddy_aot;
         classification.runtime_helper_required =
             receipt.runtime_helper_required;
         classification.publication_stage = "publish";
@@ -1715,6 +2421,7 @@ mod tests {
         classification.compiled_forward_states = Some(17);
         classification.compiled_reverse_states = Some(0);
         classification.compiled_reverse_start_recovery = Some(false);
+        classification.compiled_primary_native_route = Some("ordered_dfa");
         classification.publication_stage = "artifact_validation";
         classification.publication_refusal_class =
             Some("runtime_helper_required");
@@ -1724,6 +2431,8 @@ mod tests {
 
         let receipt = state.receipt_json();
         assert_eq!(receipt["schema"], RECEIPT_SCHEMA);
+        assert_eq!(receipt["wait_requested"], false);
+        assert_eq!(receipt["compiler_settled"], false);
         assert_eq!(receipt["target_feature_profile"], "sve2");
         assert_eq!(
             receipt["requested_target_feature_bits"],
@@ -1740,6 +2449,11 @@ mod tests {
         assert_eq!(receipt["compiled_forward_states"], 17);
         assert_eq!(receipt["compiled_reverse_states"], 0);
         assert_eq!(receipt["compiled_reverse_start_recovery"], false);
+        assert_eq!(receipt["compiled_primary_native_route"], "ordered_dfa");
+        assert_eq!(
+            receipt["exact_finite_selected_end_teddy_aot"],
+            serde_json::Value::Null
+        );
         assert_eq!(receipt["publication_stage"], "artifact_validation");
         assert_eq!(
             receipt["publication_refusal_class"],
@@ -1747,6 +2461,158 @@ mod tests {
         );
         assert_eq!(receipt["runtime_helper_required"], true);
         assert_eq!(receipt["decline_reason"], "runtime_helper_required");
+    }
+
+    #[test]
+    fn receipt_attests_requested_compiler_settlement() {
+        let state = CompileState::empty_with_receipt_options(
+            ReceiptClassification::pending("auto"),
+            None,
+            true,
+            0,
+        );
+        state.outcome.set(Err("settled_decline".to_owned())).unwrap();
+        state.compiler_settled.store(true, Ordering::Release);
+
+        let receipt = state.receipt_json();
+        assert_eq!(receipt["wait_requested"], true);
+        assert_eq!(receipt["compiler_settled"], true);
+        assert_eq!(receipt["outcome"], "declined");
+    }
+
+    #[test]
+    fn exact_teddy_receipt_is_copied_and_names_primary_not_incumbent() {
+        use fre_aot_regex::{
+            CompileMode, CompileRequest, CpuFeature, FeatureSet,
+            OutputContract, Target, compile,
+        };
+
+        let target = Target::aarch64_linux()
+            .with_features(FeatureSet::of(CpuFeature::Aarch64Asimd))
+            .unwrap();
+        let mut pattern = String::from("(?-u:");
+        for (ordinal, byte) in [
+            0x00_u8, 0x12, 0x3f, 0x51, 0x7e, 0x8a, 0x92, 0xa4, 0x0c, 0x18,
+            0x1e, 0x58, 0x5e, 0x8f, 0x98, 0x9e, 0xaa,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            if ordinal != 0 {
+                pattern.push('|');
+            }
+            for _ in 0..6 {
+                use std::fmt::Write as _;
+                write!(&mut pattern, "\\x{byte:02x}").unwrap();
+            }
+            if ordinal == 16 {
+                pattern.push_str("\\xaa");
+            }
+        }
+        pattern.push(')');
+        let compiled = compile(
+            CompileRequest::new(pattern, target)
+                .mode(CompileMode::Optimizing)
+                .output(OutputContract::SelectedEnd),
+        )
+        .unwrap();
+        let report =
+            copy_authenticated_exact_finite_selected_end_teddy(&compiled)
+                .unwrap()
+                .expect("the exact finite fixture selects Teddy");
+        assert!(exact_teddy_report_invariants_authenticate(
+            &report,
+            compiled.receipt(),
+        ));
+        assert_eq!(
+            selected_primary_native_route(compiled.receipt()),
+            "exact_finite_selected_end_teddy"
+        );
+        let (source, forward, reverse) =
+            selected_machine_states(compiled.receipt());
+        assert_eq!(source, Some("exact_finite_selected_end_teddy_incumbent"));
+        assert_eq!(
+            forward,
+            Some(u64_len(report.incumbent_complete_dfa.forward_states))
+        );
+        assert_eq!(reverse, Some(0));
+
+        let json = exact_finite_selected_end_teddy_receipt_json(&report);
+        assert_eq!(json["authenticated_compiler_report"], true);
+        assert_eq!(json["output_contract"], "selected_end");
+        assert_eq!(json["selected_target_tier"], "aarch64_asimd");
+        assert_eq!(json["emitted_isa"], "aarch64_asimd");
+        assert_eq!(json["scanner"], "aarch64_asimd");
+        assert_eq!(
+            json["incumbent"]["semantic_dfa_sha256"].as_str().map(str::len),
+            Some(64)
+        );
+        assert_ne!(
+            json["selection_full_cost_units_decimal"],
+            serde_json::Value::Null
+        );
+        assert_eq!(json["input_floor_bytes"], 4096);
+        assert_eq!(json["selection_horizon_bytes"], 4096);
+        assert_eq!(json["runtime_verification_budget"], 64);
+
+        for changed in [
+            {
+                let mut changed = report;
+                changed.source_count = 3;
+                changed
+            },
+            {
+                let mut changed = report;
+                changed.minimum_width = 2;
+                changed
+            },
+            {
+                let mut changed = report;
+                changed.input_floor_bytes = 4095;
+                changed
+            },
+            {
+                let mut changed = report;
+                changed.selection_horizon_bytes = 4097;
+                changed
+            },
+            {
+                let mut changed = report;
+                changed.runtime_verification_budget = 63;
+                changed
+            },
+            {
+                let mut changed = report;
+                changed.fingerprint_space -= 1;
+                changed
+            },
+            {
+                let mut changed = report;
+                changed.selection_gate_cost_units += 1;
+                changed
+            },
+            {
+                let mut changed = report;
+                changed.incumbent_complete_dfa.transition_cells -= 1;
+                changed
+            },
+            {
+                let mut changed = report;
+                changed.incumbent_complete_dfa.has_accelerator = true;
+                changed
+            },
+            {
+                let mut changed = report;
+                changed.incumbent_complete_dfa.scanner =
+                    fre_aot_regex::StartAccelerator::Scalar;
+                changed
+            },
+        ] {
+            assert!(!exact_teddy_report_invariants_authenticate(
+                &changed,
+                compiled.receipt(),
+            ));
+        }
     }
 
     #[test]
@@ -1866,6 +2732,47 @@ mod tests {
             grep::regex::RegexMatcherBuilder::new().build("a").unwrap();
         let shared = CompileState::empty();
         (matcher_with(stock, Arc::clone(&shared)), shared)
+    }
+
+    #[test]
+    fn settlement_matcher_drop_joins_before_cancelling_shared_state() {
+        let stock =
+            grep::regex::RegexMatcherBuilder::new().build("a").unwrap();
+        let shared = CompileState::empty_with_receipt_options(
+            ReceiptClassification::pending("auto"),
+            None,
+            true,
+            0,
+        );
+        let weak = Arc::downgrade(&shared);
+        let cancelled = Arc::clone(&shared.cancelled);
+        let compiler_settled = Arc::clone(&shared.compiler_settled);
+        let completed = Arc::new(AtomicBool::new(false));
+        let completed_worker = Arc::clone(&completed);
+        *shared.join.lock().unwrap() = Some(std::thread::spawn(move || {
+            let _settlement = CompilerSettlementGuard(compiler_settled);
+            loop {
+                let Some(snapshot) = weak.upgrade() else {
+                    return;
+                };
+                if snapshot.test_wait_join_entered.load(Ordering::Acquire) {
+                    assert!(!cancelled.load(Ordering::SeqCst));
+                    snapshot
+                        .outcome
+                        .set(Err("settled_test_decline".to_owned()))
+                        .unwrap();
+                    completed_worker.store(true, Ordering::Release);
+                    return;
+                }
+                drop(snapshot);
+                std::thread::yield_now();
+            }
+        }));
+        let matcher = matcher_with(stock, Arc::clone(&shared));
+        drop(shared);
+
+        drop(matcher);
+        assert!(completed.load(Ordering::Acquire));
     }
 
     #[test]

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib.util
+import copy
 import json
 import os
 from pathlib import Path
@@ -44,6 +45,10 @@ def receipt_fixture(**overrides):
         "compiled_forward_states": None,
         "compiled_reverse_states": None,
         "compiled_reverse_start_recovery": None,
+        "compiled_primary_native_route": None,
+        "exact_finite_selected_end_teddy_aot": None,
+        "wait_requested": False,
+        "compiler_settled": True,
         "runtime_helper_required": False,
         "published_code_bytes": None,
         "published_read_only_data_bytes": None,
@@ -83,6 +88,7 @@ def ready_receipt(**overrides):
         compiled_forward_states=17,
         compiled_reverse_states=0,
         compiled_reverse_start_recovery=False,
+        compiled_primary_native_route="ordered_dfa",
         published_code_bytes=4096,
         published_read_only_data_bytes=1024,
         published_total_mapped_bytes=8192,
@@ -95,6 +101,97 @@ def ready_receipt(**overrides):
     return receipt
 
 
+def exact_teddy_report_fixture(**overrides):
+    digest = "1" * 64
+    report = {
+        "authenticated_compiler_report": True,
+        "artifact_identity_sha256": digest,
+        "output_contract": HARNESS.COMPILED_OUTPUT_CONTRACT,
+        "literal_sha256": "2" * 64,
+        "prefix_plan_sha256": "3" * 64,
+        "native_code_sha256": "4" * 64,
+        "native_data_sha256": "5" * 64,
+        "relocations_sha256": "6" * 64,
+        "source_count": 4,
+        "source_bytes": 20,
+        "minimum_width": 4,
+        "maximum_width": 7,
+        "root_members": [1, 1 << 33, 0, 0],
+        "columns": 4,
+        "bucket_count": 4,
+        "literal_count": 4,
+        "candidate_fingerprint_upper_bound": 10,
+        "candidate_frequency_upper_bound": 20,
+        "fingerprint_space": 1 << 32,
+        "plan_scan_instruction_units": 31,
+        "emitted_scan_instruction_units": 27,
+        "guaranteed_vector_bytes": 16,
+        "gate_table_bytes": 128,
+        "selected_target_tier": "aarch64_sve2",
+        "emitted_isa": "aarch64_sve",
+        "scanner": "aarch64_sve",
+        "target": {
+            "architecture": "aarch64",
+            "operating_system": "linux",
+            "abi": "aapcs64",
+            "feature_bits": 7 << 32,
+        },
+        "input_floor_bytes": 4096,
+        "selection_horizon_bytes": 4096,
+        "selection_gate_cost_units_decimal": "6914",
+        "selection_expected_verification_cost_units_decimal": "1",
+        "selection_full_cost_units_decimal": "27657",
+        "selection_incumbent_cost_units_decimal": "57344",
+        "selection_root_frequency_units": 25,
+        "selection_no_candidate_numerator_decimal": "4294885376",
+        "selection_probability_denominator_decimal": "4294967296",
+        "runtime_verification_budget": 64,
+        "table_base": 128,
+        "table_end": 256,
+        "bucket_ordinal_masks_offset": 256,
+        "literal_descriptors_offset": 320,
+        "literal_bytes_offset": 352,
+        "literal_bytes_end": 372,
+        "native_data_bytes": 372,
+        "incumbent": {
+            "semantic_dfa_sha256": "7" * 64,
+            "forward_states": 23,
+            "alphabet_classes": 9,
+            "transition_cells": 207,
+            "minimum_native_data_bytes": 64,
+            "native_data_bytes": 128,
+            "hot_loads_per_byte": 2,
+            "hot_branches_per_byte": 2,
+            "has_accelerator": False,
+            "scanner": "none",
+            "native_code_sha256": "8" * 64,
+            "native_data_sha256": "9" * 64,
+            "relocations_sha256": "a" * 64,
+            "native_code_offset": 100,
+            "native_code_bytes": 50,
+            "relocation_count": 0,
+        },
+    }
+    report.update(overrides)
+    return report
+
+
+def exact_teddy_ready_receipt(**overrides):
+    receipt = ready_receipt(
+        start_accelerator="aarch64_sve",
+        compiled_state_source=(
+            "exact_finite_selected_end_teddy_incumbent"
+        ),
+        compiled_forward_states=23,
+        compiled_reverse_states=0,
+        compiled_primary_native_route=HARNESS.EXACT_TEDDY_PRIMARY_ROUTE,
+        exact_finite_selected_end_teddy_aot=exact_teddy_report_fixture(),
+        published_read_only_data_bytes=372,
+    )
+    receipt.update(overrides)
+    return receipt
+
+
 class HarnessTests(unittest.TestCase):
     def test_run_once_scrubs_control_environment(self) -> None:
         with tempfile.TemporaryDirectory() as text:
@@ -102,8 +199,9 @@ class HarnessTests(unittest.TestCase):
             executable = root / "inspect-env"
             executable.write_text(
                 "#!/bin/sh\n"
-                "printf '%s|%s|%s|%s\\n' "
-                '"${RG_FRE_AOT_BACKGROUND_RECEIPT-unset}" '
+                "printf '%s|%s|%s|%s|%s\\n' "
+                '"${RG_FRE_AOT_BACKGROUND_RECEIPT+set}" '
+                '"${RG_FRE_AOT_BACKGROUND_RECEIPT_WAIT_FOR_COMPILER-unset}" '
                 '"${RG_FRE_AOT_BACKGROUND_TEST_MIN_STOCK_BYTES-unset}" '
                 '"${RG_FRE_AOT_BACKGROUND_CPU_PROFILE-unset}" '
                 '"${RIPGREP_CONFIG_PATH-unset}"\n'
@@ -111,6 +209,7 @@ class HarnessTests(unittest.TestCase):
             executable.chmod(0o700)
             inherited = {
                 HARNESS.RECEIPT_ENV: "inherited-receipt",
+                HARNESS.RECEIPT_WAIT_FOR_COMPILER_ENV: "inherited-wait",
                 HARNESS.CORRECTNESS_GATE_ENV: "inherited-gate",
                 HARNESS.CPU_PROFILE_ENV: "inherited-profile",
                 "RIPGREP_CONFIG_PATH": "inherited-config",
@@ -125,6 +224,7 @@ class HarnessTests(unittest.TestCase):
                     cpu_profile="auto",
                     timeout_seconds=5.0,
                     test_min_stock_bytes=123,
+                    collect_timing=False,
                 )
                 background = HARNESS.run_once(
                     binary=executable,
@@ -135,9 +235,75 @@ class HarnessTests(unittest.TestCase):
                     cpu_profile="sve",
                     timeout_seconds=5.0,
                     test_min_stock_bytes=123,
+                    collect_timing=False,
                 )
-        self.assertEqual(b"unset|unset|unset|unset\n", normal["stdout_raw"])
-        self.assertEqual(b"unset|123|sve|unset\n", background["stdout_raw"])
+                settlement = HARNESS.run_once(
+                    binary=executable,
+                    args=[],
+                    cwd=root,
+                    background=True,
+                    capture_receipt=True,
+                    cpu_profile="auto",
+                    timeout_seconds=5.0,
+                    collect_timing=False,
+                    wait_for_compiler_settlement=True,
+                )
+        self.assertEqual(
+            b"|unset|unset|unset|unset\n", normal["stdout_raw"]
+        )
+        self.assertEqual(
+            b"|unset|123|sve|unset\n", background["stdout_raw"]
+        )
+        self.assertEqual(
+            b"set|1|unset|auto|unset\n", settlement["stdout_raw"]
+        )
+
+    def test_settlement_mode_requires_a_background_receipt(self) -> None:
+        with self.assertRaises(HARNESS.HarnessError):
+            HARNESS.run_once(
+                binary=Path("unused"),
+                args=[],
+                cwd=Path("."),
+                background=False,
+                capture_receipt=False,
+                cpu_profile="auto",
+                timeout_seconds=1.0,
+                collect_timing=False,
+                wait_for_compiler_settlement=True,
+            )
+
+    def test_run_once_can_omit_timing_collection(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            executable = root / "success"
+            executable.write_text("#!/bin/sh\nexit 0\n")
+            executable.chmod(0o700)
+            with (
+                mock.patch.object(
+                    HARNESS.time,
+                    "perf_counter_ns",
+                    side_effect=AssertionError("wall clock sampled"),
+                ),
+                mock.patch.object(
+                    HARNESS.resource,
+                    "getrusage",
+                    side_effect=AssertionError("child CPU sampled"),
+                ),
+            ):
+                result = HARNESS.run_once(
+                    binary=executable,
+                    args=[],
+                    cwd=root,
+                    background=False,
+                    capture_receipt=False,
+                    cpu_profile="auto",
+                    timeout_seconds=5.0,
+                    collect_timing=False,
+                )
+        self.assertEqual(0, result["status"])
+        self.assertNotIn("elapsed_ns", result)
+        self.assertNotIn("user_ns", result)
+        self.assertNotIn("system_ns", result)
 
     def test_non_object_receipt_is_rejected_without_crashing(self) -> None:
         self.assertEqual(
@@ -323,6 +489,7 @@ class HarnessTests(unittest.TestCase):
             compiled_forward_states=None,
             compiled_reverse_states=None,
             compiled_state_source=None,
+            compiled_primary_native_route="ordered_nfa",
         )
         self.assertEqual([], HARNESS.validate_receipt(nfa, "auto"))
         nfa["compiled_forward_states"] = 1
@@ -332,12 +499,14 @@ class HarnessTests(unittest.TestCase):
         )
         nfa["compiled_reverse_states"] = 0
         nfa["compiled_state_source"] = "slow_aot"
+        nfa["compiled_primary_native_route"] = "slow_dfa"
         self.assertEqual([], HARNESS.validate_receipt(nfa, "auto"))
 
         finite = ready_receipt(
             compiled_state_source="ordered_finite_language",
             compiled_forward_states=9,
             compiled_reverse_states=0,
+            compiled_primary_native_route="ordered_finite_language",
         )
         self.assertEqual([], HARNESS.validate_receipt(finite, "auto"))
 
@@ -348,6 +517,7 @@ class HarnessTests(unittest.TestCase):
             compiled_forward_states=11,
             compiled_reverse_states=7,
             compiled_reverse_start_recovery=False,
+            compiled_primary_native_route="ordered_context_dfa",
         )
         self.assertEqual([], HARNESS.validate_receipt(contextual, "auto"))
 
@@ -359,6 +529,199 @@ class HarnessTests(unittest.TestCase):
             "missing_compiled_entry_abi",
             HARNESS.validate_receipt(receipt, "auto"),
         )
+
+    def test_v5_exact_teddy_route_and_incumbent_are_unambiguous(self) -> None:
+        receipt = exact_teddy_ready_receipt()
+        self.assertEqual([], HARNESS.validate_receipt(receipt, "auto"))
+
+        receipt["compiled_primary_native_route"] = "ordered_dfa"
+        failures = HARNESS.validate_receipt(receipt, "auto")
+        self.assertIn("primary_native_route_state_mismatch", failures)
+        self.assertIn("exact_teddy_report_on_non_teddy_route", failures)
+
+        receipt = exact_teddy_ready_receipt()
+        receipt["exact_finite_selected_end_teddy_aot"]["incumbent"][
+            "semantic_dfa_sha256"
+        ] = "0" * 64
+        self.assertIn(
+            "invalid_exact_teddy_incumbent_semantic_dfa_sha256",
+            HARNESS.validate_receipt(receipt, "auto"),
+        )
+
+    def test_exact_teddy_report_rejects_selection_boundaries(self) -> None:
+        cases = (
+            ("source_low", {"source_count": 3},
+             "exact_teddy_source_count_range"),
+            ("source_high", {"source_count": 65},
+             "exact_teddy_source_count_range"),
+            ("width_below_three", {"minimum_width": 2},
+             "exact_teddy_width_geometry"),
+            ("width_below_columns", {"minimum_width": 3},
+             "exact_teddy_width_geometry"),
+            ("source_bytes", {"source_bytes": 15},
+             "exact_teddy_source_bytes_bounds"),
+            ("fingerprint_space", {"fingerprint_space": (1 << 32) - 1},
+             "exact_teddy_fingerprint_space"),
+            ("input_floor", {"input_floor_bytes": 4095},
+             "exact_teddy_input_floor"),
+            ("horizon", {"selection_horizon_bytes": 4097},
+             "exact_teddy_selection_horizon"),
+            ("budget", {"runtime_verification_budget": 63},
+             "exact_teddy_runtime_verification_budget"),
+            ("plan_units", {"plan_scan_instruction_units": 30},
+             "exact_teddy_plan_scan_units"),
+            ("sve2_emission", {"emitted_isa": "aarch64_sve2"},
+             "exact_teddy_emitted_isa_scanner_mismatch"),
+            ("gate_cost", {"selection_gate_cost_units_decimal": "6915"},
+             "exact_teddy_gate_cost_equation"),
+            ("full_cost", {"selection_full_cost_units_decimal": "27658"},
+             "exact_teddy_full_cost_equation"),
+            ("margin", {"selection_incumbent_cost_units_decimal": "30000"},
+             "exact_teddy_incumbent_cost_equation"),
+            ("layout", {"literal_bytes_end": 373},
+             "exact_teddy_native_data_layout"),
+        )
+        for name, changed, expected in cases:
+            with self.subTest(name=name):
+                receipt = exact_teddy_ready_receipt()
+                receipt["exact_finite_selected_end_teddy_aot"].update(changed)
+                self.assertIn(
+                    expected, HARNESS.validate_receipt(receipt, "auto")
+                )
+
+    def test_exact_teddy_report_binds_incumbent_geometry(self) -> None:
+        mutations = (
+            ("transition_cells", 206,
+             "exact_teddy_incumbent_transition_geometry"),
+            ("has_accelerator", True,
+             "exact_teddy_incumbent_has_accelerator"),
+            ("scanner", "scalar", "exact_teddy_incumbent_scanner"),
+        )
+        for field, value, expected in mutations:
+            with self.subTest(field=field):
+                receipt = copy.deepcopy(exact_teddy_ready_receipt())
+                receipt["exact_finite_selected_end_teddy_aot"][
+                    "incumbent"
+                ][field] = value
+                self.assertIn(
+                    expected, HARNESS.validate_receipt(receipt, "auto")
+                )
+        receipt = exact_teddy_ready_receipt(compiled_forward_states=22)
+        self.assertIn(
+            "exact_teddy_top_nested_forward_states",
+            HARNESS.validate_receipt(receipt, "auto"),
+        )
+
+    def test_legacy_v4_receipt_evidence_remains_readable(self) -> None:
+        receipt = ready_receipt(schema=HARNESS.LEGACY_RECEIPT_SCHEMA)
+        del receipt["compiled_primary_native_route"]
+        del receipt["exact_finite_selected_end_teddy_aot"]
+        del receipt["wait_requested"]
+        del receipt["compiler_settled"]
+        self.assertEqual([], HARNESS.validate_receipt(receipt, "auto"))
+        self.assertIn(
+            "current_receipt_schema_required",
+            HARNESS.validate_receipt(
+                receipt, "auto", require_current_schema=True
+            ),
+        )
+
+        case = HARNESS.QueryCase("q", "test", "raw", 1, None, {})
+        row = {
+            "private_id": "q",
+            "exact_normal_background": True,
+            "exact_stock_normal": True,
+            "receipt_failures": [],
+            "normalization": [],
+            "normal": {"status": 0},
+            "background": {"timed_out": False, "receipt": receipt},
+        }
+        classification = HARNESS.aggregate_observations(
+            [row], {"q": case}
+        )["receipt_classification"]
+        self.assertNotIn("primary_native_routes", classification)
+        self.assertNotIn("exact_teddy_target_tiers", classification)
+
+    def test_exact_teddy_census_uses_only_authenticated_primary_route(self) -> None:
+        cases = [
+            HARNESS.QueryCase("q1", "first", "raw-one", 1, None, {}),
+            HARNESS.QueryCase("q2", "second", "raw-two", 1, None, {}),
+        ]
+
+        def row(case, receipt, failures=None):
+            return {
+                "private_id": case.private_id,
+                "cohort": case.cohort,
+                "cpu_profile": "auto",
+                "panel": HARNESS.EXACT_TEDDY_CENSUS_PANEL,
+                "receipt_failures": failures or [],
+                "background": {"receipt": receipt},
+            }
+
+        private, public = HARNESS.exact_teddy_diagnostic_census(
+            [
+                row(cases[0], exact_teddy_ready_receipt(
+                    wait_requested=True, compiler_settled=True,
+                )),
+                row(cases[1], ready_receipt(
+                    wait_requested=True, compiler_settled=True,
+                )),
+            ],
+            cases,
+            ["auto"],
+        )
+        profile = private["per_profile"]["auto"]
+        self.assertEqual(1, profile["compiler_selected_exact_teddy"])
+        self.assertEqual(1, profile["published_exact_teddy"])
+        self.assertEqual(
+            ["auto/first/q1"],
+            profile[
+                "compiler_selected_exact_teddy_fully_qualified_ids"
+            ],
+        )
+        self.assertFalse(public["contains_query_ids"])
+        self.assertNotIn(
+            "compiler_selected_exact_teddy_fully_qualified_ids",
+            public["per_profile"]["auto"],
+        )
+
+        unsettled_private, _ = HARNESS.exact_teddy_diagnostic_census(
+            [row(cases[0], exact_teddy_ready_receipt())],
+            [cases[0]],
+            ["auto"],
+        )
+        unsettled = unsettled_private["per_profile"]["auto"]
+        self.assertEqual(0, unsettled["compiler_selected_exact_teddy"])
+        self.assertEqual(1, unsettled["invalid_receipts"])
+
+    def test_settlement_receipt_requires_definitive_outcome(self) -> None:
+        settled = ready_receipt(
+            wait_requested=True, compiler_settled=True
+        )
+        self.assertEqual(
+            [],
+            HARNESS.validate_receipt(
+                settled,
+                "auto",
+                require_current_schema=True,
+                require_compiler_settlement=True,
+            ),
+        )
+        unfinished = receipt_fixture(
+            outcome="unfinished",
+            decline_reason="search finished before background compilation",
+            wait_requested=True,
+            compiler_settled=False,
+        )
+        failures = HARNESS.validate_receipt(
+            unfinished,
+            "auto",
+            require_current_schema=True,
+            require_compiler_settlement=True,
+        )
+        self.assertIn("requested_compiler_not_settled", failures)
+        self.assertIn("compiler_not_settled", failures)
+        self.assertIn("compiler_outcome_unfinished", failures)
 
     def test_first_candidate_midscan_cutover_is_strict(self) -> None:
         receipt = ready_receipt(

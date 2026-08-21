@@ -42,19 +42,39 @@ FREEZE_RELATIVE = Path(
 )
 BACKGROUND_FLAG = "--fre-aot-background"
 RECEIPT_ENV = "RG_FRE_AOT_BACKGROUND_RECEIPT"
+RECEIPT_WAIT_FOR_COMPILER_ENV = (
+    "RG_FRE_AOT_BACKGROUND_RECEIPT_WAIT_FOR_COMPILER"
+)
 CORRECTNESS_GATE_ENV = "RG_FRE_AOT_BACKGROUND_TEST_MIN_STOCK_BYTES"
 CPU_PROFILE_ENV = "RG_FRE_AOT_BACKGROUND_CPU_PROFILE"
-RECEIPT_SCHEMA = "ripgrep.fre-aot-background.v4"
+RECEIPT_SCHEMA = "ripgrep.fre-aot-background.v5"
+LEGACY_RECEIPT_SCHEMA = "ripgrep.fre-aot-background.v4"
+SUPPORTED_RECEIPT_SCHEMAS = frozenset((
+    LEGACY_RECEIPT_SCHEMA, RECEIPT_SCHEMA,
+))
 RESULT_SCHEMA = "ripgrep.fre-aot-representative"
 COMPILED_OUTPUT_CONTRACT = "selected_end"
 COMPILED_ENTRY_ABI = "selected_end_search_v1"
 COMPILED_STATE_SOURCES = frozenset((
     "semantic_dfa", "context_determinization", "slow_aot",
     "compiler_k0_aot", "slow_context_aot", "ordered_finite_language",
+    "exact_finite_selected_end_teddy_incumbent",
 ))
 DFA_COMPILER_ENGINES = frozenset(("ordered_dfa", "ordered_context_dfa"))
 NON_DFA_COMPILER_ENGINES = frozenset(("ordered_nfa",))
 KNOWN_COMPILER_ENGINES = DFA_COMPILER_ENGINES | NON_DFA_COMPILER_ENGINES
+PRIMARY_NATIVE_ROUTES = frozenset((
+    "exact_finite_selected_end_teddy", "slow_context_dfa",
+    "compiler_k0_dfa", "slow_dfa", "ordered_finite_language",
+    "ordered_context_dfa", "ordered_dfa", "ordered_nfa",
+))
+EXACT_TEDDY_PRIMARY_ROUTE = "exact_finite_selected_end_teddy"
+EXACT_TEDDY_CENSUS_PANEL = "fre-count-thread1"
+EXACT_TEDDY_INPUT_FLOOR_BYTES = 4096
+EXACT_TEDDY_RUNTIME_VERIFICATION_BUDGET = 64
+EXACT_TEDDY_BYTE_FREQUENCY_DENOMINATOR = 256
+EXACT_TEDDY_LITERAL_DISPATCH_UNITS = 8
+EXACT_TEDDY_LITERAL_BYTE_UNITS = 11
 CANDIDATE_DISCOVERY_COUNTER_FIELDS = (
     "candidate_stock_files",
     "candidate_fre_aot_files",
@@ -705,7 +725,13 @@ def run_once(
     cpu_profile: str,
     timeout_seconds: float,
     test_min_stock_bytes: int = 0,
+    collect_timing: bool = True,
+    wait_for_compiler_settlement: bool = False,
 ) -> dict[str, Any]:
+    if wait_for_compiler_settlement and not (background and capture_receipt):
+        raise HarnessError(
+            "compiler settlement requires a background receipt invocation"
+        )
     command = [str(binary)]
     if background:
         command.append(BACKGROUND_FLAG)
@@ -715,6 +741,7 @@ def run_once(
         receipt_path = temporary / "receipt.json"
         environment = os.environ.copy()
         environment.pop(RECEIPT_ENV, None)
+        environment.pop(RECEIPT_WAIT_FOR_COMPILER_ENV, None)
         environment.pop(CORRECTNESS_GATE_ENV, None)
         environment.pop(CPU_PROFILE_ENV, None)
         environment.pop("RIPGREP_CONFIG_PATH", None)
@@ -724,12 +751,17 @@ def run_once(
             environment[CPU_PROFILE_ENV] = cpu_profile
             if capture_receipt:
                 environment[RECEIPT_ENV] = str(receipt_path)
+                if wait_for_compiler_settlement:
+                    environment[RECEIPT_WAIT_FOR_COMPILER_ENV] = "1"
             if test_min_stock_bytes > 0:
                 environment[CORRECTNESS_GATE_ENV] = str(
                     test_min_stock_bytes
                 )
-        before = resource.getrusage(resource.RUSAGE_CHILDREN)
-        started = time.perf_counter_ns()
+        before = (
+            resource.getrusage(resource.RUSAGE_CHILDREN)
+            if collect_timing else None
+        )
+        started = time.perf_counter_ns() if collect_timing else None
         try:
             completed = subprocess.run(
                 command,
@@ -749,8 +781,15 @@ def run_once(
             stdout = error.stdout or b""
             stderr = error.stderr or b""
             status = None
-        elapsed_ns = time.perf_counter_ns() - started
-        after = resource.getrusage(resource.RUSAGE_CHILDREN)
+        timing = {}
+        if collect_timing:
+            assert started is not None and before is not None
+            elapsed_ns = time.perf_counter_ns() - started
+            after = resource.getrusage(resource.RUSAGE_CHILDREN)
+            timing = {
+                "elapsed_ns": elapsed_ns,
+                **elapsed_child_cpu(before, after),
+            }
         receipt = None
         receipt_parse_error = False
         if receipt_path.is_file():
@@ -768,8 +807,7 @@ def run_once(
         if unexpected_artifacts and not timed_out and not receipt_parse_error:
             raise HarnessError("child left an unexpected temporary artifact")
     return {
-        "elapsed_ns": elapsed_ns,
-        **elapsed_child_cpu(before, after),
+        **timing,
         "timed_out": timed_out,
         "status": status,
         "stdout": output_record(stdout),
@@ -824,22 +862,553 @@ def receipt_decline_class(receipt: Mapping[str, Any] | None) -> str:
     return "declined_other_redacted"
 
 
+def is_nonnegative_int(value: Any) -> bool:
+    return (
+        isinstance(value, int)
+        and not isinstance(value, bool)
+        and value >= 0
+    )
+
+
+def is_positive_int(value: Any) -> bool:
+    return is_nonnegative_int(value) and value > 0
+
+
+def is_sha256_hex(value: Any) -> bool:
+    return (
+        isinstance(value, str)
+        and re.fullmatch(r"[0-9a-f]{64}", value) is not None
+        and value != "0" * 64
+    )
+
+
+def decimal_u128(value: Any) -> int | None:
+    if (
+        not isinstance(value, str)
+        or re.fullmatch(r"0|[1-9][0-9]*", value) is None
+    ):
+        return None
+    parsed = int(value)
+    return parsed if parsed < 1 << 128 else None
+
+
+def validate_exact_teddy_report(
+    report: Any,
+    receipt: Mapping[str, Any],
+) -> list[str]:
+    """Validate the pattern-free v5 copy of FRE's authenticated report."""
+    if not isinstance(report, Mapping):
+        return ["exact_teddy_report_not_object"]
+    failures = []
+    if report.get("authenticated_compiler_report") is not True:
+        failures.append("exact_teddy_report_not_authenticated")
+    for field in (
+        "artifact_identity_sha256", "literal_sha256", "prefix_plan_sha256",
+        "native_code_sha256", "native_data_sha256", "relocations_sha256",
+    ):
+        if not is_sha256_hex(report.get(field)):
+            failures.append(f"invalid_exact_teddy_{field}")
+    if report.get("output_contract") != COMPILED_OUTPUT_CONTRACT:
+        failures.append("invalid_exact_teddy_output_contract")
+    for field in (
+        "source_count", "source_bytes", "minimum_width", "maximum_width",
+        "columns", "bucket_count", "literal_count",
+        "candidate_fingerprint_upper_bound",
+        "candidate_frequency_upper_bound", "fingerprint_space",
+        "plan_scan_instruction_units", "emitted_scan_instruction_units",
+        "guaranteed_vector_bytes", "gate_table_bytes", "input_floor_bytes",
+        "selection_horizon_bytes", "selection_root_frequency_units",
+        "runtime_verification_budget", "table_base", "table_end",
+        "bucket_ordinal_masks_offset", "literal_descriptors_offset",
+        "literal_bytes_offset", "literal_bytes_end", "native_data_bytes",
+    ):
+        if not is_positive_int(report.get(field)):
+            failures.append(f"invalid_exact_teddy_{field}")
+    source_count = report.get("source_count")
+    literal_count = report.get("literal_count")
+    minimum_width = report.get("minimum_width")
+    maximum_width = report.get("maximum_width")
+    columns = report.get("columns")
+    bucket_count = report.get("bucket_count")
+    fingerprint_upper = report.get("candidate_fingerprint_upper_bound")
+    frequency_upper = report.get("candidate_frequency_upper_bound")
+    fingerprint_space = report.get("fingerprint_space")
+    input_floor = report.get("input_floor_bytes")
+    horizon = report.get("selection_horizon_bytes")
+    if is_positive_int(source_count) and not 4 <= source_count <= 64:
+        failures.append("exact_teddy_source_count_range")
+    if is_positive_int(source_count) and literal_count != source_count:
+        failures.append("exact_teddy_source_literal_count_mismatch")
+    if (
+        is_positive_int(minimum_width)
+        and is_positive_int(maximum_width)
+        and (
+            minimum_width > maximum_width
+            or minimum_width < 3
+            or is_positive_int(columns) and minimum_width < columns
+        )
+    ):
+        failures.append("exact_teddy_width_geometry")
+    source_bytes = report.get("source_bytes")
+    if (
+        is_positive_int(source_count)
+        and is_positive_int(source_bytes)
+        and is_positive_int(minimum_width)
+        and is_positive_int(maximum_width)
+        and not (
+            minimum_width * source_count
+            <= source_bytes
+            <= maximum_width * source_count
+        )
+    ):
+        failures.append("exact_teddy_source_bytes_bounds")
+    if columns not in (3, 4):
+        failures.append("exact_teddy_columns")
+    if is_positive_int(literal_count) and bucket_count != min(literal_count, 8):
+        failures.append("exact_teddy_bucket_count")
+    expected_fingerprint_space = (
+        1 << (columns * 8) if columns in (3, 4) else None
+    )
+    if fingerprint_space != expected_fingerprint_space:
+        failures.append("exact_teddy_fingerprint_space")
+    if (
+        is_positive_int(fingerprint_space)
+        and (
+            not is_positive_int(fingerprint_upper)
+            or fingerprint_upper > fingerprint_space
+            or is_positive_int(literal_count)
+            and fingerprint_upper > literal_count * 8
+            or not is_positive_int(frequency_upper)
+            or frequency_upper > fingerprint_space
+        )
+    ):
+        failures.append("exact_teddy_fingerprint_bounds")
+    if input_floor != EXACT_TEDDY_INPUT_FLOOR_BYTES:
+        failures.append("exact_teddy_input_floor")
+    if horizon != EXACT_TEDDY_INPUT_FLOOR_BYTES:
+        failures.append("exact_teddy_selection_horizon")
+    if (
+        report.get("runtime_verification_budget")
+        != EXACT_TEDDY_RUNTIME_VERIFICATION_BUDGET
+    ):
+        failures.append("exact_teddy_runtime_verification_budget")
+    root_members = report.get("root_members")
+    if (
+        not isinstance(root_members, list)
+        or len(root_members) != 4
+        or not all(is_nonnegative_int(value) and value < 1 << 64
+                   for value in root_members)
+    ):
+        failures.append("invalid_exact_teddy_root_members")
+    root_cardinality = None
+    if isinstance(root_members, list) and all(
+        is_nonnegative_int(value) and value < 1 << 64
+        for value in root_members
+    ):
+        root_cardinality = sum(value.bit_count() for value in root_members)
+        if root_cardinality == 0:
+            failures.append("exact_teddy_empty_root_members")
+    root_frequency = report.get("selection_root_frequency_units")
+    if not (
+        is_positive_int(root_frequency)
+        and root_frequency <= EXACT_TEDDY_BYTE_FREQUENCY_DENOMINATOR
+    ):
+        failures.append("exact_teddy_root_frequency")
+
+    target = report.get("target")
+    target_bits = None
+    if not isinstance(target, Mapping):
+        failures.append("exact_teddy_target_not_object")
+    else:
+        if target.get("architecture") not in ("x86_64", "aarch64"):
+            failures.append("invalid_exact_teddy_target_architecture")
+        if target.get("operating_system") not in ("linux", "macos"):
+            failures.append("invalid_exact_teddy_target_operating_system")
+        if target.get("abi") not in ("system_v", "aapcs64"):
+            failures.append("invalid_exact_teddy_target_abi")
+        if target.get("feature_bits") != receipt.get("target_feature_bits"):
+            failures.append("exact_teddy_target_feature_bits_mismatch")
+        target_bits = target.get("feature_bits")
+        if not is_nonnegative_int(target_bits):
+            failures.append("invalid_exact_teddy_target_feature_bits")
+        elif (
+            target.get("architecture") == "x86_64"
+            and target_bits & ~0x1f
+            or target.get("architecture") == "aarch64"
+            and target_bits & ~(0x7 << 32)
+        ):
+            failures.append("exact_teddy_cross_architecture_features")
+        if target.get("architecture") == "x86_64" and target.get("abi") != "system_v":
+            failures.append("exact_teddy_target_abi_architecture")
+        if target.get("architecture") == "aarch64" and target.get("abi") != "aapcs64":
+            failures.append("exact_teddy_target_abi_architecture")
+    tier = report.get("selected_target_tier")
+    emitted_isa = report.get("emitted_isa")
+    scanner = report.get("scanner")
+    tier_contracts = {
+        "x86_avx2": ("x86_avx2", "x86_avx2"),
+        "x86_avx512bw": ("x86_avx2", "x86_avx2"),
+        "aarch64_asimd": ("aarch64_asimd", "aarch64_asimd"),
+        "aarch64_sve": ("aarch64_sve", "aarch64_sve"),
+        "aarch64_sve2": ("aarch64_sve", "aarch64_sve"),
+    }
+    if tier not in tier_contracts:
+        failures.append("invalid_exact_teddy_target_tier")
+    elif tier_contracts[tier] != (emitted_isa, scanner):
+        failures.append("exact_teddy_emitted_isa_scanner_mismatch")
+    if scanner != receipt.get("start_accelerator"):
+        failures.append("exact_teddy_receipt_scanner_mismatch")
+    plan_scan_units = columns * 8 - 1 if columns in (3, 4) else None
+    tier_geometry = None
+    if plan_scan_units is not None and is_nonnegative_int(target_bits):
+        architecture = target.get("architecture") if isinstance(target, Mapping) else None
+        operating_system = target.get("operating_system") if isinstance(target, Mapping) else None
+        avx2 = bool(target_bits & (1 << 1))
+        avx512f = bool(target_bits & (1 << 2))
+        avx512bw = bool(target_bits & (1 << 3))
+        asimd = bool(target_bits & (1 << 32))
+        sve = bool(target_bits & (1 << 33))
+        sve2 = bool(target_bits & (1 << 34))
+        logical_table_bytes = columns * 32
+        if tier == "x86_avx2":
+            valid_tier = architecture == "x86_64" and avx2 and not (
+                avx512f and avx512bw
+            )
+            tier_geometry = (
+                plan_scan_units, 32, 32,
+                logical_table_bytes * 2 + 32,
+                logical_table_bytes * 2 + 32, 0, valid_tier,
+            )
+        elif tier == "x86_avx512bw":
+            valid_tier = (
+                architecture == "x86_64"
+                and avx2 and avx512f and avx512bw
+            )
+            tier_geometry = (
+                plan_scan_units, 32, 32,
+                logical_table_bytes * 2 + 32,
+                logical_table_bytes * 2 + 32, 0, valid_tier,
+            )
+        elif tier == "aarch64_asimd":
+            valid_tier = (
+                architecture == "aarch64"
+                and asimd
+                and not (operating_system == "linux" and sve)
+            )
+            tier_geometry = (
+                plan_scan_units - columns, 16, 16,
+                logical_table_bytes, logical_table_bytes + 16, 16,
+                valid_tier,
+            )
+        elif tier == "aarch64_sve":
+            valid_tier = (
+                architecture == "aarch64"
+                and operating_system == "linux"
+                and sve and not sve2
+            )
+            tier_geometry = (
+                plan_scan_units - columns, 16, 16,
+                logical_table_bytes, logical_table_bytes, 0, valid_tier,
+            )
+        elif tier == "aarch64_sve2":
+            valid_tier = (
+                architecture == "aarch64"
+                and operating_system == "linux"
+                and sve and sve2
+            )
+            tier_geometry = (
+                plan_scan_units - columns, 16, 16,
+                logical_table_bytes, logical_table_bytes, 0, valid_tier,
+            )
+    if tier_geometry is None or tier_geometry[-1] is not True:
+        failures.append("exact_teddy_target_tier_geometry")
+    else:
+        (
+            expected_emitted_units,
+            expected_vector_bytes,
+            table_alignment,
+            table_extent_bytes,
+            expected_gate_table_bytes,
+            auxiliary_table_bytes,
+            _,
+        ) = tier_geometry
+        if report.get("plan_scan_instruction_units") != plan_scan_units:
+            failures.append("exact_teddy_plan_scan_units")
+        if report.get("emitted_scan_instruction_units") != expected_emitted_units:
+            failures.append("exact_teddy_emitted_scan_units")
+        if report.get("guaranteed_vector_bytes") != expected_vector_bytes:
+            failures.append("exact_teddy_guaranteed_vector_bytes")
+        if report.get("gate_table_bytes") != expected_gate_table_bytes:
+            failures.append("exact_teddy_gate_table_bytes")
+
+    incumbent = report.get("incumbent")
+    if not isinstance(incumbent, Mapping):
+        failures.append("exact_teddy_incumbent_not_object")
+    else:
+        for field in (
+            "semantic_dfa_sha256", "native_code_sha256",
+            "native_data_sha256", "relocations_sha256",
+        ):
+            if not is_sha256_hex(incumbent.get(field)):
+                failures.append(f"invalid_exact_teddy_incumbent_{field}")
+        for field in (
+            "forward_states", "alphabet_classes", "transition_cells",
+            "minimum_native_data_bytes", "native_data_bytes",
+            "hot_loads_per_byte", "hot_branches_per_byte",
+            "native_code_bytes",
+        ):
+            if not is_positive_int(incumbent.get(field)):
+                failures.append(f"invalid_exact_teddy_incumbent_{field}")
+        for field in ("native_code_offset", "relocation_count"):
+            if not is_nonnegative_int(incumbent.get(field)):
+                failures.append(f"invalid_exact_teddy_incumbent_{field}")
+        states = incumbent.get("forward_states")
+        classes = incumbent.get("alphabet_classes")
+        transitions = incumbent.get("transition_cells")
+        if not is_positive_int(classes) or classes > 256:
+            failures.append("exact_teddy_incumbent_alphabet_classes")
+        if (
+            is_positive_int(states)
+            and is_positive_int(classes)
+            and transitions != states * classes
+        ):
+            failures.append("exact_teddy_incumbent_transition_geometry")
+        minimum_data = incumbent.get("minimum_native_data_bytes")
+        incumbent_data_bytes = incumbent.get("native_data_bytes")
+        if (
+            is_positive_int(minimum_data)
+            and is_positive_int(incumbent_data_bytes)
+            and incumbent_data_bytes < minimum_data
+        ):
+            failures.append("exact_teddy_incumbent_minimum_data")
+        if incumbent.get("has_accelerator") is not False:
+            failures.append("exact_teddy_incumbent_has_accelerator")
+        if incumbent.get("scanner") != "none":
+            failures.append("exact_teddy_incumbent_scanner")
+        if receipt.get("compiled_forward_states") != states:
+            failures.append("exact_teddy_top_nested_forward_states")
+        if receipt.get("compiled_reverse_states") != 0:
+            failures.append("exact_teddy_top_nested_reverse_states")
+        native_data_bytes = report.get("native_data_bytes")
+        if (
+            is_positive_int(incumbent_data_bytes)
+            and is_positive_int(native_data_bytes)
+            and incumbent_data_bytes > native_data_bytes
+        ):
+            failures.append("exact_teddy_incumbent_data_extent")
+        native_code_offset = incumbent.get("native_code_offset")
+        native_code_bytes = incumbent.get("native_code_bytes")
+        published_code_bytes = receipt.get("published_code_bytes")
+        if (
+            receipt.get("outcome") == "ready"
+            and is_nonnegative_int(native_code_offset)
+            and is_positive_int(native_code_bytes)
+            and is_positive_int(published_code_bytes)
+            and native_code_offset + native_code_bytes
+            > published_code_bytes
+        ):
+            failures.append("exact_teddy_incumbent_code_extent")
+        if (
+            receipt.get("outcome") == "ready"
+            and report.get("native_data_bytes")
+            != receipt.get("published_read_only_data_bytes")
+        ):
+            failures.append("exact_teddy_published_data_extent")
+
+    if tier_geometry is not None and isinstance(incumbent, Mapping):
+        (
+            _, _, table_alignment, table_extent_bytes, _,
+            auxiliary_table_bytes, valid_tier,
+        ) = tier_geometry
+        incumbent_data_bytes = incumbent.get("native_data_bytes")
+        if valid_tier and is_positive_int(incumbent_data_bytes):
+            expected_table_base = (
+                incumbent_data_bytes + table_alignment - 1
+            ) & ~(table_alignment - 1)
+            expected_table_end = expected_table_base + table_extent_bytes
+            expected_masks_offset = (
+                expected_table_end + auxiliary_table_bytes + 7
+            ) & ~7
+            expected_descriptors_offset = expected_masks_offset + 64
+            expected_literal_bytes_offset = (
+                expected_descriptors_offset + source_count * 8
+                if is_positive_int(source_count) else None
+            )
+            expected_literal_bytes_end = (
+                expected_literal_bytes_offset + source_bytes
+                if expected_literal_bytes_offset is not None
+                and is_positive_int(source_bytes) else None
+            )
+            expected_layout = (
+                expected_table_base,
+                expected_table_end,
+                expected_masks_offset,
+                expected_descriptors_offset,
+                expected_literal_bytes_offset,
+                expected_literal_bytes_end,
+                expected_literal_bytes_end,
+            )
+            actual_layout = (
+                report.get("table_base"),
+                report.get("table_end"),
+                report.get("bucket_ordinal_masks_offset"),
+                report.get("literal_descriptors_offset"),
+                report.get("literal_bytes_offset"),
+                report.get("literal_bytes_end"),
+                report.get("native_data_bytes"),
+            )
+            if actual_layout != expected_layout:
+                failures.append("exact_teddy_native_data_layout")
+
+    cost_fields = (
+        "selection_gate_cost_units_decimal",
+        "selection_expected_verification_cost_units_decimal",
+        "selection_full_cost_units_decimal",
+        "selection_incumbent_cost_units_decimal",
+        "selection_no_candidate_numerator_decimal",
+        "selection_probability_denominator_decimal",
+    )
+    costs = {field: decimal_u128(report.get(field)) for field in cost_fields}
+    for field, value in costs.items():
+        if value is None:
+            failures.append(f"invalid_exact_teddy_{field}")
+    gate_cost = costs["selection_gate_cost_units_decimal"]
+    expected_verification = costs[
+        "selection_expected_verification_cost_units_decimal"
+    ]
+    full = costs["selection_full_cost_units_decimal"]
+    incumbent_cost = costs["selection_incumbent_cost_units_decimal"]
+    numerator = costs["selection_no_candidate_numerator_decimal"]
+    denominator = costs["selection_probability_denominator_decimal"]
+    if (
+        all(isinstance(value, int) for value in (
+            gate_cost, expected_verification, full, incumbent_cost,
+            numerator, denominator,
+        ))
+        and tier_geometry is not None
+        and tier_geometry[-1] is True
+        and isinstance(incumbent, Mapping)
+        and is_positive_int(source_count)
+        and is_positive_int(source_bytes)
+        and is_positive_int(frequency_upper)
+        and is_positive_int(fingerprint_space)
+        and is_positive_int(horizon)
+    ):
+        expected_candidates = horizon * frequency_upper
+        if expected_candidates * 2 > fingerprint_space:
+            failures.append("exact_teddy_candidate_budget")
+        expected_denominator = fingerprint_space
+        expected_no_candidate = fingerprint_space - expected_candidates
+        verification_units = (
+            literal_count * EXACT_TEDDY_LITERAL_DISPATCH_UNITS
+            + source_bytes * EXACT_TEDDY_LITERAL_BYTE_UNITS
+        )
+        expected_verification_cost = (
+            verification_units * expected_candidates
+            + fingerprint_space - 1
+        ) // fingerprint_space
+        emitted_units, vector_bytes, _, _, table_bytes, _, _ = tier_geometry
+        expected_gate_cost = (
+            (horizon + vector_bytes - 1) // vector_bytes * emitted_units
+            + (table_bytes + 63) // 64
+        )
+        expected_full_cost = expected_gate_cost * 4 + expected_verification_cost
+        loads = incumbent.get("hot_loads_per_byte")
+        branches = incumbent.get("hot_branches_per_byte")
+        expected_incumbent_cost = (
+            horizon * (loads * 4 + branches * 3)
+            if is_positive_int(loads) and is_positive_int(branches)
+            else None
+        )
+        if denominator != expected_denominator:
+            failures.append("exact_teddy_probability_denominator")
+        if numerator != expected_no_candidate:
+            failures.append("exact_teddy_no_candidate_equation")
+        if gate_cost != expected_gate_cost:
+            failures.append("exact_teddy_gate_cost_equation")
+        if expected_verification != expected_verification_cost:
+            failures.append("exact_teddy_verification_cost_equation")
+        if full != expected_full_cost:
+            failures.append("exact_teddy_full_cost_equation")
+        if incumbent_cost != expected_incumbent_cost:
+            failures.append("exact_teddy_incumbent_cost_equation")
+        if (
+            expected_incumbent_cost is not None
+            and full * 8 > incumbent_cost * 7
+        ):
+            failures.append("exact_teddy_material_gain_margin")
+        if (
+            root_cardinality is not None
+            and is_positive_int(root_frequency)
+        ):
+            per_byte_scan_units = max(
+                1, (emitted_units + vector_bytes - 1) // vector_bytes
+            )
+            ordinary = (
+                gate_cost * 8 * denominator
+                * EXACT_TEDDY_BYTE_FREQUENCY_DENOMINATOR
+                <= horizon * root_frequency * 4 * 7 * numerator
+            )
+            dense = (
+                root_cardinality >= 2
+                and root_frequency >= max(4 * per_byte_scan_units, 8)
+                and root_frequency * denominator
+                >= 1024 * per_byte_scan_units
+                * EXACT_TEDDY_BYTE_FREQUENCY_DENOMINATOR
+                * frequency_upper
+                and gate_cost * 8 * denominator
+                <= horizon * 4 * 7 * numerator
+            )
+            if not (ordinary or dense):
+                failures.append("exact_teddy_dynamic_profitability")
+    return failures
+
+
 def validate_receipt(
     receipt: Mapping[str, Any] | None,
     requested_cpu_profile: str,
     expected_test_min_stock_bytes: int = 0,
+    *,
+    require_current_schema: bool = False,
+    require_compiler_settlement: bool = False,
 ) -> list[str]:
     failures = []
     if receipt is None:
         return ["missing_receipt"]
     if not isinstance(receipt, Mapping):
         return ["receipt_not_object"]
-    if receipt.get("schema") != RECEIPT_SCHEMA:
+    receipt_schema = receipt.get("schema")
+    if receipt_schema not in SUPPORTED_RECEIPT_SCHEMAS:
         failures.append("schema")
+    if require_current_schema and receipt_schema != RECEIPT_SCHEMA:
+        failures.append("current_receipt_schema_required")
+    v5_receipt = receipt_schema == RECEIPT_SCHEMA
+    if require_compiler_settlement and not require_current_schema:
+        raise HarnessError(
+            "compiler settlement validation requires the current schema"
+        )
     if receipt.get("direct_native_only") is not True:
         failures.append("not_direct_native")
     if receipt.get("outcome") not in ("ready", "declined", "unfinished"):
         failures.append("invalid_outcome")
+    if v5_receipt:
+        for field in ("wait_requested", "compiler_settled"):
+            if field not in receipt:
+                failures.append(f"missing_{field}")
+            elif not isinstance(receipt.get(field), bool):
+                failures.append(f"invalid_{field}")
+        if receipt.get("wait_requested") is True:
+            if receipt.get("compiler_settled") is not True:
+                failures.append("requested_compiler_not_settled")
+            if receipt.get("outcome") == "unfinished":
+                failures.append("settlement_wait_left_unfinished")
+    if require_compiler_settlement:
+        if receipt.get("wait_requested") is not True:
+            failures.append("compiler_settlement_not_requested")
+        if receipt.get("compiler_settled") is not True:
+            failures.append("compiler_not_settled")
+        if receipt.get("outcome") == "unfinished":
+            failures.append("compiler_outcome_unfinished")
     for field in (
         "compile_ns", "publish_ns", "prepare_ns", "total_file_attempts",
         "native_call_failures", "external_linker_invocations",
@@ -953,6 +1522,24 @@ def validate_receipt(
     compiled_reverse_start_recovery = receipt.get(
         "compiled_reverse_start_recovery"
     )
+    compiled_primary_native_route = receipt.get(
+        "compiled_primary_native_route"
+    )
+    exact_teddy_report = receipt.get(
+        "exact_finite_selected_end_teddy_aot"
+    )
+    if v5_receipt:
+        for field in (
+            "compiled_primary_native_route",
+            "exact_finite_selected_end_teddy_aot",
+        ):
+            if field not in receipt:
+                failures.append(f"missing_{field}")
+        if (
+            compiled_primary_native_route is not None
+            and compiled_primary_native_route not in PRIMARY_NATIVE_ROUTES
+        ):
+            failures.append("invalid_compiled_primary_native_route")
     if (
         compiled_output_contract is not None
         and compiled_output_contract != COMPILED_OUTPUT_CONTRACT
@@ -989,6 +1576,10 @@ def validate_receipt(
     if compiler_engine is None:
         if any(receipt.get(field) is not None for field in compiled_fields):
             failures.append("compiled_metadata_without_compiler_engine")
+        if v5_receipt and compiled_primary_native_route is not None:
+            failures.append("primary_native_route_without_compiler_engine")
+        if v5_receipt and exact_teddy_report is not None:
+            failures.append("exact_teddy_report_without_compiler_engine")
     elif compiler_engine in KNOWN_COMPILER_ENGINES:
         if compiled_output_contract != COMPILED_OUTPUT_CONTRACT:
             failures.append("compiled_output_contract_not_selected_end")
@@ -1013,6 +1604,31 @@ def validate_receipt(
             failures.append("compiled_forward_states_zero")
         if compiled_reverse_start_recovery is not False:
             failures.append("selected_end_reverse_start_recovery_present")
+        if v5_receipt:
+            expected_route = {
+                "exact_finite_selected_end_teddy_incumbent": (
+                    EXACT_TEDDY_PRIMARY_ROUTE
+                ),
+                "slow_context_aot": "slow_context_dfa",
+                "compiler_k0_aot": "compiler_k0_dfa",
+                "slow_aot": "slow_dfa",
+                "ordered_finite_language": "ordered_finite_language",
+                "context_determinization": "ordered_context_dfa",
+                "semantic_dfa": compiler_engine,
+                None: compiler_engine,
+            }.get(compiled_state_source)
+            if compiled_primary_native_route != expected_route:
+                failures.append("primary_native_route_state_mismatch")
+            if compiled_primary_native_route == EXACT_TEDDY_PRIMARY_ROUTE:
+                failures.extend(validate_exact_teddy_report(
+                    exact_teddy_report, receipt
+                ))
+                if compiled_state_source != (
+                    "exact_finite_selected_end_teddy_incumbent"
+                ):
+                    failures.append("exact_teddy_incumbent_source_mismatch")
+            elif exact_teddy_report is not None:
+                failures.append("exact_teddy_report_on_non_teddy_route")
     for field in (
         "requested_target_feature_bits", "host_target_feature_bits",
         "target_feature_bits", "published_code_bytes",
@@ -1235,7 +1851,9 @@ def probe_one(
     )
     exact_normal_background = outputs_equal(normal, background, panel.output_comparison)
     exact_stock_normal = outputs_equal(stock_result, normal, panel.output_comparison)
-    failures = probe_receipt_failures(normal, background, cpu_profile)
+    failures = probe_receipt_failures(
+        normal, background, cpu_profile, require_current_schema=True
+    )
     return {
         "query_argv_after_binary": list(args),
         "normalization": normalization,
@@ -1337,7 +1955,7 @@ def run_forced_midscan_gate(
         "stock": compact_private(stock_result),
     }
     gate["failures"] = validate_forced_midscan_gate_record(
-        gate, cpu_profile
+        gate, cpu_profile, require_current_schema=True
     )
     return gate
 
@@ -1364,7 +1982,8 @@ def forced_midscan_gate_summary(
 
 
 def validate_forced_midscan_gate_record(
-    gate: Mapping[str, Any], cpu_profile: str
+    gate: Mapping[str, Any], cpu_profile: str, *,
+    require_current_schema: bool = False,
 ) -> list[str]:
     failures = []
     normal = gate.get("normal")
@@ -1381,7 +2000,10 @@ def validate_forced_midscan_gate_record(
         return ["forced_midscan_evidence_missing"]
     receipt = background.get("receipt")
     failures.extend(validate_receipt(
-        receipt, cpu_profile, FORCED_MIDSCAN_STOCK_BYTES
+        receipt,
+        cpu_profile,
+        FORCED_MIDSCAN_STOCK_BYTES,
+        require_current_schema=require_current_schema,
     ))
     if background.get("receipt_parse_error") is not False:
         failures.append("malformed_receipt")
@@ -1460,8 +2082,14 @@ def probe_receipt_failures(
     normal: Mapping[str, Any],
     background: Mapping[str, Any],
     cpu_profile: str,
+    *,
+    require_current_schema: bool = False,
 ) -> list[str]:
-    failures = validate_receipt(background.get("receipt"), cpu_profile)
+    failures = validate_receipt(
+        background.get("receipt"),
+        cpu_profile,
+        require_current_schema=require_current_schema,
+    )
     if background.get("receipt") is None and normal.get("status") not in (0, 1):
         failures = [
             failure for failure in failures if failure != "missing_receipt"
@@ -1636,6 +2264,11 @@ def aggregate_observations(
     compiled_output_contracts = Counter()
     compiled_entry_abis = Counter()
     compiled_state_sources = Counter()
+    primary_native_routes = Counter()
+    exact_teddy_target_tiers = Counter()
+    exact_teddy_emitted_isas = Counter()
+    exact_teddy_scanners = Counter()
+    has_v5_receipt = False
     compiled_reverse_start_recovery = Counter()
     compiled_state_reporting = Counter()
     candidate_discovery_totals = {
@@ -1661,6 +2294,7 @@ def aggregate_observations(
         receipt_failures.update(row["receipt_failures"])
         normalization.update(row["normalization"])
         if receipt:
+            has_v5_receipt |= receipt.get("schema") == RECEIPT_SCHEMA
             target_profiles[str(receipt.get("target_feature_profile", "unreported"))] += 1
             for counter, field in (
                 (requested_feature_bits, "requested_target_feature_bits"),
@@ -1694,6 +2328,20 @@ def aggregate_observations(
             compiled_state_sources[
                 str(receipt.get("compiled_state_source", "unreported"))
             ] += 1
+            primary_native_routes[
+                str(receipt.get("compiled_primary_native_route", "unreported"))
+            ] += 1
+            teddy = receipt.get("exact_finite_selected_end_teddy_aot")
+            if isinstance(teddy, Mapping):
+                exact_teddy_target_tiers[
+                    str(teddy.get("selected_target_tier", "unreported"))
+                ] += 1
+                exact_teddy_emitted_isas[
+                    str(teddy.get("emitted_isa", "unreported"))
+                ] += 1
+                exact_teddy_scanners[
+                    str(teddy.get("scanner", "unreported"))
+                ] += 1
             recovery = receipt.get("compiled_reverse_start_recovery")
             compiled_reverse_start_recovery[
                 "present" if recovery is True
@@ -1754,6 +2402,56 @@ def aggregate_observations(
                 compile_ns.append(int(receipt["compile_ns"]))
             if isinstance(receipt.get("publish_ns"), int):
                 publish_ns.append(int(receipt["publish_ns"]))
+    receipt_classification = {
+        "target_feature_profiles": dict(sorted(target_profiles.items())),
+        "requested_target_feature_bits": dict(
+            sorted(requested_feature_bits.items())
+        ),
+        "host_target_feature_bits": dict(sorted(host_feature_bits.items())),
+        "effective_target_feature_bits": dict(
+            sorted(effective_feature_bits.items())
+        ),
+        "compiler_engines": dict(sorted(compiler_engines.items())),
+        "engine_selection_reasons": dict(sorted(engine_selection_reasons.items())),
+        "start_accelerators": dict(sorted(accelerators.items())),
+        "compiled_output_contracts": dict(
+            sorted(compiled_output_contracts.items())
+        ),
+        "compiled_entry_abis": dict(sorted(compiled_entry_abis.items())),
+        "compiled_state_sources": dict(
+            sorted(compiled_state_sources.items())
+        ),
+        "compiled_reverse_start_recovery": dict(
+            sorted(compiled_reverse_start_recovery.items())
+        ),
+        "compiled_state_reporting": dict(
+            sorted(compiled_state_reporting.items())
+        ),
+        "compiled_forward_states": nonnegative_integer_distribution(
+            compiled_forward_states
+        ),
+        "compiled_reverse_states": nonnegative_integer_distribution(
+            compiled_reverse_states
+        ),
+        "publication_stages": dict(sorted(publication_stages.items())),
+        "publication_refusal_classes": dict(sorted(publication_refusals.items())),
+        "runtime_helpers": dict(sorted(runtime_helpers.items())),
+    }
+    if has_v5_receipt:
+        receipt_classification.update({
+            "primary_native_routes": dict(
+                sorted(primary_native_routes.items())
+            ),
+            "exact_teddy_target_tiers": dict(
+                sorted(exact_teddy_target_tiers.items())
+            ),
+            "exact_teddy_emitted_isas": dict(
+                sorted(exact_teddy_emitted_isas.items())
+            ),
+            "exact_teddy_scanners": dict(
+                sorted(exact_teddy_scanners.items())
+            ),
+        })
     return {
         "cases": len(observations),
         "occurrence_weight": sum(cases[row["private_id"]].occurrence_weight for row in observations),
@@ -1777,41 +2475,7 @@ def aggregate_observations(
         "stock_matcher_work_accounting": stock_work_totals,
         "receipt_validation_failures": dict(sorted(receipt_failures.items())),
         "semantic_normalizations": dict(sorted(normalization.items())),
-        "receipt_classification": {
-            "target_feature_profiles": dict(sorted(target_profiles.items())),
-            "requested_target_feature_bits": dict(
-                sorted(requested_feature_bits.items())
-            ),
-            "host_target_feature_bits": dict(sorted(host_feature_bits.items())),
-            "effective_target_feature_bits": dict(
-                sorted(effective_feature_bits.items())
-            ),
-            "compiler_engines": dict(sorted(compiler_engines.items())),
-            "engine_selection_reasons": dict(sorted(engine_selection_reasons.items())),
-            "start_accelerators": dict(sorted(accelerators.items())),
-            "compiled_output_contracts": dict(
-                sorted(compiled_output_contracts.items())
-            ),
-            "compiled_entry_abis": dict(sorted(compiled_entry_abis.items())),
-            "compiled_state_sources": dict(
-                sorted(compiled_state_sources.items())
-            ),
-            "compiled_reverse_start_recovery": dict(
-                sorted(compiled_reverse_start_recovery.items())
-            ),
-            "compiled_state_reporting": dict(
-                sorted(compiled_state_reporting.items())
-            ),
-            "compiled_forward_states": nonnegative_integer_distribution(
-                compiled_forward_states
-            ),
-            "compiled_reverse_states": nonnegative_integer_distribution(
-                compiled_reverse_states
-            ),
-            "publication_stages": dict(sorted(publication_stages.items())),
-            "publication_refusal_classes": dict(sorted(publication_refusals.items())),
-            "runtime_helpers": dict(sorted(runtime_helpers.items())),
-        },
+        "receipt_classification": receipt_classification,
         "ready_compile_ns": distribution([float(value) for value in compile_ns]),
         "ready_publish_ns": distribution([float(value) for value in publish_ns]),
     }
@@ -1940,6 +2604,129 @@ def aggregate_groups(
             for cohort in cohorts
         },
     }
+
+
+def exact_teddy_diagnostic_census(
+    rows: Sequence[Mapping[str, Any]],
+    cases: Sequence[QueryCase],
+    cpu_profiles: Sequence[str],
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Build an untimed, result-blind census from one frozen count panel.
+
+    IDs remain in the private half. The public half exposes only counts and
+    report contracts. A compiler-selected ID is included solely from the
+    authenticated compile receipt, never from match status or elapsed time.
+    """
+    expected_ids = {case.private_id for case in cases}
+    case_by_id = {case.private_id: case for case in cases}
+    if len(expected_ids) != len(cases):
+        raise HarnessError("diagnostic census case IDs are not unique")
+    private_profiles = {}
+    public_profiles = {}
+    for profile in cpu_profiles:
+        selected = [
+            row for row in rows
+            if row.get("cpu_profile") == profile
+            and row.get("panel") == EXACT_TEDDY_CENSUS_PANEL
+        ]
+        observed_ids = [row.get("private_id") for row in selected]
+        if (
+            len(observed_ids) != len(expected_ids)
+            or set(observed_ids) != expected_ids
+            or len(set(observed_ids)) != len(observed_ids)
+        ):
+            raise HarnessError("diagnostic census panel is incomplete")
+        compiler_selected = []
+        published = []
+        invalid = []
+        routes = Counter()
+        outcomes = Counter()
+        tiers = Counter()
+        emitted_isas = Counter()
+        scanners = Counter()
+        for row in selected:
+            private_id = str(row["private_id"])
+            case = case_by_id[private_id]
+            qualified_id = f"{profile}/{case.cohort}/{private_id}"
+            receipt = row.get("background", {}).get("receipt")
+            route = (
+                receipt.get("compiled_primary_native_route", "unreported")
+                if isinstance(receipt, Mapping)
+                else "no_receipt"
+            )
+            outcome = (
+                receipt.get("outcome", "invalid")
+                if isinstance(receipt, Mapping)
+                else "no_receipt"
+            )
+            routes[str(route)] += 1
+            outcomes[str(outcome)] += 1
+            receipt_failures = row.get("receipt_failures")
+            settled = (
+                isinstance(receipt, Mapping)
+                and receipt.get("schema") == RECEIPT_SCHEMA
+                and receipt.get("wait_requested") is True
+                and receipt.get("compiler_settled") is True
+                and receipt.get("outcome") in ("ready", "declined")
+            )
+            if (
+                not isinstance(receipt_failures, list)
+                or receipt_failures
+                or not settled
+            ):
+                invalid.append(qualified_id)
+                continue
+            teddy = receipt.get("exact_finite_selected_end_teddy_aot")
+            if (
+                route != EXACT_TEDDY_PRIMARY_ROUTE
+                or not isinstance(teddy, Mapping)
+                or teddy.get("authenticated_compiler_report") is not True
+            ):
+                continue
+            compiler_selected.append(qualified_id)
+            if outcome == "ready":
+                published.append(qualified_id)
+            tiers[str(teddy.get("selected_target_tier", "unreported"))] += 1
+            emitted_isas[str(teddy.get("emitted_isa", "unreported"))] += 1
+            scanners[str(teddy.get("scanner", "unreported"))] += 1
+        compiler_selected.sort()
+        published.sort()
+        invalid.sort()
+        common = {
+            "selected_queries": len(selected),
+            "compiler_selected_exact_teddy": len(compiler_selected),
+            "published_exact_teddy": len(published),
+            "invalid_receipts": len(invalid),
+            "primary_native_routes": dict(sorted(routes.items())),
+            "outcomes": dict(sorted(outcomes.items())),
+            "selected_target_tiers": dict(sorted(tiers.items())),
+            "emitted_isas": dict(sorted(emitted_isas.items())),
+            "scanners": dict(sorted(scanners.items())),
+        }
+        private_profiles[profile] = {
+            **common,
+            "compiler_selected_exact_teddy_fully_qualified_ids": (
+                compiler_selected
+            ),
+            "published_exact_teddy_fully_qualified_ids": published,
+            "invalid_receipt_fully_qualified_ids": invalid,
+        }
+        public_profiles[profile] = common
+    common = {
+        "schema": f"{RESULT_SCHEMA}.exact-teddy-census.v1",
+        "panel": EXACT_TEDDY_CENSUS_PANEL,
+        "selection_rule": (
+            "settled current-schema authenticated compiler primary-route "
+            "receipt only; independent of output, match status, compile "
+            "latency, and performance"
+        ),
+        "timing_samples": 0,
+        "formal_eligibility_claimed": False,
+    }
+    return (
+        {**common, "contains_query_ids": True, "per_profile": private_profiles},
+        {**common, "contains_query_ids": False, "per_profile": public_profiles},
+    )
 
 
 def write_new_json(path: Path, value: Mapping[str, Any], mode: int) -> None:
@@ -2434,6 +3221,135 @@ def run_probe(args: argparse.Namespace) -> None:
     )
 
 
+def census_result(result: Mapping[str, Any]) -> dict[str, Any]:
+    """Retain audit evidence while intentionally omitting all timing fields."""
+    return {
+        key: result[key]
+        for key in (
+            "timed_out", "status", "stdout", "stderr", "receipt",
+            "receipt_parse_error", "unexpected_temporary_artifacts",
+        )
+    }
+
+
+def run_exact_teddy_census(args: argparse.Namespace) -> None:
+    oot, wider = selected_cases(args)
+    all_cases = [*oot, *wider]
+    selection_manifest = case_manifest(all_cases)
+    selection_record = selection_provenance(args, oot, wider)
+    with tempfile.TemporaryDirectory(prefix="rg-fre-teddy-census-") as text:
+        temporary = Path(text)
+        corpus_paths, corpus_records = create_corpora(args, temporary)
+        panel = next(
+            panel for panel in panels_for(corpus_paths)
+            if panel.id == EXACT_TEDDY_CENSUS_PANEL
+        )
+        if panel.threads != 1 or panel.count_mode is not True:
+            raise HarnessError(
+                "exact Teddy census panel must be canonical count/threads=1"
+            )
+        prov = provenance(args, corpus_records, selection_record)
+        workload_start = load_snapshot()
+        rows = []
+        for cpu_profile in args.cpu_profile:
+            for index, case in enumerate(all_cases, 1):
+                print(
+                    f"exact-Teddy census {cpu_profile} "
+                    f"{index}/{len(all_cases)}",
+                    flush=True,
+                )
+                query, normalization = query_args(case, panel)
+                background = run_once(
+                    binary=args.binary,
+                    args=query,
+                    cwd=args.candidate_source,
+                    background=True,
+                    capture_receipt=True,
+                    cpu_profile=cpu_profile,
+                    timeout_seconds=args.timeout_seconds,
+                    collect_timing=False,
+                    wait_for_compiler_settlement=True,
+                )
+                failures = validate_receipt(
+                    background.get("receipt"),
+                    cpu_profile,
+                    require_current_schema=True,
+                    require_compiler_settlement=True,
+                )
+                if background.get("receipt_parse_error"):
+                    failures.append("malformed_receipt")
+                if background.get("unexpected_temporary_artifacts"):
+                    failures.append("unexpected_temporary_artifacts")
+                if background.get("status") not in (0, 1):
+                    failures.append("candidate_process_error")
+                rows.append({
+                    "private_id": case.private_id,
+                    "cohort": case.cohort,
+                    "cpu_profile": cpu_profile,
+                    "panel": panel.id,
+                    "normalization": normalization,
+                    "receipt_failures": sorted(set(failures)),
+                    "background": census_result(background),
+                })
+        private_census, public_census = exact_teddy_diagnostic_census(
+            rows, all_cases, args.cpu_profile
+        )
+        workload_end = load_snapshot()
+        revalidate_selection(args, oot, wider)
+        post = provenance(
+            args,
+            corpus_records,
+            selection_provenance(args, oot, wider),
+        )
+        if post != prov:
+            raise HarnessError("source or binaries changed during census")
+    private = {
+        "schema": f"{RESULT_SCHEMA}.exact-teddy-census.private.v1",
+        "contains_raw_patterns": True,
+        "local_only_do_not_commit": True,
+        "selection_manifest_sha256": manifest_digest(selection_manifest),
+        "selection_manifest": selection_manifest,
+        "workload_environment": {
+            "start": workload_start,
+            "end": workload_end,
+        },
+        "rows": rows,
+        "census": private_census,
+    }
+    public = {
+        "schema": f"{RESULT_SCHEMA}.exact-teddy-census.public.v1",
+        "aggregate_only": True,
+        "contains_patterns_commands_paths_or_per_pattern_rows": False,
+        "method": {
+            "role": "untimed compiler-route diagnostic only",
+            "result_blind": True,
+            "compiler_settlement_required": True,
+            "receipt_schema_required": RECEIPT_SCHEMA,
+            "candidate_invocations_per_query_profile": 1,
+            "stock_or_normal_invocations": 0,
+            "canonical_panel": panel.id,
+            "cpu_profiles": args.cpu_profile,
+            "wider_sample_size": args.wider_sample_size,
+            "wider_sample_seed": args.wider_sample_seed,
+        },
+        **prov,
+        "workload_environment": {
+            "start": workload_start,
+            "end": workload_end,
+        },
+        "cohorts": {"oot": cohort_profile(oot), "wider": cohort_profile(wider)},
+        "census": public_census,
+        "post_run_private_freeze_verified": (
+            args.selection_manifest_input is None
+        ),
+        "post_run_selection_verified": True,
+        "post_run_provenance_verified": True,
+    }
+    write_bound_result_pair(
+        args.private_output, args.public_output, private, public
+    )
+
+
 def run_pair(
     case: QueryCase,
     panel: Panel,
@@ -2657,6 +3573,12 @@ def validate_probe(
             wider=wider,
         )
     )
+    private_census = private_probe.get("exact_teddy_diagnostic_census")
+    public_census = probe.get("exact_teddy_diagnostic_census")
+    if private_census is not None or public_census is not None:
+        raise HarnessError(
+            "ordinary probe contains an ambiguous embedded compiler census"
+        )
     if (
         probe.get("schema") != f"{RESULT_SCHEMA}.probe.public.v1"
         or probe.get("aggregate_only") is not True
@@ -2872,7 +3794,7 @@ def run_benchmark(args: argparse.Namespace) -> None:
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     subparsers = parser.add_subparsers(dest="mode", required=True)
-    for mode in ("probe", "benchmark"):
+    for mode in ("probe", "benchmark", "exact-teddy-census"):
         child = subparsers.add_parser(mode)
         child.add_argument("--binary", type=Path, required=True)
         child.add_argument("--candidate-source", type=Path, default=REPO)
@@ -2967,6 +3889,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             run_export_selection(args)
         elif args.mode == "probe":
             run_probe(args)
+        elif args.mode == "exact-teddy-census":
+            run_exact_teddy_census(args)
         else:
             run_benchmark(args)
         return 0
