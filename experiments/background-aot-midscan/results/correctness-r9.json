@@ -1,0 +1,338 @@
+{
+  "schema": "ripgrep.fre-aot-background-midscan.correctness.v1",
+  "comparison": "identical status and literal stdout/stderr bytes",
+  "correctness_gate": {
+    "environment": "RG_FRE_AOT_BACKGROUND_TEST_MIN_STOCK_BYTES",
+    "bytes": 8388608,
+    "timed": false
+  },
+  "host": {
+    "platform": "macOS-26.6.1-arm64-arm-64bit-Mach-O",
+    "machine": "arm64",
+    "cpu_count": 18,
+    "python": "3.14.6"
+  },
+  "source": {
+    "path": "/Users/danluu/dev/ripgrep-fre-aot-background-20260820",
+    "commit": "752d2703433ea2ff0f940978e9d78864e66885b5",
+    "dirty": false,
+    "status_short": "",
+    "origin_url": "git@github.com:danluu/ripgrep.git"
+  },
+  "stock_source": {
+    "path": "/Users/danluu/dev/ripgrep",
+    "commit": "f9c05a949d1a0dc8e16dee28ca9605d38611faeb",
+    "dirty": false,
+    "status_short": "",
+    "origin_url": "git@github.com:danluu/ripgrep.git"
+  },
+  "fre_dependency": {
+    "dependencies": [
+      {
+        "line": "fre-ripgrep-aot-thin = { git = \"https://github.com/danluu/fre.git\", rev = \"6f961465d00ff50f2096cfb05520c0653a87d2cd\" }",
+        "git": "https://github.com/danluu/fre.git",
+        "rev": "6f961465d00ff50f2096cfb05520c0653a87d2cd"
+      },
+      {
+        "line": "fre-aot-regex = { git = \"https://github.com/danluu/fre.git\", rev = \"6f961465d00ff50f2096cfb05520c0653a87d2cd\" }",
+        "git": "https://github.com/danluu/fre.git",
+        "rev": "6f961465d00ff50f2096cfb05520c0653a87d2cd"
+      },
+      {
+        "line": "fre-aot-regex-loader = { git = \"https://github.com/danluu/fre.git\", rev = \"6f961465d00ff50f2096cfb05520c0653a87d2cd\" }",
+        "git": "https://github.com/danluu/fre.git",
+        "rev": "6f961465d00ff50f2096cfb05520c0653a87d2cd"
+      },
+      {
+        "line": "fre-syntax = { git = \"https://github.com/danluu/fre.git\", rev = \"6f961465d00ff50f2096cfb05520c0653a87d2cd\" }",
+        "git": "https://github.com/danluu/fre.git",
+        "rev": "6f961465d00ff50f2096cfb05520c0653a87d2cd"
+      }
+    ],
+    "cargo_toml_sha256": "93866d8e49e5e1744bbd18afe9bb41b17b212ea65e00532e58b52522aca02f72",
+    "cargo_lock_sha256": "8fbaf034fdc6687d2b0188c5f95e2682cfc4b35ec00bdaa294dec3b8f3c18692",
+    "cargo_config_sha256": "8bd7b5f9a465f9898a590239a06678d62b7be6e28ccc1fcc9fedd7915f5d6e39"
+  },
+  "toolchain": {
+    "rustc": "rustc 1.96.0 (ac68faa20 2026-05-25)\nbinary: rustc\ncommit-hash: ac68faa20c58cbccd01ee7208bf3b6e93a7d7f96\ncommit-date: 2026-05-25\nhost: aarch64-apple-darwin\nrelease: 1.96.0\nLLVM version: 22.1.2",
+    "cargo": "cargo 1.96.0 (30a34c682 2026-05-25)\nrelease: 1.96.0\ncommit-hash: 30a34c6821b57de0aaec83a901aca39f88f6778c\ncommit-date: 2026-05-25\nhost: aarch64-apple-darwin\nlibgit2: 1.9.2 (sys:0.20.4 vendored)\nlibcurl: 8.7.1 (sys:0.4.87+curl-8.19.0 system ssl:(SecureTransport) LibreSSL/3.3.6)\nssl: OpenSSL 3.5.4 30 Sep 2025\nos: Mac OS 26.6.1 [64-bit]"
+  },
+  "fixed_pattern_registry": {
+    "path": "/Users/danluu/dev/ripgrep-fre-aot-background-20260820/experiments/fre-patterns.tsv",
+    "sha256": "155bcee5e3cd01b963fd3d346ec55d23ea75a4db31d1aed2e3c3913d2c5fe61c",
+    "query_registered": false
+  },
+  "binaries": {
+    "candidate": {
+      "path": "/Users/danluu/dev/ripgrep-fre-aot-background-20260820/target/release/rg",
+      "sha256": "36345e49610a7b44eb33d2168ac2004dd3fa7d6668f2c23da04d750333f75c41",
+      "version": "ripgrep 15.2.0 (rev 752d270343)\n\nfeatures:-pcre2\nsimd(compile):+NEON\nsimd(runtime):+NEON\n\nPCRE2 is not available in this build of ripgrep."
+    },
+    "stock": {
+      "path": "/Users/danluu/dev/ripgrep/target/release/rg",
+      "sha256": "c23ebfd27192ae14b7c59acf33adf2b62e1af380422fdf6657b0a6d0294f43c6",
+      "version": "ripgrep 15.2.0 (rev f9c05a949d)\n\nfeatures:-pcre2\nsimd(compile):+NEON\nsimd(runtime):+NEON\n\nPCRE2 is not available in this build of ripgrep."
+    }
+  },
+  "corpus": {
+    "manifest": "/Users/danluu/dev/ripgrep-fre-aot-background-20260820/experiments/background-aot-midscan/data/manifest.json",
+    "manifest_sha256": "1f7bd705f1e75de103d16bb39219a140b61d64949d9258256f474e511862d361",
+    "pattern": "a{0,99}b",
+    "line_bytes": 4096
+  },
+  "cases": [
+    {
+      "name": "same-file-two-witnesses",
+      "args": [
+        "--no-config",
+        "--engine=default",
+        "--no-ignore",
+        "--text",
+        "--color=never",
+        "--threads=1",
+        "--count",
+        "--",
+        "a{0,99}b",
+        "/Users/danluu/dev/ripgrep-fre-aot-background-20260820/experiments/background-aot-midscan/data/correctness/two-matches.log"
+      ],
+      "normal": {
+        "status": 0,
+        "stdout": {
+          "bytes": 2,
+          "sha256": "53c234e5e8472b6ac51c1ae1cab3fe06fad053beb8ebfd8977b010655bfdd3c3",
+          "hex": "320a"
+        },
+        "stderr": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "hex": ""
+        },
+        "receipt": null
+      },
+      "background": {
+        "status": 0,
+        "stdout": {
+          "bytes": 2,
+          "sha256": "53c234e5e8472b6ac51c1ae1cab3fe06fad053beb8ebfd8977b010655bfdd3c3",
+          "hex": "320a"
+        },
+        "stderr": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "hex": ""
+        },
+        "receipt": {
+          "compile_ns": 2751541,
+          "decline_reason": null,
+          "direct_native_only": true,
+          "external_linker_invocations": 0,
+          "first_cutover_file_ordinal": 1,
+          "first_cutover_ns_since_start": 3283625,
+          "first_cutover_stock_committed_bytes": 8450048,
+          "fre_aot_files": 1,
+          "fre_aot_window_bytes": 58716160,
+          "fre_aot_windows": 896,
+          "mixed_engine_files": 1,
+          "native_call_failures": 0,
+          "outcome": "ready",
+          "prepare_ns": 2894625,
+          "publish_ns": 26792,
+          "ready_ns_since_start": 3274542,
+          "schema": "ripgrep.fre-aot-background.v2",
+          "stock_committed_bytes": 8450048,
+          "stock_files": 1,
+          "stock_window_bytes": 8515584,
+          "stock_windows": 130,
+          "test_min_stock_bytes": 8388608,
+          "total_file_attempts": 1
+        }
+      },
+      "stock": {
+        "status": 0,
+        "stdout": {
+          "bytes": 2,
+          "sha256": "53c234e5e8472b6ac51c1ae1cab3fe06fad053beb8ebfd8977b010655bfdd3c3",
+          "hex": "320a"
+        },
+        "stderr": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "hex": ""
+        },
+        "receipt": null
+      }
+    },
+    {
+      "name": "same-file-exact-spans",
+      "args": [
+        "--no-config",
+        "--engine=default",
+        "--no-ignore",
+        "--text",
+        "--color=never",
+        "--threads=1",
+        "--only-matching",
+        "--byte-offset",
+        "--line-number",
+        "--",
+        "a{0,99}b",
+        "/Users/danluu/dev/ripgrep-fre-aot-background-20260820/experiments/background-aot-midscan/data/correctness/two-matches.log"
+      ],
+      "normal": {
+        "status": 0,
+        "stdout": {
+          "bytes": 229,
+          "sha256": "af014831104d94f8f3de110f327110296c40fbf41e24e8d48c03564ce516e4a9",
+          "hex": "313032353a343139383239393a616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161620a343039373a31363738313231313a616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161620a"
+        },
+        "stderr": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "hex": ""
+        },
+        "receipt": null
+      },
+      "background": {
+        "status": 0,
+        "stdout": {
+          "bytes": 229,
+          "sha256": "af014831104d94f8f3de110f327110296c40fbf41e24e8d48c03564ce516e4a9",
+          "hex": "313032353a343139383239393a616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161620a343039373a31363738313231313a616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161620a"
+        },
+        "stderr": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "hex": ""
+        },
+        "receipt": {
+          "compile_ns": 2095916,
+          "decline_reason": null,
+          "direct_native_only": true,
+          "external_linker_invocations": 0,
+          "first_cutover_file_ordinal": 1,
+          "first_cutover_ns_since_start": 4130042,
+          "first_cutover_stock_committed_bytes": 8450048,
+          "fre_aot_files": 1,
+          "fre_aot_window_bytes": 58720255,
+          "fre_aot_windows": 898,
+          "mixed_engine_files": 1,
+          "native_call_failures": 0,
+          "outcome": "ready",
+          "prepare_ns": 2195708,
+          "publish_ns": 19417,
+          "ready_ns_since_start": 4120583,
+          "schema": "ripgrep.fre-aot-background.v2",
+          "stock_committed_bytes": 8450048,
+          "stock_files": 1,
+          "stock_window_bytes": 8519679,
+          "stock_windows": 132,
+          "test_min_stock_bytes": 8388608,
+          "total_file_attempts": 1
+        }
+      },
+      "stock": {
+        "status": 0,
+        "stdout": {
+          "bytes": 229,
+          "sha256": "af014831104d94f8f3de110f327110296c40fbf41e24e8d48c03564ce516e4a9",
+          "hex": "313032353a343139383239393a616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161620a343039373a31363738313231313a616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161620a"
+        },
+        "stderr": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "hex": ""
+        },
+        "receipt": null
+      }
+    },
+    {
+      "name": "default-thread-tree",
+      "args": [
+        "--no-config",
+        "--engine=default",
+        "--no-ignore",
+        "--text",
+        "--color=never",
+        "--quiet",
+        "--",
+        "a{0,99}b",
+        "/Users/danluu/dev/ripgrep-fre-aot-background-20260820/experiments/background-aot-midscan/data/tree/shard-000.log",
+        "/Users/danluu/dev/ripgrep-fre-aot-background-20260820/experiments/background-aot-midscan/data/tree/shard-001.log",
+        "/Users/danluu/dev/ripgrep-fre-aot-background-20260820/experiments/background-aot-midscan/data/tree/shard-002.log",
+        "/Users/danluu/dev/ripgrep-fre-aot-background-20260820/experiments/background-aot-midscan/data/tree/shard-003.log",
+        "/Users/danluu/dev/ripgrep-fre-aot-background-20260820/experiments/background-aot-midscan/data/tree/shard-004.log",
+        "/Users/danluu/dev/ripgrep-fre-aot-background-20260820/experiments/background-aot-midscan/data/tree/shard-005.log",
+        "/Users/danluu/dev/ripgrep-fre-aot-background-20260820/experiments/background-aot-midscan/data/tree/shard-006.log",
+        "/Users/danluu/dev/ripgrep-fre-aot-background-20260820/experiments/background-aot-midscan/data/tree/shard-007.log"
+      ],
+      "normal": {
+        "status": 1,
+        "stdout": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "hex": ""
+        },
+        "stderr": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "hex": ""
+        },
+        "receipt": null
+      },
+      "background": {
+        "status": 1,
+        "stdout": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "hex": ""
+        },
+        "stderr": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "hex": ""
+        },
+        "receipt": {
+          "compile_ns": 2460833,
+          "decline_reason": null,
+          "direct_native_only": true,
+          "external_linker_invocations": 0,
+          "first_cutover_file_ordinal": 6,
+          "first_cutover_ns_since_start": 2608250,
+          "first_cutover_stock_committed_bytes": 4521984,
+          "fre_aot_files": 8,
+          "fre_aot_window_bytes": 507904000,
+          "fre_aot_windows": 7750,
+          "mixed_engine_files": 8,
+          "native_call_failures": 0,
+          "outcome": "ready",
+          "prepare_ns": 2566416,
+          "publish_ns": 24500,
+          "ready_ns_since_start": 2591333,
+          "schema": "ripgrep.fre-aot-background.v2",
+          "stock_committed_bytes": 28966912,
+          "stock_files": 8,
+          "stock_window_bytes": 28966912,
+          "stock_windows": 442,
+          "test_min_stock_bytes": 8388608,
+          "total_file_attempts": 8
+        }
+      },
+      "stock": {
+        "status": 1,
+        "stdout": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "hex": ""
+        },
+        "stderr": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "hex": ""
+        },
+        "receipt": null
+      }
+    }
+  ],
+  "post_run_corpus_verified": true,
+  "post_run_provenance_verified": true
+}
