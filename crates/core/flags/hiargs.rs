@@ -20,6 +20,7 @@ use crate::{
         PatternSource, SearchMode, SortMode, SortModeKind, TypeChange,
     },
     fre_aot::FreAotMatcher,
+    fre_aot_background::BackgroundFreMatcher,
     haystack::{Haystack, HaystackBuilder},
     search::{PatternMatcher, Printer, SearchWorker, SearchWorkerBuilder},
 };
@@ -54,6 +55,7 @@ pub(crate) struct HiArgs {
     field_match_separator: FieldMatchSeparator,
     file_separator: Option<Vec<u8>>,
     fixed_strings: bool,
+    fre_aot_background: bool,
     follow: bool,
     globs: ignore::overrides::Override,
     heading: bool,
@@ -116,6 +118,11 @@ impl HiArgs {
         // Callers should not be trying to convert low-level arguments when
         // a short-circuiting special mode is present.
         assert_eq!(None, low.special, "special mode demands short-circuiting");
+        if low.fre_aot_background
+            && !matches!(low.engine, EngineChoice::Default)
+        {
+            anyhow::bail!("--fre-aot-background requires --engine=default");
+        }
         // If the sorting mode isn't supported, then we bail loudly. I'm not
         // sure if this is the right thing to do. We could silently "not sort"
         // as well. If we wanted to go that route, then we could just set
@@ -282,6 +289,7 @@ impl HiArgs {
             field_match_separator: low.field_match_separator,
             file_separator,
             fixed_strings: low.fixed_strings,
+            fre_aot_background: low.fre_aot_background,
             follow: low.follow,
             heading,
             hidden: low.hidden,
@@ -378,6 +386,9 @@ impl HiArgs {
     /// If there was a problem building the matcher (e.g., a syntax error),
     /// then this returns an error.
     pub(crate) fn matcher(&self) -> anyhow::Result<PatternMatcher> {
+        if self.fre_aot_background {
+            return self.matcher_fre_background();
+        }
         match self.engine {
             EngineChoice::Default => match self.matcher_rust() {
                 Ok(m) => Ok(m),
@@ -412,6 +423,50 @@ impl HiArgs {
                 );
             }
         }
+    }
+
+    /// Build the stock Rust matcher synchronously, then start an independent
+    /// optimizing-AOT attempt. Unsupported search profiles retain the stock
+    /// matcher and publish an explicit decline receipt.
+    fn matcher_fre_background(&self) -> anyhow::Result<PatternMatcher> {
+        let unsupported = if self.patterns.patterns.len() != 1 {
+            Some("multiple patterns")
+        } else if !matches!(self.case, CaseMode::Sensitive) {
+            Some("case mode other than case-sensitive")
+        } else if self.boundary.is_some() {
+            Some("word or line boundary mode")
+        } else if self.fixed_strings {
+            Some("fixed-string rewriting")
+        } else if self.multiline {
+            Some("multiline mode")
+        } else if self.crlf {
+            Some("CRLF mode")
+        } else if self.null_data {
+            Some("NUL line terminators")
+        } else if self.no_unicode {
+            Some("Unicode-disabled syntax")
+        } else {
+            None
+        };
+        let matcher = match unsupported {
+            Some(reason) => {
+                // Avoid rendering a potentially large configured HIR for a
+                // profile that will never be sent to the AOT compiler.
+                let (stock, _) = self.matcher_rust_parts(false)?;
+                BackgroundFreMatcher::declined(stock, reason)
+            }
+            None => {
+                let (stock, aot_pattern) =
+                    self.matcher_rust_background_parts()?;
+                BackgroundFreMatcher::start(
+                    aot_pattern,
+                    self.regex_size_limit,
+                    self.dfa_size_limit,
+                    stock,
+                )
+            }
+        };
+        Ok(PatternMatcher::FreAotBackground(matcher))
     }
 
     /// Build the normal Rust matcher first, and replace its matching hot path
@@ -522,6 +577,26 @@ impl HiArgs {
     /// If there was a problem building the matcher (such as a regex syntax
     /// error), then an error is returned.
     fn matcher_rust(&self) -> anyhow::Result<PatternMatcher> {
+        let (matcher, _) = self.matcher_rust_parts(false)?;
+        Ok(PatternMatcher::RustRegex(matcher))
+    }
+
+    /// Build the stock matcher and retain the configured-HIR rendering that
+    /// exactly describes its group-zero match semantics for the AOT compiler.
+    fn matcher_rust_background_parts(
+        &self,
+    ) -> anyhow::Result<(grep::regex::RegexMatcher, String)> {
+        let (matcher, pattern) = self.matcher_rust_parts(true)?;
+        Ok((
+            matcher,
+            pattern.expect("background matcher requested its HIR pattern"),
+        ))
+    }
+
+    fn matcher_rust_parts(
+        &self,
+        include_hir_pattern: bool,
+    ) -> anyhow::Result<(grep::regex::RegexMatcher, Option<String>)> {
         let mut builder = grep::regex::RegexMatcherBuilder::new();
         builder
             .multi_line(true)
@@ -567,13 +642,22 @@ impl HiArgs {
         if !self.binary.is_none() {
             builder.ban_byte(Some(b'\x00'));
         }
-        let m = match builder.build_many(&self.patterns.patterns) {
-            Ok(m) => m,
+        let built = if include_hir_pattern {
+            builder
+                .build_many_with_hir_pattern(&self.patterns.patterns)
+                .map(|(matcher, pattern)| (matcher, Some(pattern)))
+        } else {
+            builder
+                .build_many(&self.patterns.patterns)
+                .map(|matcher| (matcher, None))
+        };
+        let built = match built {
+            Ok(built) => built,
             Err(err) => {
                 anyhow::bail!(suggest_text(suggest_multiline(err.to_string())))
             }
         };
-        Ok(PatternMatcher::RustRegex(m))
+        Ok(built)
     }
 
     /// Returns true if some non-zero number of matches is believed to be

@@ -192,9 +192,21 @@ impl SearchResult {
 #[derive(Clone, Debug)]
 pub(crate) enum PatternMatcher {
     FreAot(crate::fre_aot::FreAotMatcher),
+    FreAotBackground(crate::fre_aot_background::BackgroundFreMatcher),
     RustRegex(grep::regex::RegexMatcher),
     #[cfg(feature = "pcre2")]
     PCRE2(grep::pcre2::RegexMatcher),
+}
+
+impl PatternMatcher {
+    /// Poll background compilation and select the matcher for one complete
+    /// file. This is called before a searcher or printer sink borrows us, so
+    /// the engine cannot change in the middle of a file.
+    fn begin_file(&mut self) {
+        if let PatternMatcher::FreAotBackground(matcher) = self {
+            matcher.begin_file();
+        }
+    }
 }
 
 /// The printer used by a search worker.
@@ -247,6 +259,7 @@ impl<W: WriteColor> SearchWorker<W> {
         &mut self,
         haystack: &crate::haystack::Haystack,
     ) -> io::Result<SearchResult> {
+        self.matcher.begin_file();
         let bin = if haystack.is_explicit() {
             self.config.binary_explicit.clone()
         } else {
@@ -346,6 +359,7 @@ impl<W: WriteColor> SearchWorker<W> {
         let (searcher, printer) = (&mut self.searcher, &mut self.printer);
         match self.matcher {
             FreAot(ref m) => search_path(m, searcher, printer, path),
+            FreAotBackground(ref m) => search_path(m, searcher, printer, path),
             RustRegex(ref m) => search_path(m, searcher, printer, path),
             #[cfg(feature = "pcre2")]
             PCRE2(ref m) => search_path(m, searcher, printer, path),
@@ -371,6 +385,9 @@ impl<W: WriteColor> SearchWorker<W> {
         let (searcher, printer) = (&mut self.searcher, &mut self.printer);
         match self.matcher {
             FreAot(ref m) => search_reader(m, searcher, printer, path, rdr),
+            FreAotBackground(ref m) => {
+                search_reader(m, searcher, printer, path, rdr)
+            }
             RustRegex(ref m) => search_reader(m, searcher, printer, path, rdr),
             #[cfg(feature = "pcre2")]
             PCRE2(ref m) => search_reader(m, searcher, printer, path, rdr),

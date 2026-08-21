@@ -54,6 +54,7 @@ pub(crate) struct LowArgs {
     pub(crate) field_context_separator: FieldContextSeparator,
     pub(crate) field_match_separator: FieldMatchSeparator,
     pub(crate) fixed_strings: bool,
+    pub(crate) fre_aot_background: bool,
     pub(crate) follow: bool,
     pub(crate) glob_case_insensitive: bool,
     pub(crate) globs: Vec<String>,

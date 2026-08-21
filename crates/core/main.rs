@@ -13,6 +13,7 @@ mod messages;
 
 mod flags;
 mod fre_aot;
+mod fre_aot_background;
 mod haystack;
 mod index;
 mod logger;

@@ -70,6 +70,7 @@ pub(super) const FLAGS: &[&dyn Flag] = &[
     &FilesWithMatches,
     &FilesWithoutMatch,
     &FixedStrings,
+    &FreAotBackground,
     &Follow,
     &Generate,
     &Glob,
@@ -1862,6 +1863,67 @@ fn test_engine() {
     let args =
         parse_low_raw(["--engine=pcre2", "--no-auto-hybrid-regex"]).unwrap();
     assert_eq!(EngineChoice::Default, args.engine);
+}
+
+/// --fre-aot-background
+#[derive(Debug)]
+struct FreAotBackground;
+
+impl Flag for FreAotBackground {
+    fn is_switch(&self) -> bool {
+        true
+    }
+
+    fn name_long(&self) -> &'static str {
+        "fre-aot-background"
+    }
+
+    fn name_negated(&self) -> Option<&'static str> {
+        Some("no-fre-aot-background")
+    }
+
+    fn doc_category(&self) -> Category {
+        Category::Search
+    }
+
+    fn doc_short(&self) -> &'static str {
+        r"Compile eligible FRE AOT searches in the background."
+    }
+
+    fn doc_long(&self) -> &'static str {
+        r"
+Start searching immediately with ripgrep's default regex engine while an
+eligible equivalent FRE optimizing-AOT matcher is compiled in a background
+thread. Once compilation and native loading finish, each search worker changes
+its group-zero matching route before its next file. That route remains fixed
+for the complete file; capture extraction continues to use ripgrep's default
+regex engine.
+.sp
+Compilation or loading failure leaves the default regex engine in use. This
+experimental flag requires \fB\-\-engine=default\fP and is separate from
+\fB\-\-engine=fre\fP, which selects only the fixed build-time AOT registry.
+"
+    }
+
+    fn update(&self, v: FlagValue, args: &mut LowArgs) -> anyhow::Result<()> {
+        args.fre_aot_background = v.unwrap_switch();
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn test_fre_aot_background() {
+    let args = parse_low_raw(None::<&str>).unwrap();
+    assert!(!args.fre_aot_background);
+
+    let args = parse_low_raw(["--fre-aot-background"]).unwrap();
+    assert!(args.fre_aot_background);
+
+    let args =
+        parse_low_raw(["--fre-aot-background", "--no-fre-aot-background"])
+            .unwrap();
+    assert!(!args.fre_aot_background);
 }
 
 /// --field-context-separator

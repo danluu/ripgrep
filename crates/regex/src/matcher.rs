@@ -54,6 +54,30 @@ impl RegexMatcherBuilder {
         &self,
         patterns: &[P],
     ) -> Result<RegexMatcher, Error> {
+        self.build_many_impl(patterns, false).map(|(matcher, _)| matcher)
+    }
+
+    /// Build a matcher and return a regex-syntax rendering of the exact
+    /// configured HIR used to build it.
+    ///
+    /// Unlike the caller's original pattern, this rendering includes
+    /// transformations such as removing a configured line terminator from
+    /// character classes. It is intended for semantically compatible
+    /// secondary compilers that need to reproduce this matcher's group-zero
+    /// spans without reimplementing grep-regex configuration.
+    pub fn build_many_with_hir_pattern<P: AsRef<str>>(
+        &self,
+        patterns: &[P],
+    ) -> Result<(RegexMatcher, String), Error> {
+        let (matcher, pattern) = self.build_many_impl(patterns, true)?;
+        Ok((matcher, pattern.expect("configured HIR rendering requested")))
+    }
+
+    fn build_many_impl<P: AsRef<str>>(
+        &self,
+        patterns: &[P],
+        include_hir_pattern: bool,
+    ) -> Result<(RegexMatcher, Option<String>), Error> {
         let mut chir = self.config.build_many(patterns)?;
         // 'whole_line' is a strict subset of 'word', so when it is enabled,
         // we don't need to both with any specific to word matching.
@@ -62,6 +86,7 @@ impl RegexMatcherBuilder {
         } else if chir.config().word {
             chir = chir.into_word();
         }
+        let hir_pattern = include_hir_pattern.then(|| chir.hir().to_string());
         let regex = chir.to_regex()?;
         log::trace!("final regex: {:?}", chir.hir().to_string());
 
@@ -81,7 +106,15 @@ impl RegexMatcherBuilder {
         // support it.
         let mut config = self.config.clone();
         config.line_terminator = chir.line_terminator();
-        Ok(RegexMatcher { config, regex, fast_line_regex, non_matching_bytes })
+        Ok((
+            RegexMatcher {
+                config,
+                regex,
+                fast_line_regex,
+                non_matching_bytes,
+            },
+            hir_pattern,
+        ))
     }
 
     /// Build a new matcher from a plain alternation of literals.
@@ -581,6 +614,22 @@ mod tests {
             .build(r"abc\sxyz")
             .unwrap();
         assert!(!matcher.is_match(b"abc\nxyz").unwrap());
+    }
+
+    #[test]
+    fn configured_hir_rendering_preserves_line_terminator_rewrite() {
+        let mut builder = RegexMatcherBuilder::new();
+        builder.line_terminator(Some(b'\n')).multi_line(true);
+        let (stock, pattern) =
+            builder.build_many_with_hir_pattern(&[r"abc\sxyz"]).unwrap();
+        let rendered = builder.build(&pattern).unwrap();
+        for haystack in [b"abc xyz".as_slice(), b"abc\nxyz", b"zzabc\txyz"] {
+            assert_eq!(
+                stock.find(haystack).unwrap(),
+                rendered.find(haystack).unwrap()
+            );
+        }
+        assert!(!rendered.is_match(b"abc\nxyz").unwrap());
     }
 
     // Ensure that the builder returns an error if a line terminator is set
