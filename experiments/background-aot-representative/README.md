@@ -1,5 +1,9 @@
 # Representative background-AOT experiment
 
+The sealed retained-candidate-mask four-arm attribution control is documented
+in [SCANNER_DELTA.md](SCANNER_DELTA.md). It runs only prebuilt, independently
+qualified old/new candidates and leaves the general receipt validator strict.
+
 The completed local and EC2 results are in [RESULTS.md](RESULTS.md). The
 newest checked-in result is the authenticated exact-Teddy V2 census,
 qualification, formal round, and reverse-order confirmation; it is a clear
