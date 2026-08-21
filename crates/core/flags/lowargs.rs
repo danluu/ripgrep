@@ -545,6 +545,8 @@ pub(crate) enum EngineChoice {
     /// the implementation of the `regex` crate.)
     #[default]
     Default,
+    /// Uses FRE's portable ordinary runtime if it is available.
+    FRE,
     /// Dynamically select the right engine to use.
     ///
     /// This works by trying to use the default engine, and if the pattern does

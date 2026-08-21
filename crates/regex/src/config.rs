@@ -155,7 +155,7 @@ impl Config {
 /// size limits set on the configured HIR will be propagated out to any
 /// subsequently constructed HIR or regular expression.
 #[derive(Clone, Debug)]
-pub(crate) struct ConfiguredHIR {
+pub struct ConfiguredHIR {
     config: Config,
     hir: Hir,
 }
@@ -234,7 +234,7 @@ impl ConfiguredHIR {
     }
 
     /// Return a reference to the underlying HIR.
-    pub(crate) fn hir(&self) -> &Hir {
+    pub fn hir(&self) -> &Hir {
         &self.hir
     }
 
@@ -260,7 +260,7 @@ impl ConfiguredHIR {
     }
 
     /// Compute the set of non-matching bytes for this HIR expression.
-    pub(crate) fn non_matching_bytes(&self) -> ByteSet {
+    pub fn non_matching_bytes(&self) -> ByteSet {
         non_matching_bytes(&self.hir)
     }
 
@@ -293,7 +293,7 @@ impl ConfiguredHIR {
     /// present even though that's not quite correct...
     ///
     /// See: <https://github.com/BurntSushi/ripgrep/issues/2260>
-    pub(crate) fn line_terminator(&self) -> Option<LineTerminator> {
+    pub fn line_terminator(&self) -> Option<LineTerminator> {
         if self.hir.properties().look_set().contains_anchor_haystack() {
             None
         } else {

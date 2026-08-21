@@ -122,14 +122,16 @@ fn search(args: &HiArgs, mode: SearchMode) -> anyhow::Result<bool> {
     let mut matched = false;
     let mut searched = false;
     let mut stats = args.stats();
-    let mut searcher = args.search_worker(
+    let searcher = args.search_worker(
         args.matcher()?,
         args.searcher()?,
         args.printer(mode, args.stdout()),
     )?;
+    let (matcher, mut searcher) = searcher.into_parts();
+    let matcher = matcher.worker()?;
     for haystack in haystacks {
         searched = true;
-        let search_result = match searcher.search(&haystack) {
+        let search_result = match searcher.search(&matcher, &haystack) {
             Ok(search_result) => search_result,
             // A broken pipe means graceful termination.
             Err(err) if err.kind() == std::io::ErrorKind::BrokenPipe => break,
@@ -184,7 +186,14 @@ fn search_parallel(args: &HiArgs, mode: SearchMode) -> anyhow::Result<bool> {
         let matched = &matched;
         let searched = &searched;
         let haystack_builder = &haystack_builder;
-        let mut searcher = searcher.clone();
+        let matcher = match searcher.parallel_matcher_worker() {
+            Ok(matcher) => matcher,
+            Err(error) => {
+                err_message!("failed to construct FRE search worker: {error}");
+                return Box::new(|_| WalkState::Quit);
+            }
+        };
+        let mut worker = searcher.clone_runtime();
 
         Box::new(move |result| {
             let haystack = match haystack_builder.build_from_result(result) {
@@ -192,8 +201,8 @@ fn search_parallel(args: &HiArgs, mode: SearchMode) -> anyhow::Result<bool> {
                 None => return WalkState::Continue,
             };
             searched.store(true, Ordering::SeqCst);
-            searcher.printer().get_mut().clear();
-            let search_result = match searcher.search(&haystack) {
+            worker.printer().get_mut().clear();
+            let search_result = match worker.search(&matcher, &haystack) {
                 Ok(search_result) => search_result,
                 Err(err) => {
                     err_message!("{}: {}", haystack.path().display(), err);
@@ -207,7 +216,7 @@ fn search_parallel(args: &HiArgs, mode: SearchMode) -> anyhow::Result<bool> {
                 let mut stats = locked_stats.lock().unwrap();
                 *stats += search_result.stats().unwrap();
             }
-            if let Err(err) = bufwtr.print(searcher.printer().get_mut()) {
+            if let Err(err) = bufwtr.print(worker.printer().get_mut()) {
                 // A broken pipe means graceful termination.
                 if err.kind() == std::io::ErrorKind::BrokenPipe {
                     return WalkState::Quit;

@@ -7,7 +7,7 @@ read and matched using the regex engine) and the printer. For example, the
 search worker is where things like preprocessors or decompression happens.
 */
 
-use std::{io, path::Path};
+use std::{borrow::Cow, io, path::Path};
 
 use {grep::matcher::Matcher, termcolor::WriteColor};
 
@@ -192,8 +192,56 @@ impl SearchResult {
 #[derive(Clone, Debug)]
 pub(crate) enum PatternMatcher {
     RustRegex(grep::regex::RegexMatcher),
+    #[cfg(feature = "fre")]
+    FRE(grep::fre::RegexMatcher),
     #[cfg(feature = "pcre2")]
     PCRE2(grep::pcre2::RegexMatcher),
+}
+
+#[derive(Debug)]
+pub(crate) enum PatternMatcherWorker<'a> {
+    RustRegex(Cow<'a, grep::regex::RegexMatcher>),
+    #[cfg(feature = "fre")]
+    FRE(grep::fre::RegexMatcherWorker<'a>),
+    #[cfg(feature = "pcre2")]
+    PCRE2(Cow<'a, grep::pcre2::RegexMatcher>),
+}
+
+impl PatternMatcher {
+    pub(crate) fn worker(&self) -> anyhow::Result<PatternMatcherWorker<'_>> {
+        match self {
+            Self::RustRegex(matcher) => {
+                Ok(PatternMatcherWorker::RustRegex(Cow::Borrowed(matcher)))
+            }
+            #[cfg(feature = "fre")]
+            Self::FRE(matcher) => {
+                Ok(PatternMatcherWorker::FRE(matcher.worker()?))
+            }
+            #[cfg(feature = "pcre2")]
+            Self::PCRE2(matcher) => {
+                Ok(PatternMatcherWorker::PCRE2(Cow::Borrowed(matcher)))
+            }
+        }
+    }
+
+    pub(crate) fn parallel_worker(
+        &self,
+    ) -> anyhow::Result<PatternMatcherWorker<'_>> {
+        match self {
+            // Cloning gives each parallel worker its own regex cache pool.
+            Self::RustRegex(matcher) => Ok(PatternMatcherWorker::RustRegex(
+                Cow::Owned(matcher.clone()),
+            )),
+            #[cfg(feature = "fre")]
+            Self::FRE(matcher) => {
+                Ok(PatternMatcherWorker::FRE(matcher.worker()?))
+            }
+            #[cfg(feature = "pcre2")]
+            Self::PCRE2(matcher) => {
+                Ok(PatternMatcherWorker::PCRE2(Cow::Owned(matcher.clone())))
+            }
+        }
+    }
 }
 
 /// The printer used by a search worker.
@@ -240,10 +288,58 @@ pub(crate) struct SearchWorker<W> {
     printer: Printer<W>,
 }
 
+#[derive(Clone, Debug)]
+pub(crate) struct SearchWorkerRuntime<W> {
+    config: Config,
+    command_builder: grep::cli::CommandReaderBuilder,
+    decomp_builder: Option<grep::cli::DecompressionReaderBuilder>,
+    searcher: grep::searcher::Searcher,
+    printer: Printer<W>,
+}
+
 impl<W: WriteColor> SearchWorker<W> {
+    pub(crate) fn into_parts(
+        self,
+    ) -> (PatternMatcher, SearchWorkerRuntime<W>) {
+        let runtime = SearchWorkerRuntime {
+            config: self.config,
+            command_builder: self.command_builder,
+            decomp_builder: self.decomp_builder,
+            searcher: self.searcher,
+            printer: self.printer,
+        };
+        (self.matcher, runtime)
+    }
+
+    pub(crate) fn parallel_matcher_worker(
+        &self,
+    ) -> anyhow::Result<PatternMatcherWorker<'_>> {
+        self.matcher.parallel_worker()
+    }
+
+    pub(crate) fn clone_runtime(&self) -> SearchWorkerRuntime<W>
+    where
+        W: Clone,
+    {
+        SearchWorkerRuntime {
+            config: self.config.clone(),
+            command_builder: self.command_builder.clone(),
+            decomp_builder: self.decomp_builder.clone(),
+            searcher: self.searcher.clone(),
+            printer: self.printer.clone(),
+        }
+    }
+
+    pub(crate) fn printer(&mut self) -> &mut Printer<W> {
+        &mut self.printer
+    }
+}
+
+impl<W: WriteColor> SearchWorkerRuntime<W> {
     /// Execute a search over the given haystack.
     pub(crate) fn search(
         &mut self,
+        matcher: &PatternMatcherWorker<'_>,
         haystack: &crate::haystack::Haystack,
     ) -> io::Result<SearchResult> {
         let bin = if haystack.is_explicit() {
@@ -256,13 +352,13 @@ impl<W: WriteColor> SearchWorker<W> {
 
         self.searcher.set_binary_detection(bin);
         if haystack.is_stdin() {
-            self.search_reader(path, &mut io::stdin().lock())
+            self.search_reader(matcher, path, &mut io::stdin().lock())
         } else if self.should_preprocess(path) {
-            self.search_preprocessor(path)
+            self.search_preprocessor(matcher, path)
         } else if self.should_decompress(path) {
-            self.search_decompress(path)
+            self.search_decompress(matcher, path)
         } else {
-            self.search_path(path)
+            self.search_path(matcher, path)
         }
     }
 
@@ -295,6 +391,7 @@ impl<W: WriteColor> SearchWorker<W> {
     /// data to search instead of opening the path directly.
     fn search_preprocessor(
         &mut self,
+        matcher: &PatternMatcherWorker<'_>,
         path: &Path,
     ) -> io::Result<SearchResult> {
         use std::{fs::File, process::Stdio};
@@ -311,12 +408,13 @@ impl<W: WriteColor> SearchWorker<W> {
                 ),
             )
         })?;
-        let result = self.search_reader(path, &mut rdr).map_err(|err| {
-            io::Error::new(
-                io::ErrorKind::Other,
-                format!("preprocessor command failed: '{cmd:?}': {err}"),
-            )
-        });
+        let result =
+            self.search_reader(matcher, path, &mut rdr).map_err(|err| {
+                io::Error::new(
+                    io::ErrorKind::Other,
+                    format!("preprocessor command failed: '{cmd:?}': {err}"),
+                )
+            });
         let close_result = rdr.close();
         let search_result = result?;
         close_result?;
@@ -326,12 +424,16 @@ impl<W: WriteColor> SearchWorker<W> {
     /// Attempt to decompress the data at the given file path and search the
     /// result. If the given file path isn't recognized as a compressed file,
     /// then search it without doing any decompression.
-    fn search_decompress(&mut self, path: &Path) -> io::Result<SearchResult> {
+    fn search_decompress(
+        &mut self,
+        matcher: &PatternMatcherWorker<'_>,
+        path: &Path,
+    ) -> io::Result<SearchResult> {
         let Some(ref decomp_builder) = self.decomp_builder else {
-            return self.search_path(path);
+            return self.search_path(matcher, path);
         };
         let mut rdr = decomp_builder.build(path)?;
-        let result = self.search_reader(path, &mut rdr);
+        let result = self.search_reader(matcher, path, &mut rdr);
         let close_result = rdr.close();
         let search_result = result?;
         close_result?;
@@ -339,14 +441,20 @@ impl<W: WriteColor> SearchWorker<W> {
     }
 
     /// Search the contents of the given file path.
-    fn search_path(&mut self, path: &Path) -> io::Result<SearchResult> {
-        use self::PatternMatcher::*;
+    fn search_path(
+        &mut self,
+        matcher: &PatternMatcherWorker<'_>,
+        path: &Path,
+    ) -> io::Result<SearchResult> {
+        use self::PatternMatcherWorker::*;
 
         let (searcher, printer) = (&mut self.searcher, &mut self.printer);
-        match self.matcher {
-            RustRegex(ref m) => search_path(m, searcher, printer, path),
+        match matcher {
+            RustRegex(m) => search_path(m.as_ref(), searcher, printer, path),
+            #[cfg(feature = "fre")]
+            FRE(m) => search_path(m, searcher, printer, path),
             #[cfg(feature = "pcre2")]
-            PCRE2(ref m) => search_path(m, searcher, printer, path),
+            PCRE2(m) => search_path(m.as_ref(), searcher, printer, path),
         }
     }
 
@@ -361,17 +469,64 @@ impl<W: WriteColor> SearchWorker<W> {
     /// for optimizations (such as memory maps).
     fn search_reader<R: io::Read>(
         &mut self,
+        matcher: &PatternMatcherWorker<'_>,
         path: &Path,
         rdr: &mut R,
     ) -> io::Result<SearchResult> {
-        use self::PatternMatcher::*;
+        use self::PatternMatcherWorker::*;
 
         let (searcher, printer) = (&mut self.searcher, &mut self.printer);
-        match self.matcher {
-            RustRegex(ref m) => search_reader(m, searcher, printer, path, rdr),
+        match matcher {
+            RustRegex(m) => {
+                search_reader(m.as_ref(), searcher, printer, path, rdr)
+            }
+            #[cfg(feature = "fre")]
+            FRE(m) => search_reader(m, searcher, printer, path, rdr),
             #[cfg(feature = "pcre2")]
-            PCRE2(ref m) => search_reader(m, searcher, printer, path, rdr),
+            PCRE2(m) => {
+                search_reader(m.as_ref(), searcher, printer, path, rdr)
+            }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::borrow::Cow;
+
+    use super::{PatternMatcher, PatternMatcherWorker};
+
+    #[test]
+    fn rust_matcher_is_borrowed_sequentially_and_owned_in_parallel() {
+        let matcher = PatternMatcher::RustRegex(
+            grep::regex::RegexMatcher::new("needle")
+                .expect("build regex matcher"),
+        );
+        assert!(matches!(
+            matcher.worker().expect("sequential worker"),
+            PatternMatcherWorker::RustRegex(Cow::Borrowed(_)),
+        ));
+        assert!(matches!(
+            matcher.parallel_worker().expect("parallel worker"),
+            PatternMatcherWorker::RustRegex(Cow::Owned(_)),
+        ));
+    }
+
+    #[cfg(feature = "pcre2")]
+    #[test]
+    fn pcre2_matcher_is_borrowed_sequentially_and_owned_in_parallel() {
+        let matcher = PatternMatcher::PCRE2(
+            grep::pcre2::RegexMatcher::new("needle")
+                .expect("build PCRE2 matcher"),
+        );
+        assert!(matches!(
+            matcher.worker().expect("sequential worker"),
+            PatternMatcherWorker::PCRE2(Cow::Borrowed(_)),
+        ));
+        assert!(matches!(
+            matcher.parallel_worker().expect("parallel worker"),
+            PatternMatcherWorker::PCRE2(Cow::Owned(_)),
+        ));
     }
 }
 

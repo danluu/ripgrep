@@ -41,6 +41,7 @@ members = [
   "crates/globset",
   "crates/grep",
   "crates/cli",
+  "crates/fre",
   "crates/index",
   "crates/matcher",
   "crates/pcre2",
@@ -75,6 +76,7 @@ serde_derive = "1.0.77"
 walkdir = "2"
 
 [features]
+fre = ["grep/fre"]
 pcre2 = ["grep/pcre2"]
 # This provides opt-in support for indexing. This is currently in active
 # development and may have very serious bugs. Use at your own risk.

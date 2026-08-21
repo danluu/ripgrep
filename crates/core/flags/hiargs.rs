@@ -384,6 +384,7 @@ impl HiArgs {
                     anyhow::bail!(suggest_other_engine(err.to_string()));
                 }
             },
+            EngineChoice::FRE => Ok(self.matcher_fre()?),
             EngineChoice::PCRE2 => Ok(self.matcher_pcre2()?),
             EngineChoice::Auto => {
                 let rust_err = match self.matcher_rust() {
@@ -409,6 +410,70 @@ impl HiArgs {
                      PCRE2 regex engine error:\n{pcre_err}",
                 );
             }
+        }
+    }
+
+    /// Build a matcher using FRE's portable ordinary runtime.
+    ///
+    /// Construction reuses grep-regex's configured HIR so that line-byte
+    /// exclusion and the matcher metadata are shared with the Rust engine.
+    /// Unsupported bridge/runtime cases fall back to that engine.
+    fn matcher_fre(&self) -> anyhow::Result<PatternMatcher> {
+        #[cfg(feature = "fre")]
+        {
+            if self.multiline || self.replace.is_some() {
+                return self.matcher_rust();
+            }
+
+            let mut builder = grep::fre::RegexMatcherBuilder::new();
+            builder
+                .multi_line(true)
+                .unicode(!self.no_unicode)
+                .octal(false)
+                .fixed_strings(self.fixed_strings)
+                .line_terminator(Some(b'\n'))
+                .dot_matches_new_line(false);
+            if self.crlf {
+                builder.crlf(true);
+            }
+            if self.null_data {
+                builder.line_terminator(Some(b'\x00'));
+            }
+            match self.case {
+                CaseMode::Sensitive => builder.case_insensitive(false),
+                CaseMode::Insensitive => builder.case_insensitive(true),
+                CaseMode::Smart => builder.case_smart(true),
+            };
+            if let Some(ref boundary) = self.boundary {
+                match *boundary {
+                    BoundaryMode::Line => builder.whole_line(true),
+                    BoundaryMode::Word => builder.word(true),
+                };
+            }
+            if let Some(limit) = self.regex_size_limit {
+                builder.size_limit(limit);
+            }
+            if let Some(limit) = self.dfa_size_limit {
+                builder.dfa_size_limit(limit);
+            }
+            if !self.binary.is_none() {
+                builder.ban_byte(Some(b'\x00'));
+            }
+            match builder.build_many(&self.patterns.patterns) {
+                Ok(matcher) => Ok(PatternMatcher::FRE(matcher)),
+                Err(_) => {
+                    log::debug!(
+                        "FRE construction declined; using the Rust regex matcher"
+                    );
+                    self.matcher_rust()
+                }
+            }
+        }
+        #[cfg(not(feature = "fre"))]
+        {
+            Err(anyhow::anyhow!(
+                "FRE is not available in this build of ripgrep"
+            ))
         }
     }
 

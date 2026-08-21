@@ -9,7 +9,11 @@ use {
     },
 };
 
-use crate::{config::Config, error::Error, literal::InnerLiterals};
+use crate::{
+    config::{Config, ConfiguredHIR},
+    error::Error,
+    literal::InnerLiterals,
+};
 
 /// A builder for constructing a `Matcher` using regular expressions.
 ///
@@ -54,14 +58,7 @@ impl RegexMatcherBuilder {
         &self,
         patterns: &[P],
     ) -> Result<RegexMatcher, Error> {
-        let mut chir = self.config.build_many(patterns)?;
-        // 'whole_line' is a strict subset of 'word', so when it is enabled,
-        // we don't need to both with any specific to word matching.
-        if chir.config().whole_line {
-            chir = chir.into_whole_line();
-        } else if chir.config().word {
-            chir = chir.into_word();
-        }
+        let chir = self.configured_hir_many(patterns)?;
         let regex = chir.to_regex()?;
         log::trace!("final regex: {:?}", chir.hir().to_string());
 
@@ -82,6 +79,27 @@ impl RegexMatcherBuilder {
         let mut config = self.config.clone();
         config.line_terminator = chir.line_terminator();
         Ok(RegexMatcher { config, regex, fast_line_regex, non_matching_bytes })
+    }
+
+    /// Build the exact configured HIR used by [`Self::build_many`].
+    ///
+    /// This is a narrow integration seam for alternate execution engines. It
+    /// includes smart-case analysis, fixed-string handling, line-terminator
+    /// stripping and the word/whole-line transformations before returning.
+    /// Callers remain responsible for preserving the HIR's match semantics.
+    pub fn configured_hir_many<P: AsRef<str>>(
+        &self,
+        patterns: &[P],
+    ) -> Result<ConfiguredHIR, Error> {
+        let mut chir = self.config.build_many(patterns)?;
+        // 'whole_line' is a strict subset of 'word', so when it is enabled,
+        // we don't need to both with any specific to word matching.
+        if chir.config().whole_line {
+            chir = chir.into_whole_line();
+        } else if chir.config().word {
+            chir = chir.into_word();
+        }
+        Ok(chir)
     }
 
     /// Build a new matcher from a plain alternation of literals.

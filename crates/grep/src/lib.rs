@@ -13,6 +13,8 @@ A cookbook and a guide are planned.
 */
 
 pub extern crate grep_cli as cli;
+#[cfg(feature = "fre")]
+pub extern crate grep_fre as fre;
 pub extern crate grep_matcher as matcher;
 #[cfg(feature = "pcre2")]
 pub extern crate grep_pcre2 as pcre2;
