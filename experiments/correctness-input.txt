@@ -1,0 +1,6 @@
+none
+ab aa a xab
+aaaaaaaaab aaaaaaaaab ab
+ERR_SYS normal PME_TURN_OFF
+foo BAR foo
+last-line-no-special-case

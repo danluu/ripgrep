@@ -23,3 +23,12 @@ cargo-timing.html
 
 # ripgrep index
 .ripgrep
+
+# Local benchmark executables are reproducible build products. Raw timing and
+# correctness records under artifacts/raw remain tracked.
+/artifacts/bin/
+# Harness checkpoint/latest aliases are redundant with the named preserved
+# ASIMD/scalar records.
+/artifacts/raw/*.partial.json
+/artifacts/raw/correctness.json
+/artifacts/raw/fresh-process-benchmark.json

@@ -550,6 +550,9 @@ pub(crate) enum EngineChoice {
     /// This works by trying to use the default engine, and if the pattern does
     /// not compile, it switches over to the PCRE2 engine if it's available.
     Auto,
+    /// Uses a fixed, build-time FRE AOT registry when an exact pattern and
+    /// supported profile are present, otherwise Rust's regex engine.
+    FRE,
     /// Uses the PCRE2 regex engine if it's available.
     PCRE2,
 }

@@ -19,3 +19,12 @@ rustflags = [
   "-C", "target-feature=+crt-static",
   "-C", "link-self-contained=yes",
 ]
+
+[env]
+# Cargo resolves this relative to this file and exports an absolute path to
+# dependency build scripts. The resulting rg binary only accelerates exact
+# pattern/profile tuples listed in this manifest.
+FRE_RIPGREP_AOT_PATTERNS_FILE = { value = "experiments/fre-patterns.tsv", relative = true }
+# Match the mandatory Advanced SIMD/NEON capability of the Apple arm64 host.
+# This controls AOT code generation, not runtime caching or dispatch.
+FRE_RIPGREP_AOT_FEATURES = "asimd"

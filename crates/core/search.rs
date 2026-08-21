@@ -191,6 +191,7 @@ impl SearchResult {
 /// The pattern matcher used by a search worker.
 #[derive(Clone, Debug)]
 pub(crate) enum PatternMatcher {
+    FreAot(crate::fre_aot::FreAotMatcher),
     RustRegex(grep::regex::RegexMatcher),
     #[cfg(feature = "pcre2")]
     PCRE2(grep::pcre2::RegexMatcher),
@@ -344,6 +345,7 @@ impl<W: WriteColor> SearchWorker<W> {
 
         let (searcher, printer) = (&mut self.searcher, &mut self.printer);
         match self.matcher {
+            FreAot(ref m) => search_path(m, searcher, printer, path),
             RustRegex(ref m) => search_path(m, searcher, printer, path),
             #[cfg(feature = "pcre2")]
             PCRE2(ref m) => search_path(m, searcher, printer, path),
@@ -368,6 +370,7 @@ impl<W: WriteColor> SearchWorker<W> {
 
         let (searcher, printer) = (&mut self.searcher, &mut self.printer);
         match self.matcher {
+            FreAot(ref m) => search_reader(m, searcher, printer, path, rdr),
             RustRegex(ref m) => search_reader(m, searcher, printer, path, rdr),
             #[cfg(feature = "pcre2")]
             PCRE2(ref m) => search_reader(m, searcher, printer, path, rdr),

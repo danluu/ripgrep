@@ -1,0 +1,6 @@
+# id	case_insensitive	pattern
+ordered_alt_short_long	0	(?:ab|a)
+literal_fleet_overlapping_prefix	0	(?:aaaaaaaaab|aaaaaaaab|aaaaaaab|aaaaaab|aaaaab|aaaab|aaab|aab|ab)
+bounded_repeat_boundary	0	a{0,100}b
+ambiguous_star_suffix	0	(?:a|aa)*b
+trace_literal_alternation	0	ERR_SYS|PME_TURN_OFF|LINK_REQ_RST|CFG_BME_EVT

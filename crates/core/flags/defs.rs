@@ -1789,13 +1789,18 @@ Specify which regular expression engine to use. When you choose a regex engine,
 it applies that choice for every regex provided to ripgrep (e.g., via multiple
 \flag{regexp} or \flag{file} flags).
 .sp
-Accepted values are \fBdefault\fP, \fBpcre2\fP, or \fBauto\fP.
+Accepted values are \fBdefault\fP, \fBfre\fP, \fBpcre2\fP, or \fBauto\fP.
 .sp
 The default value is \fBdefault\fP, which is usually the fastest and should be
 good for most use cases. The \fBpcre2\fP engine is generally useful when you
 want to use features such as look-around or backreferences. \fBauto\fP will
 dynamically choose between supported regex engines depending on the features
 used in a pattern on a best effort basis.
+.sp
+The \fBfre\fP engine uses a build-time FRE AOT matcher only when the exact
+pattern and supported search profile are present in this binary's fixed
+registry. All other queries transparently use the default engine. It does not
+compile a new query at process startup.
 .sp
 Note that the \fBpcre2\fP engine is an optional ripgrep feature. If PCRE2
 wasn't included in your build of ripgrep, then using this flag will result in
@@ -1806,7 +1811,7 @@ flags.
 "
     }
     fn doc_choices(&self) -> &'static [&'static str] {
-        &["default", "pcre2", "auto"]
+        &["default", "fre", "pcre2", "auto"]
     }
 
     fn update(&self, v: FlagValue, args: &mut LowArgs) -> anyhow::Result<()> {
@@ -1814,6 +1819,7 @@ flags.
         let string = convert::str(&v)?;
         args.engine = match string {
             "default" => EngineChoice::Default,
+            "fre" => EngineChoice::FRE,
             "pcre2" => EngineChoice::PCRE2,
             "auto" => EngineChoice::Auto,
             _ => anyhow::bail!("unrecognized regex engine '{string}'"),
@@ -1833,6 +1839,9 @@ fn test_engine() {
 
     let args = parse_low_raw(["--engine=pcre2"]).unwrap();
     assert_eq!(EngineChoice::PCRE2, args.engine);
+
+    let args = parse_low_raw(["--engine=fre"]).unwrap();
+    assert_eq!(EngineChoice::FRE, args.engine);
 
     let args =
         parse_low_raw(["--auto-hybrid-regex", "--engine=pcre2"]).unwrap();

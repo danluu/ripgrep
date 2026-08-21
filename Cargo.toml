@@ -57,6 +57,7 @@ rust-version = "1.96"
 [dependencies]
 anyhow = "1.0.75"
 bstr = "1.7.0"
+fre-ripgrep-aot-thin = { path = "../fre-rg-aot-deps-20260820/tools/ripgrep-aot-thin" }
 grep = { version = "0.4.1", path = "crates/grep" }
 grep-index = { version = "0.0.1", path = "crates/index", optional = true }
 ignore = { version = "0.4.29", path = "crates/ignore" }

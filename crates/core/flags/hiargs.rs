@@ -19,6 +19,7 @@ use crate::{
         FieldContextSeparator, FieldMatchSeparator, LowArgs, MmapMode, Mode,
         PatternSource, SearchMode, SortMode, SortModeKind, TypeChange,
     },
+    fre_aot::FreAotMatcher,
     haystack::{Haystack, HaystackBuilder},
     search::{PatternMatcher, Printer, SearchWorker, SearchWorkerBuilder},
 };
@@ -385,6 +386,7 @@ impl HiArgs {
                 }
             },
             EngineChoice::PCRE2 => Ok(self.matcher_pcre2()?),
+            EngineChoice::FRE => Ok(self.matcher_fre()?),
             EngineChoice::Auto => {
                 let rust_err = match self.matcher_rust() {
                     Ok(m) => return Ok(m),
@@ -408,6 +410,56 @@ impl HiArgs {
                      {divider}\n\n\
                      PCRE2 regex engine error:\n{pcre_err}",
                 );
+            }
+        }
+    }
+
+    /// Build the normal Rust matcher first, and replace its matching hot path
+    /// only for an exact tuple present in the fixed FRE AOT registry. This
+    /// keeps normal ripgrep semantics for registry misses and unsupported
+    /// flags instead of pretending to JIT arbitrary queries.
+    fn matcher_fre(&self) -> anyhow::Result<PatternMatcher> {
+        let stock = match self.matcher_rust()? {
+            PatternMatcher::RustRegex(matcher) => matcher,
+            _ => unreachable!("matcher_rust always returns RustRegex"),
+        };
+        let unsupported = if self.patterns.patterns.len() != 1 {
+            Some("multiple patterns")
+        } else if !matches!(self.case, CaseMode::Sensitive) {
+            Some("case mode other than case-sensitive")
+        } else if self.boundary.is_some() {
+            Some("word or line boundary mode")
+        } else if self.fixed_strings {
+            Some("fixed-string rewriting")
+        } else if self.multiline {
+            Some("multiline mode")
+        } else if self.crlf {
+            Some("CRLF mode")
+        } else if self.null_data {
+            Some("NUL line terminators")
+        } else if self.no_unicode {
+            Some("Unicode-disabled syntax")
+        } else {
+            None
+        };
+        if let Some(reason) = unsupported {
+            log::debug!(
+                "FRE AOT not selected ({reason}); using stock Rust regex"
+            );
+            return Ok(PatternMatcher::RustRegex(stock));
+        }
+
+        let pattern = self.patterns.patterns[0].clone();
+        match FreAotMatcher::new(pattern, false, stock.clone()) {
+            Ok(matcher) => {
+                log::debug!("selected exact-key FRE AOT matcher: {matcher:?}");
+                Ok(PatternMatcher::FreAot(matcher))
+            }
+            Err(error) => {
+                log::debug!(
+                    "FRE AOT registry miss ({error}); using stock Rust regex"
+                );
+                Ok(PatternMatcher::RustRegex(stock))
             }
         }
     }

@@ -1,0 +1,9 @@
+rg: DEBUG|rg::flags::config|crates/core/flags/config.rs:19: RIPGREP_CONFIG_PATH environment variable is not set, therefore not reading any config file
+rg: DEBUG|rg::flags::parse|crates/core/flags/parse.rs:97: no extra arguments found from configuration file
+rg: DEBUG|rg::flags::hiargs|crates/core/flags/hiargs.rs:1042: read CWD from environment: /Users/danluu/dev/ripgrep-fre-aot-20260820
+rg: DEBUG|rg::flags::hiargs|crates/core/flags/hiargs.rs:1180: number of paths given to search: 1
+rg: DEBUG|rg::flags::hiargs|crates/core/flags/hiargs.rs:1191: is_one_file? true
+rg: DEBUG|rg::flags::hiargs|crates/core/flags/hiargs.rs:1366: found hostname for hyperlink configuration: MacBook-Pro-2.local
+rg: DEBUG|rg::flags::hiargs|crates/core/flags/hiargs.rs:1376: hyperlink format: ""
+rg: DEBUG|rg::flags::hiargs|crates/core/flags/hiargs.rs:186: using 1 thread(s)
+rg: DEBUG|rg::flags::hiargs|crates/core/flags/hiargs.rs:455: selected exact-key FRE AOT matcher: FreAotMatcher { pattern: "(?:ab|a)", case_insensitive: false, description: "mode=optimizing,route=direct-native,api=rust-span-fill,bulk=none,engine=ordered-dfa,reason=complete-dfa,accelerator=aarch64-asimd,target=aarch64-macos,features=0x100000000,states=4,dfa_states=2", .. }
