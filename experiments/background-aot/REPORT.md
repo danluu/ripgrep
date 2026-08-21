@@ -47,6 +47,7 @@ cutover break-even.
 |---|---:|---|
 | `tiny-fresh-process-control` | 1 tiny file | Startup/cancellation tail control; preparation will often be unfinished and no cutover is required. |
 | `bounded-negative-{1,2,4,8,16}x64m` | 1--16 × 64 MiB | Primary discrete break-even curve for `a{0,100}b` over long `a...c` files. The fixed-AOT experiment found this favorable at 64 MiB. |
+| `bounded-negative-default-threads-{8,16}x64m` | 8--16 × 64 MiB | Same favorable negative shape with ripgrep's default worker count and default no-match output; tests whether concurrent AOT still pays back against normal parallel search. |
 | `ambiguous-negative-8x64m` | 8 × 64 MiB | Favorable selected-shape control for `(?:a\|aa)*b` with no final `b`. |
 | `ambiguous-positive-8x64m` | 8 × 64 MiB | Sign-reversal control. Fixed AOT was slower when a final `b` forced span reconstruction. |
 | `overlap-mixed-log-8x64m` | 8 × 64 MiB | Newline-dense overlapping-literal case; fixed AOT had a modest end-to-end win. |
@@ -59,6 +60,14 @@ The shape cells are deliberately selected from prior evidence. They expose the
 mechanism and its break-even point; they are not a blind estimator for normal
 source searches. The positive and trace/source controls prevent a favorable
 shape from being reported as a generally dominant matcher.
+
+The primary break-even curve fixes one search thread. The two
+`default-threads` controls omit both `--threads` and `--sort`; on this host
+ripgrep may use up to 12 search workers while the compiler consumes another
+core. Because the corpus has no match, default output is deterministically
+empty with status 1 even though scheduling order is nondeterministic. These
+controls are reported separately and cannot satisfy the sequential break-even
+definition.
 
 The generator uses independent regular-file copies by default. Its `hardlink`
 mode is a labeled, space-saving pilot only and the timing harness refuses it

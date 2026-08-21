@@ -176,6 +176,32 @@ def benchmark_cells(manifest_path: Path, manifest: dict[str, Any]) -> list[Cell]
             )
         )
 
+    # The break-even curve above fixes one search thread so publication and
+    # file-boundary promotion remain easy to interpret. These no-match cells
+    # retain ripgrep's default worker count. Their empty output and status 1
+    # are deterministic even though file scheduling is not.
+    for count in (8, 16):
+        paths = scenario_paths(manifest_path, manifest, "a_negative", count)
+        cells.append(
+            Cell(
+                id=f"bounded-negative-default-threads-{count}x{shard_label}",
+                class_name="default-parallelism-negative-control",
+                args=(
+                    "--no-config",
+                    "--color=never",
+                    "--",
+                    BOUNDED,
+                    *(str(path) for path in paths),
+                ),
+                receipt_policy="observe",
+                logical_bytes=count * shard_bytes,
+                file_count=count,
+                pattern=BOUNDED,
+                scenario="a_negative",
+                secondary_stock=True,
+            )
+        )
+
     for cell_id, class_name, scenario, pattern, argument_builder in (
         (
             f"ambiguous-negative-8x{shard_label}",
