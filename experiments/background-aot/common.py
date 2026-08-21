@@ -23,6 +23,9 @@ OVERLAP = (
 TRACE = r"ERR_SYS|PME_TURN_OFF|LINK_REQ_RST|CFG_BME_EVT"
 AMBIGUOUS = r"(?:a|aa)*b"
 BOUNDED = r"a{0,100}b"
+# Deliberately absent from experiments/fre-patterns.tsv. This distinguishes
+# runtime compilation of a new query from reuse of the fixed-registry corpus.
+UNREGISTERED_BOUNDED = r"a{0,99}b"
 
 RECEIPT_SCHEMA = "ripgrep.fre-aot-background.v1"
 RECEIPT_OUTCOMES = {"ready", "declined", "unfinished"}
@@ -201,6 +204,42 @@ def benchmark_cells(manifest_path: Path, manifest: dict[str, Any]) -> list[Cell]
                 secondary_stock=True,
             )
         )
+
+    for count in (8, 16):
+        paths = scenario_paths(manifest_path, manifest, "a_negative", count)
+        cells.append(
+            Cell(
+                id=f"unregistered-bounded-negative-{count}x{shard_label}",
+                class_name="unregistered-fresh-query-control",
+                args=_count_args(UNREGISTERED_BOUNDED, paths),
+                receipt_policy="observe",
+                logical_bytes=count * shard_bytes,
+                file_count=count,
+                pattern=UNREGISTERED_BOUNDED,
+                scenario="a_negative",
+                secondary_stock=count == 16,
+            )
+        )
+    paths = scenario_paths(manifest_path, manifest, "a_negative", 16)
+    cells.append(
+        Cell(
+            id=f"unregistered-bounded-default-threads-16x{shard_label}",
+            class_name="unregistered-default-parallelism-control",
+            args=(
+                "--no-config",
+                "--color=never",
+                "--",
+                UNREGISTERED_BOUNDED,
+                *(str(path) for path in paths),
+            ),
+            receipt_policy="observe",
+            logical_bytes=16 * shard_bytes,
+            file_count=16,
+            pattern=UNREGISTERED_BOUNDED,
+            scenario="a_negative",
+            secondary_stock=True,
+        )
+    )
 
     for cell_id, class_name, scenario, pattern, argument_builder in (
         (
