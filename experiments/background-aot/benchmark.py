@@ -267,6 +267,16 @@ def version(binary: Path) -> str:
     ).stdout.strip()
 
 
+def command_version(command: Sequence[str]) -> str:
+    return subprocess.run(
+        list(command),
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        check=True,
+    ).stdout.strip()
+
+
 def write_json(path: Path, value: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(value, indent=2) + "\n")
@@ -279,6 +289,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--manifest", type=Path, default=DEFAULT_MANIFEST)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--cwd", type=Path, default=REPO)
+    parser.add_argument(
+        "--fre-repo",
+        type=Path,
+        default=REPO.parent / "fre-rg-aot-deps-20260820",
+    )
     parser.add_argument("--pairs", type=int, default=31)
     parser.add_argument("--warmup-pairs", type=int, default=3)
     parser.add_argument("--stock-pairs", type=int, default=11)
@@ -308,6 +323,7 @@ def main() -> None:
     binary = args.binary.resolve(strict=True)
     stock_binary = args.stock_binary.resolve(strict=True)
     manifest_path = args.manifest.resolve(strict=True)
+    fre_repo = args.fre_repo.resolve(strict=True)
     output = args.output.resolve()
     partial = output.with_suffix(output.suffix + ".partial")
     for path in (output, partial):
@@ -323,8 +339,11 @@ def main() -> None:
     if not args.no_verify_corpus:
         verify_manifest_files(manifest_path, manifest)
     source = git_record(args.cwd)
-    if args.require_clean and source["dirty"]:
-        raise SystemExit("--require-clean requested but the source worktree is dirty")
+    fre_source = git_record(fre_repo)
+    if args.require_clean and (source["dirty"] or fre_source["dirty"]):
+        raise SystemExit(
+            "--require-clean requested but the source or FRE worktree is dirty"
+        )
 
     cells = benchmark_cells(manifest_path, manifest)
     if args.cells:
@@ -377,6 +396,19 @@ def main() -> None:
             "load_average_started": list(os.getloadavg()),
         },
         "source": source,
+        "dependencies": {
+            "fre": {"path": str(fre_repo), **fre_source},
+        },
+        "toolchain": {
+            "rustc": command_version(
+                ("rustc", "+1.96.0", "--version", "--verbose")
+            ),
+            "cargo": command_version(
+                ("cargo", "+1.96.0", "--version", "--verbose")
+            ),
+            "clang": command_version(("/usr/bin/clang", "--version")),
+            "xcode": command_version(("xcodebuild", "-version")),
+        },
         "binaries": {
             "candidate": {
                 "path": str(binary),

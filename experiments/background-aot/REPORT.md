@@ -238,15 +238,17 @@ python3 experiments/background-aot/benchmark.py \
   --pairs 31 \
   --warmup-pairs 3 \
   --stock-pairs 11 \
+  --fre-repo /Users/danluu/dev/fre-rg-aot-deps-20260820 \
   --require-clean \
   --output experiments/background-aot/results/benchmark.json
 ```
 
-The final artifact records source status, binary and manifest hashes, versions,
-host metadata, raw results, exact commands, output digests and bytes, receipts,
-statistics, per-cell start/end timestamps and load averages, a post-run corpus
-verification, and the predeclared break-even result. A partial artifact is
-rewritten after every completed cell, outside every child timing boundary.
+The final artifact records ripgrep and FRE source commits/status, Rust/Cargo,
+Clang/Xcode, binary and manifest hashes, host metadata, raw results, exact
+commands, output digests and bytes, receipts, statistics, per-cell start/end
+timestamps and load averages, a post-run corpus verification, and the
+predeclared break-even result. A partial artifact is rewritten after every
+completed cell, outside every child timing boundary.
 
 ## Results
 
