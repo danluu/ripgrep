@@ -3670,7 +3670,7 @@ mod tests {
 
         let json = compile_receipt_v2_json(&receipt_v2);
         assert_eq!(json["schema_version"], 2);
-        assert_eq!(json["optimizer_version"], 25);
+        assert_eq!(json["optimizer_version"], 26);
         assert_eq!(
             json["exact_finite_selected_end_teddy_policy"],
             "force_structurally_eligible"

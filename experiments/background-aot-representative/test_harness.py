@@ -1265,7 +1265,7 @@ class HarnessTests(unittest.TestCase):
 
         mutations = (
             (
-                ("compile_receipt_v2", "optimizer_version"), 24,
+                ("compile_receipt_v2", "optimizer_version"), 25,
                 "compile_receipt_v2_optimizer_version",
             ),
             (
@@ -1526,6 +1526,9 @@ class HarnessTests(unittest.TestCase):
         receipt = forced_exact_teddy_v2_ready_receipt(
             schema=HARNESS.V6_RECEIPT_SCHEMA
         )
+        receipt["compile_receipt_v2"]["optimizer_version"] = (
+            HARNESS.V6_EXACT_TEDDY_V2_OPTIMIZER_VERSION
+        )
         for field in (
             "aot_publication_policy", "aot_publication_decision",
             "compiled_artifact_available",
@@ -1543,6 +1546,21 @@ class HarnessTests(unittest.TestCase):
                 ),
                 require_forced_exact_teddy_v2=True,
             )
+        )
+        current_optimizer_v6 = copy.deepcopy(receipt)
+        current_optimizer_v6["compile_receipt_v2"][
+            "optimizer_version"
+        ] = HARNESS.EXACT_TEDDY_V2_OPTIMIZER_VERSION
+        self.assertIn(
+            "compile_receipt_v2_optimizer_version",
+            HARNESS.validate_receipt(
+                current_optimizer_v6,
+                "auto",
+                expected_exact_teddy_policy_v2=(
+                    "force-structurally-eligible"
+                ),
+                require_forced_exact_teddy_v2=True,
+            ),
         )
         self.assertIn(
             "current_receipt_schema_required",

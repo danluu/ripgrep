@@ -46,7 +46,15 @@ ignored by Git.
 
 This iteration pins all four direct FRE crates and every corresponding
 lockfile entry to FRE commit
-`d2b352b7a051628bbcf8afc7f23d1362a850cb25`. The V2 policy is default-off:
+`eca0972ff205daa860ca8cd20e125910b05baa34`. The retained-candidate-mask
+change preserves compile-receipt V2 schema 2 and its authentication fields,
+while advancing the stable optimizer identity to 25 and the experimental V2
+optimizer identity to 26. Native-code, artifact-identity, and route-binding
+digests therefore remain candidate-specific; the existing validator continues
+to check their form and independently recompute the route-binding digest.
+Historical V6 receipts remain bound to experimental optimizer identity 25;
+the validator dispatches the expected identity by outer receipt schema instead
+of relabeling that evidence. The V2 policy is default-off:
 without `--exact-teddy-policy-v2`, ripgrep does not set
 `RG_FRE_AOT_BACKGROUND_EXACT_TEDDY_POLICY_V2` and calls the stable V1 compile
 API. An explicit campaign accepts exactly one policy per harness invocation:
@@ -186,7 +194,7 @@ python3 experiments/background-aot-representative/harness.py exact-teddy-census 
   --database /Users/danluu/.codex/thread_history_1.sqlite \
   --ripgrep-corpus-repo /Users/danluu/dev/ripgrep \
   --ripgrep-corpus-commit f9c05a949d1a0dc8e16dee28ca9605d38611faeb \
-  --fre-corpus-repo /Users/danluu/dev/fre-teddy-census-d2b352b7-20260821 \
+  --fre-corpus-repo /Users/danluu/dev/fre-teddy-retained-mask-20260821 \
   --fre-corpus-commit 6f961465d00ff50f2096cfb05520c0653a87d2cd \
   --exact-teddy-policy-v2 force-selected-or-stock \
   --private-output experiments/background-aot-representative/results/teddy-census-force-v2.private.json \
@@ -213,7 +221,7 @@ python3 experiments/background-aot-representative/harness.py probe \
   --database /Users/danluu/.codex/thread_history_1.sqlite \
   --ripgrep-corpus-repo /Users/danluu/dev/ripgrep \
   --ripgrep-corpus-commit f9c05a949d1a0dc8e16dee28ca9605d38611faeb \
-  --fre-corpus-repo /Users/danluu/dev/fre-teddy-census-d2b352b7-20260821 \
+  --fre-corpus-repo /Users/danluu/dev/fre-teddy-retained-mask-20260821 \
   --fre-corpus-commit 6f961465d00ff50f2096cfb05520c0653a87d2cd \
   --exact-teddy-policy-v2 force-selected-or-stock \
   --private-output experiments/background-aot-representative/results/probe.private.json \
@@ -221,7 +229,7 @@ python3 experiments/background-aot-representative/harness.py probe \
 ```
 
 The clean `--fre-corpus-repo` checkout must be at the exact FRE revision pinned
-by the candidate (`d2b352b7a051628bbcf8afc7f23d1362a850cb25` for this
+by the candidate (`eca0972ff205daa860ca8cd20e125910b05baa34` for this
 iteration), while `--fre-corpus-commit` deliberately remains the older frozen
 `6f96146` corpus. The harness verifies both independently. This keeps the
 searched bytes constant as compiler dependencies evolve.

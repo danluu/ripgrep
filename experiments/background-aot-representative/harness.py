@@ -65,7 +65,12 @@ EXACT_TEDDY_V2_RECEIPT_SCHEMAS = frozenset((
     V6_RECEIPT_SCHEMA, RECEIPT_SCHEMA,
 ))
 EXACT_TEDDY_V2_SCHEMA_VERSION = 2
-EXACT_TEDDY_V2_OPTIMIZER_VERSION = 25
+V6_EXACT_TEDDY_V2_OPTIMIZER_VERSION = 25
+EXACT_TEDDY_V2_OPTIMIZER_VERSION = 26
+EXACT_TEDDY_V2_OPTIMIZER_VERSION_BY_RECEIPT_SCHEMA = {
+    V6_RECEIPT_SCHEMA: V6_EXACT_TEDDY_V2_OPTIMIZER_VERSION,
+    RECEIPT_SCHEMA: EXACT_TEDDY_V2_OPTIMIZER_VERSION,
+}
 EXACT_TEDDY_POLICY_V2_VALUES = (
     "disabled", "automatic", "force-structurally-eligible",
     "force-selected-or-stock",
@@ -2072,10 +2077,12 @@ def validate_compile_receipt_v2(
             failures.append(f"missing_compile_receipt_v2_{field}")
     if compile_receipt.get("schema_version") != EXACT_TEDDY_V2_SCHEMA_VERSION:
         failures.append("compile_receipt_v2_schema_version")
-    if (
-        compile_receipt.get("optimizer_version")
-        != EXACT_TEDDY_V2_OPTIMIZER_VERSION
-    ):
+    expected_optimizer_version = (
+        EXACT_TEDDY_V2_OPTIMIZER_VERSION_BY_RECEIPT_SCHEMA.get(
+            receipt.get("schema")
+        )
+    )
+    if compile_receipt.get("optimizer_version") != expected_optimizer_version:
         failures.append("compile_receipt_v2_optimizer_version")
     if (
         compile_receipt.get("exact_finite_selected_end_teddy_policy")
