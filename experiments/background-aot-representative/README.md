@@ -1,10 +1,15 @@
 # Representative background-AOT experiment
 
-The completed local and EC2 results are in [RESULTS.md](RESULTS.md).
+The completed local and EC2 results are in [RESULTS.md](RESULTS.md). Those
+checked-in results are historical Span-entry runs with v3 receipts. The
+current harness accepts the exact `ripgrep.fre-aot-background.v4` receipt for
+SelectedEnd runs; it does not reinterpret a v3 probe as v4 evidence.
 
 This harness tests the normal ripgrep path against the same binary with
 `--fre-aot-background` on frozen, actual ripgrep query shapes. It does not use
-the earlier synthetic `a{0,99}b` workload.
+the earlier synthetic `a{0,99}b` workload for performance results; that
+pattern appears only in the deterministic correctness-only cutover gate
+described below.
 
 The primary cohort is the frozen 84-query out-of-time set reconstructed from
 Codex history. Selection predates this integration and its performance
@@ -13,7 +18,7 @@ results. Every query runs in all three panels:
 1. A clean archive of ripgrep `f9c05a9`, with normal line output and default
    threads. This transplant is known to contain 25 matching and 59 nonmatching
    queries.
-2. A clean archive of FRE `6f96146`, with normalized
+2. A clean archive of the frozen FRE corpus commit `6f96146`, with normalized
    `--count --include-zero` output and default threads.
 3. The same FRE archive and output contract with `--threads=1`.
 
@@ -45,6 +50,12 @@ python3 experiments/background-aot-representative/harness.py probe \
   --public-output experiments/background-aot-representative/results/probe.public.json
 ```
 
+The clean `--fre-corpus-repo` checkout must be at the exact FRE revision pinned
+by the candidate (`abad8a8e9007409ae483c9627397886d09a9fdf6` for this
+iteration), while `--fre-corpus-commit` deliberately remains the older frozen
+`6f96146` corpus. The harness verifies both independently. This keeps the
+searched bytes constant as compiler dependencies evolve.
+
 The probe uses one fresh process per stock/normal/background observation. It
 compares default-thread output as an unordered multiset of complete LF records
 because worker scheduling can reorder records. Thread-1 output is compared
@@ -57,15 +68,59 @@ order, for example `--cpu-profile auto --cpu-profile sve --cpu-profile sve2`.
 `asimd` is also accepted as an optional control. An unsupported requested
 profile is recorded as a decline, never silently replaced with `auto`.
 Receipts report the requested, host, and effective feature masks plus the
-compiler engine and actual start accelerator. On a remote SVE host, add (for
-example) `--expected-sve-vl-bytes 16` to fail closed if the process vector
-length is not the audited value. Profiles run profile-major, so their adjacent
-normal/background speedups are valid but cross-profile uplift is not paired.
-Fast queries may finish before the compiler thread detects the host; those
-receipts retain an explicit unfinished lifecycle state. Before formal timing,
-the complete probe matrix must nevertheless contain at least one fully
+compiler engine and actual start accelerator. A successfully compiled v4
+receipt also identifies the `selected_end` output contract, the
+`selected_end_search_v1` entry ABI, the source of any reported machine
+geometry, forward/reverse analysis state counts, and whether the compiler
+selected its reverse start-recovery pass. Counts and their source are null when
+no complete-machine receipt exists; an `ordered_nfa` semantic engine may still
+report them when the native optimizer selected a DFA/K0 sidecar. Contextual
+analysis may retain reverse geometry even though the SelectedEnd native entry
+does not use it, so the separately authenticated
+`compiled_reverse_start_recovery: false` field is the code-generation claim.
+All six compiled fields are null when compilation has not succeeded yet. On a
+remote SVE host, add (for example) `--expected-sve-vl-bytes 16` to fail closed if the process
+vector length is not the audited value. Profiles run profile-major, so their
+adjacent normal/background speedups are valid but cross-profile uplift is not
+paired. Fast queries may finish before the compiler thread detects the host;
+those receipts retain an explicit unfinished lifecycle state. Before formal
+timing, the complete probe matrix must nevertheless contain at least one fully
 target-validated receipt for every requested CPU profile, all with one common
 host feature mask.
+
+The v4 route counters describe candidate discovery only. A mixed-engine file
+can merely reflect different matcher operations. A genuine mid-scan cutover is
+counted separately and requires a nonempty, line-aligned stock prefix to be
+committed before AOT scans a later suffix. Candidate file/byte totals and the
+first strict mid-scan witness are aggregated alongside both classifications.
+Stock span and capture calls are reported and
+aggregated separately because SelectedEnd can locate a candidate endpoint and
+still use the stock matcher to recover output spans or captures; that work is
+not a candidate-discovery engine cutover.
+
+Specifically, candidate discovery reports `candidate_stock_files`,
+`candidate_fre_aot_files`, `candidate_mixed_engine_files`, stock/AOT window
+counts and bytes, `candidate_stock_committed_bytes`, and
+`candidate_midscan_cutover_files`. The three
+`first_candidate_midscan_cutover_*` values are either all null or all
+nonnegative, and a reported witness must have positive committed stock bytes.
+Only positive-length input scans count as candidate windows or file routes;
+an empty-haystack nullable probe cannot manufacture a mid-scan transition.
+Stock follow-up work uses the separate `stock_span_calls`, `stock_span_bytes`,
+`stock_capture_calls`, and `stock_capture_bytes` counters.
+
+Before the historical-query matrix, the probe also runs one synthetic,
+correctness-only SelectedEnd gate for each CPU profile. A single 16 MiB
+newline-dense file contains exactly two bounded-repeat matches, one before and
+one on the final line after a deterministic 4 MiB publication barrier. Candidate-normal,
+candidate-background, and upstream ripgrep must produce identical literal
+`--only-matching --byte-offset --line-number` output. The background receipt
+must prove one real same-file mid-scan transition, positive stock and AOT
+candidate work, in-memory publication with no native-call failure, the
+`selected_end_search_v1` ABI, and no selected reverse-start-recovery pass.
+The barrier environment variable is scrubbed from every historical-query
+probe and every timed invocation; this synthetic gate is never included in a
+speedup aggregate.
 
 ## Small remote selection manifest
 
@@ -129,18 +184,19 @@ cache eviction. Results therefore represent fresh query processes and fresh
 AOT compilation over an uncontrolled, deliberately cache-hot filesystem—not a
 cold-cache first traversal. A
 formal run refuses a probe with missing cases, output mismatches, receipt
-validation failures, changed binaries, changed source, changed corpus trees,
-changed host/toolchain/SVE vector length, a changed raw cohort manifest, or
-changed frozen inventory. Both public result files bind their complete private
-counterpart by SHA-256. The formal gate reconstructs the exact
-profile/panel/case row matrix,
+validation failures (including a non-SelectedEnd compiled contract/ABI or
+invalid candidate/stock-work accounting), changed binaries, changed source,
+changed corpus trees, changed host/toolchain/SVE vector length, a changed raw
+cohort manifest, or changed frozen inventory. Both public result files bind
+their complete private counterpart by SHA-256. The formal gate reconstructs
+the exact profile/panel/case row matrix,
 recomputes semantic output equality and receipt validation from private
 evidence, and requires its regenerated aggregates to equal the public report.
 Provenance parses the candidate's Cargo manifest and
-lockfile to require its actual FRE git dependency revision to equal the corpus
-commit. It separately requires the local FRE corpus source mirror to be clean,
-and records rustc/cargo, corpus file counts/bytes, and start/end host load
-averages.
+lockfile to require its actual FRE git dependency revision to equal the clean
+local FRE mirror's HEAD. It separately authenticates the older frozen corpus
+commit and tree from that mirror, and records rustc/cargo, corpus file
+counts/bytes, and start/end host load averages.
 
 These are historical query transplants, not replays of historical commands:
 the original targets, target sizes, match densities, and complete argv are not

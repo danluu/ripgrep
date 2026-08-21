@@ -32,15 +32,15 @@ const RECEIPT_ENV: &str = "RG_FRE_AOT_BACKGROUND_RECEIPT";
 const CPU_PROFILE_ENV: &str = "RG_FRE_AOT_BACKGROUND_CPU_PROFILE";
 const TEST_MIN_STOCK_BYTES_ENV: &str =
     "RG_FRE_AOT_BACKGROUND_TEST_MIN_STOCK_BYTES";
-const RECEIPT_SCHEMA: &str = "ripgrep.fre-aot-background.v3";
+const RECEIPT_SCHEMA: &str = "ripgrep.fre-aot-background.v4";
 const PENDING_SCAN_QUANTUM: usize = 1 << 20;
 static RECEIPT_NONCE: AtomicU64 = AtomicU64::new(0);
 
-/// A published, reentrant direct-native Span entry. `PublishedSpan` owns the
-/// strict-W^X mapping until the last worker and publication-state reference is
-/// released.
+/// A published, reentrant direct-native `SelectedEnd` entry. The published
+/// handle owns the strict-W^X mapping until the last worker and
+/// publication-state reference is released.
 struct NativeAotFactory {
-    published: fre_aot_regex_loader::PublishedSpan,
+    published: fre_aot_regex_loader::PublishedSelectedEnd,
     description: String,
 }
 
@@ -79,6 +79,12 @@ struct ReceiptClassification {
     compiler_engine: Option<&'static str>,
     engine_selection_reason: Option<&'static str>,
     start_accelerator: Option<&'static str>,
+    compiled_output_contract: Option<&'static str>,
+    compiled_entry_abi: Option<&'static str>,
+    compiled_state_source: Option<&'static str>,
+    compiled_forward_states: Option<u64>,
+    compiled_reverse_states: Option<u64>,
+    compiled_reverse_start_recovery: Option<bool>,
     publication_stage: &'static str,
     publication_refusal_class: Option<&'static str>,
     runtime_helper_required: bool,
@@ -97,6 +103,12 @@ impl ReceiptClassification {
             compiler_engine: None,
             engine_selection_reason: None,
             start_accelerator: None,
+            compiled_output_contract: None,
+            compiled_entry_abi: None,
+            compiled_state_source: None,
+            compiled_forward_states: None,
+            compiled_reverse_states: None,
+            compiled_reverse_start_recovery: None,
             publication_stage: "not_started",
             publication_refusal_class: None,
             runtime_helper_required: false,
@@ -121,71 +133,36 @@ impl std::fmt::Debug for NativeAotFactory {
 }
 
 /// One worker's reference to the stateless direct-native entry.
-#[derive(Clone, Debug)]
-struct NativeAotMatcher {
-    factory: Arc<NativeAotFactory>,
+#[derive(Clone, Copy, Debug)]
+struct NativeAotMatcher<'a> {
+    factory: &'a NativeAotFactory,
 }
 
-impl NativeAotMatcher {
-    fn find_at(
+impl NativeAotMatcher<'_> {
+    fn find_end_at(
         &self,
         haystack: &[u8],
         at: usize,
-    ) -> Result<Option<Match>, String> {
-        self.factory
-            .published
-            .find_at(haystack, at)
-            .map(|found| found.map(|m| Match::new(m.start(), m.end())))
-            .map_err(|error| format!("FRE AOT native Span call: {error}"))
+    ) -> Result<Option<usize>, String> {
+        self.factory.published.find_at(haystack, at).map_err(|error| {
+            format!("FRE AOT native SelectedEnd call: {error}")
+        })
     }
 
-    fn find_in(
+    fn find_end_in(
         &self,
         haystack: &[u8],
         start: usize,
         end: usize,
-    ) -> Result<Option<Match>, String> {
+    ) -> Result<Option<usize>, String> {
         use fre_aot_regex::SearchWindow;
 
         self.factory
             .published
             .search(haystack, SearchWindow::new(start, end))
-            .map(|found| found.map(|m| Match::new(m.start(), m.end())))
-            .map_err(|error| format!("FRE AOT native Span call: {error}"))
-    }
-
-    fn try_find_iter<F, E>(
-        &self,
-        haystack: &[u8],
-        mut matched: F,
-    ) -> Result<Result<(), E>, String>
-    where
-        F: FnMut(Match) -> Result<bool, E>,
-    {
-        let mut last_end = 0;
-        let mut last_match = None;
-        loop {
-            if last_end > haystack.len() {
-                return Ok(Ok(()));
-            }
-            let Some(found) = self.find_at(haystack, last_end)? else {
-                return Ok(Ok(()));
-            };
-            if found.start() == found.end() {
-                last_end = found.end() + 1;
-                if Some(found.end()) == last_match {
-                    continue;
-                }
-            } else {
-                last_end = found.end();
-            }
-            last_match = Some(found.end());
-            match matched(found) {
-                Ok(true) => {}
-                Ok(false) => return Ok(Ok(())),
-                Err(error) => return Ok(Err(error)),
-            }
-        }
+            .map_err(|error| {
+                format!("FRE AOT native SelectedEnd call: {error}")
+            })
     }
 }
 
@@ -218,15 +195,20 @@ struct CompileState {
     publish_ns: Arc<AtomicU64>,
     prepare_ns: Arc<AtomicU64>,
     ready_ns: AtomicU64,
-    stock_files: AtomicU64,
-    aot_files: AtomicU64,
-    mixed_files: AtomicU64,
+    candidate_stock_files: AtomicU64,
+    candidate_aot_files: AtomicU64,
+    candidate_mixed_files: AtomicU64,
+    candidate_midscan_cutover_files: AtomicU64,
     total_files: AtomicU64,
-    stock_windows: AtomicU64,
-    aot_windows: AtomicU64,
-    stock_window_bytes: AtomicU64,
-    stock_committed_bytes: AtomicU64,
-    aot_window_bytes: AtomicU64,
+    candidate_stock_windows: AtomicU64,
+    candidate_aot_windows: AtomicU64,
+    candidate_stock_window_bytes: AtomicU64,
+    candidate_stock_committed_bytes: AtomicU64,
+    candidate_aot_window_bytes: AtomicU64,
+    stock_span_calls: AtomicU64,
+    stock_span_bytes: AtomicU64,
+    stock_capture_calls: AtomicU64,
+    stock_capture_bytes: AtomicU64,
     native_disabled: AtomicBool,
     native_call_failures: AtomicU64,
     first_cutover: Mutex<Option<Cutover>>,
@@ -236,14 +218,21 @@ struct CompileState {
         Mutex<Option<(u64, Arc<NativeAotFactory>)>>,
     receipt_classification: Arc<Mutex<ReceiptClassification>>,
     receipt_path: Option<PathBuf>,
+    telemetry_enabled: bool,
 }
 
 impl std::fmt::Debug for CompileState {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("CompileState")
             .field("ready", &self.outcome.get().is_some())
-            .field("stock_files", &self.stock_files.load(Ordering::Relaxed))
-            .field("aot_files", &self.aot_files.load(Ordering::Relaxed))
+            .field(
+                "candidate_stock_files",
+                &self.candidate_stock_files.load(Ordering::Relaxed),
+            )
+            .field(
+                "candidate_aot_files",
+                &self.candidate_aot_files.load(Ordering::Relaxed),
+            )
             .finish_non_exhaustive()
     }
 }
@@ -257,6 +246,13 @@ impl CompileState {
     fn empty_with_classification(
         receipt_classification: ReceiptClassification,
     ) -> Arc<Self> {
+        let test_min_stock_bytes = std::env::var(TEST_MIN_STOCK_BYTES_ENV)
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(0);
+        let receipt_path = std::env::var_os(RECEIPT_ENV).map(PathBuf::from);
+        let telemetry_enabled =
+            receipt_path.is_some() || test_min_stock_bytes > 0 || cfg!(test);
         Arc::new(Self {
             started: Instant::now(),
             outcome: OnceLock::new(),
@@ -266,28 +262,31 @@ impl CompileState {
             publish_ns: Arc::new(AtomicU64::new(0)),
             prepare_ns: Arc::new(AtomicU64::new(0)),
             ready_ns: AtomicU64::new(0),
-            stock_files: AtomicU64::new(0),
-            aot_files: AtomicU64::new(0),
-            mixed_files: AtomicU64::new(0),
+            candidate_stock_files: AtomicU64::new(0),
+            candidate_aot_files: AtomicU64::new(0),
+            candidate_mixed_files: AtomicU64::new(0),
+            candidate_midscan_cutover_files: AtomicU64::new(0),
             total_files: AtomicU64::new(0),
-            stock_windows: AtomicU64::new(0),
-            aot_windows: AtomicU64::new(0),
-            stock_window_bytes: AtomicU64::new(0),
-            stock_committed_bytes: AtomicU64::new(0),
-            aot_window_bytes: AtomicU64::new(0),
+            candidate_stock_windows: AtomicU64::new(0),
+            candidate_aot_windows: AtomicU64::new(0),
+            candidate_stock_window_bytes: AtomicU64::new(0),
+            candidate_stock_committed_bytes: AtomicU64::new(0),
+            candidate_aot_window_bytes: AtomicU64::new(0),
+            stock_span_calls: AtomicU64::new(0),
+            stock_span_bytes: AtomicU64::new(0),
+            stock_capture_calls: AtomicU64::new(0),
+            stock_capture_bytes: AtomicU64::new(0),
             native_disabled: AtomicBool::new(false),
             native_call_failures: AtomicU64::new(0),
             first_cutover: Mutex::new(None),
-            test_min_stock_bytes: std::env::var(TEST_MIN_STOCK_BYTES_ENV)
-                .ok()
-                .and_then(|value| value.parse().ok())
-                .unwrap_or(0),
+            test_min_stock_bytes,
             #[cfg(test)]
             test_publish_after_stock_commit: Mutex::new(None),
             receipt_classification: Arc::new(Mutex::new(
                 receipt_classification,
             )),
-            receipt_path: std::env::var_os(RECEIPT_ENV).map(PathBuf::from),
+            receipt_path,
+            telemetry_enabled,
         })
     }
 
@@ -375,7 +374,7 @@ impl CompileState {
                         };
                         let threshold = snapshot.test_min_stock_bytes;
                         let committed = snapshot
-                            .stock_committed_bytes
+                            .candidate_stock_committed_bytes
                             .load(Ordering::Acquire);
                         drop(snapshot);
                         if threshold == 0 || committed >= threshold {
@@ -468,7 +467,7 @@ impl CompileState {
         };
         let classification =
             self.receipt_classification.lock().unwrap().clone();
-        serde_json::json!({
+        let mut receipt = serde_json::json!({
             "schema": RECEIPT_SCHEMA,
             "outcome": outcome,
             "decline_reason": decline_reason,
@@ -479,6 +478,12 @@ impl CompileState {
             "compiler_engine": classification.compiler_engine,
             "engine_selection_reason": classification.engine_selection_reason,
             "start_accelerator": classification.start_accelerator,
+            "compiled_output_contract": classification.compiled_output_contract,
+            "compiled_entry_abi": classification.compiled_entry_abi,
+            "compiled_state_source": classification.compiled_state_source,
+            "compiled_forward_states": classification.compiled_forward_states,
+            "compiled_reverse_states": classification.compiled_reverse_states,
+            "compiled_reverse_start_recovery": classification.compiled_reverse_start_recovery,
             "publication_stage": classification.publication_stage,
             "publication_refusal_class": classification.publication_refusal_class,
             "runtime_helper_required": classification.runtime_helper_required,
@@ -492,23 +497,41 @@ impl CompileState {
             "publish_ns": self.publish_ns.load(Ordering::Acquire),
             "prepare_ns": self.prepare_ns.load(Ordering::Acquire),
             "ready_ns_since_start": ready_ns,
-            "stock_files": self.stock_files.load(Ordering::Relaxed),
-            "fre_aot_files": self.aot_files.load(Ordering::Relaxed),
-            "mixed_engine_files": self.mixed_files.load(Ordering::Relaxed),
+        });
+        let accounting = serde_json::json!({
+            // Candidate-discovery accounting is deliberately separate from
+            // full-span/capture work. With a SelectedEnd AOT entry, output
+            // formatting can use AOT to locate a line and stock regex to
+            // recover spans without implying a mid-file engine cutover.
+            "candidate_stock_files": self.candidate_stock_files.load(Ordering::Relaxed),
+            "candidate_fre_aot_files": self.candidate_aot_files.load(Ordering::Relaxed),
+            "candidate_mixed_engine_files": self.candidate_mixed_files.load(Ordering::Relaxed),
+            "candidate_midscan_cutover_files": self.candidate_midscan_cutover_files.load(Ordering::Relaxed),
             "total_file_attempts": self.total_files.load(Ordering::Relaxed),
-            "stock_windows": self.stock_windows.load(Ordering::Relaxed),
-            "fre_aot_windows": self.aot_windows.load(Ordering::Relaxed),
-            "stock_window_bytes": self.stock_window_bytes.load(Ordering::Relaxed),
-            "stock_committed_bytes": self.stock_committed_bytes.load(Ordering::Acquire),
-            "fre_aot_window_bytes": self.aot_window_bytes.load(Ordering::Relaxed),
+            "candidate_stock_windows": self.candidate_stock_windows.load(Ordering::Relaxed),
+            "candidate_fre_aot_windows": self.candidate_aot_windows.load(Ordering::Relaxed),
+            "candidate_stock_window_bytes": self.candidate_stock_window_bytes.load(Ordering::Relaxed),
+            "candidate_stock_committed_bytes": self.candidate_stock_committed_bytes.load(Ordering::Acquire),
+            "candidate_fre_aot_window_bytes": self.candidate_aot_window_bytes.load(Ordering::Relaxed),
+            "stock_span_calls": self.stock_span_calls.load(Ordering::Relaxed),
+            "stock_span_bytes": self.stock_span_bytes.load(Ordering::Relaxed),
+            "stock_capture_calls": self.stock_capture_calls.load(Ordering::Relaxed),
+            "stock_capture_bytes": self.stock_capture_bytes.load(Ordering::Relaxed),
             "native_call_failures": self.native_call_failures.load(Ordering::Relaxed),
-            "first_cutover_file_ordinal": first.map(|value| value.file_ordinal),
-            "first_cutover_ns_since_start": first.map(|value| value.elapsed_ns),
-            "first_cutover_stock_committed_bytes": first.map(|value| value.stock_committed_bytes_before_cutover),
+            "first_candidate_midscan_cutover_file_ordinal": first.map(|value| value.file_ordinal),
+            "first_candidate_midscan_cutover_ns_since_start": first.map(|value| value.elapsed_ns),
+            "first_candidate_midscan_cutover_stock_committed_bytes": first.map(|value| value.stock_committed_bytes_before_cutover),
             "external_linker_invocations": 0,
             "direct_native_only": true,
             "test_min_stock_bytes": self.test_min_stock_bytes,
-        })
+        });
+        receipt.as_object_mut().expect("receipt is a JSON object").extend(
+            accounting
+                .as_object()
+                .expect("accounting is a JSON object")
+                .clone(),
+        );
+        receipt
     }
 
     fn write_receipt(&self) -> Result<(), String> {
@@ -547,10 +570,11 @@ pub(crate) struct BackgroundFreMatcher {
     stock: RegexMatcher,
     shared: Arc<CompileState>,
     current_file_ordinal: AtomicU64,
-    file_saw_stock: AtomicBool,
-    file_saw_aot: AtomicBool,
-    file_mixed_recorded: AtomicBool,
-    file_stock_committed_bytes: AtomicU64,
+    file_saw_candidate_stock: AtomicBool,
+    file_saw_candidate_aot: AtomicBool,
+    file_candidate_mixed_recorded: AtomicBool,
+    file_candidate_midscan_cutover_recorded: AtomicBool,
+    file_candidate_stock_committed_bytes: AtomicU64,
 }
 
 impl BackgroundFreMatcher {
@@ -568,10 +592,11 @@ impl BackgroundFreMatcher {
                 dfa_size_limit,
             ),
             current_file_ordinal: AtomicU64::new(0),
-            file_saw_stock: AtomicBool::new(false),
-            file_saw_aot: AtomicBool::new(false),
-            file_mixed_recorded: AtomicBool::new(false),
-            file_stock_committed_bytes: AtomicU64::new(0),
+            file_saw_candidate_stock: AtomicBool::new(false),
+            file_saw_candidate_aot: AtomicBool::new(false),
+            file_candidate_mixed_recorded: AtomicBool::new(false),
+            file_candidate_midscan_cutover_recorded: AtomicBool::new(false),
+            file_candidate_stock_committed_bytes: AtomicU64::new(0),
         }
     }
 
@@ -583,31 +608,37 @@ impl BackgroundFreMatcher {
             stock,
             shared: CompileState::declined(reason),
             current_file_ordinal: AtomicU64::new(0),
-            file_saw_stock: AtomicBool::new(false),
-            file_saw_aot: AtomicBool::new(false),
-            file_mixed_recorded: AtomicBool::new(false),
-            file_stock_committed_bytes: AtomicU64::new(0),
+            file_saw_candidate_stock: AtomicBool::new(false),
+            file_saw_candidate_aot: AtomicBool::new(false),
+            file_candidate_mixed_recorded: AtomicBool::new(false),
+            file_candidate_midscan_cutover_recorded: AtomicBool::new(false),
+            file_candidate_stock_committed_bytes: AtomicU64::new(0),
         }
     }
 
     /// Start accounting for a new file. Engine selection remains live and is
     /// polled at safe scan-window boundaries inside the matcher.
     pub(crate) fn begin_file(&mut self) {
+        if !self.shared.telemetry_enabled {
+            return;
+        }
         let file_ordinal = self.shared.next_file_ordinal();
         self.current_file_ordinal.store(file_ordinal, Ordering::Relaxed);
-        self.file_saw_stock.store(false, Ordering::Relaxed);
-        self.file_saw_aot.store(false, Ordering::Relaxed);
-        self.file_mixed_recorded.store(false, Ordering::Relaxed);
-        self.file_stock_committed_bytes.store(0, Ordering::Relaxed);
+        self.file_saw_candidate_stock.store(false, Ordering::Relaxed);
+        self.file_saw_candidate_aot.store(false, Ordering::Relaxed);
+        self.file_candidate_mixed_recorded.store(false, Ordering::Relaxed);
+        self.file_candidate_midscan_cutover_recorded
+            .store(false, Ordering::Relaxed);
+        self.file_candidate_stock_committed_bytes.store(0, Ordering::Relaxed);
     }
 
-    fn native(&self) -> Option<NativeAotMatcher> {
+    fn native(&self) -> Option<NativeAotMatcher<'_>> {
         if self.shared.native_disabled.load(Ordering::Acquire) {
             return None;
         }
         match self.shared.outcome.get() {
             Some(Ok(factory)) => {
-                Some(NativeAotMatcher { factory: Arc::clone(factory) })
+                Some(NativeAotMatcher { factory: factory.as_ref() })
             }
             Some(Err(_)) | None => None,
         }
@@ -626,48 +657,51 @@ impl BackgroundFreMatcher {
         );
     }
 
-    fn record_stock_window(&self, bytes: usize) {
-        self.shared.stock_windows.fetch_add(1, Ordering::Relaxed);
-        self.shared
-            .stock_window_bytes
-            .fetch_add(u64_len(bytes), Ordering::Relaxed);
-        if !self.file_saw_stock.swap(true, Ordering::Relaxed) {
-            self.shared.stock_files.fetch_add(1, Ordering::Relaxed);
+    #[inline]
+    fn record_candidate_stock_window(&self, bytes: usize) {
+        // Route telemetry describes actual input scanned. Empty-haystack
+        // probes can decide nullable matches, but they must not manufacture a
+        // stock/AOT file route or a mid-scan byte cutover.
+        if bytes == 0 || !self.shared.telemetry_enabled {
+            return;
         }
-        self.record_mixed_if_needed();
+        self.shared.candidate_stock_windows.fetch_add(1, Ordering::Relaxed);
+        self.shared
+            .candidate_stock_window_bytes
+            .fetch_add(u64_len(bytes), Ordering::Relaxed);
+        if !self.file_saw_candidate_stock.swap(true, Ordering::Relaxed) {
+            self.shared.candidate_stock_files.fetch_add(1, Ordering::Relaxed);
+        }
+        self.record_candidate_mixed_if_needed();
     }
 
-    fn record_aot_window(&self, bytes: usize) {
-        self.shared.aot_windows.fetch_add(1, Ordering::Relaxed);
-        self.shared
-            .aot_window_bytes
-            .fetch_add(u64_len(bytes), Ordering::Relaxed);
-        if !self.file_saw_aot.swap(true, Ordering::Relaxed) {
-            self.shared.aot_files.fetch_add(1, Ordering::Relaxed);
-            if self.file_saw_stock.load(Ordering::Relaxed) {
-                let ordinal =
-                    self.current_file_ordinal.load(Ordering::Relaxed);
-                let stock_bytes =
-                    self.file_stock_committed_bytes.load(Ordering::Acquire);
-                self.shared.record_first_cutover(ordinal, stock_bytes);
-                if let Some(Ok(factory)) = self.shared.outcome.get() {
-                    log::debug!(
-                        "FRE AOT background mid-scan cutover in file ordinal \
-                         {ordinal} after {stock_bytes} committed stock bytes: {}",
-                        factory.description
-                    );
-                }
-            }
+    #[inline]
+    fn record_candidate_aot_window(&self, bytes: usize) {
+        if bytes == 0 || !self.shared.telemetry_enabled {
+            return;
         }
-        self.record_mixed_if_needed();
+        self.shared.candidate_aot_windows.fetch_add(1, Ordering::Relaxed);
+        self.shared
+            .candidate_aot_window_bytes
+            .fetch_add(u64_len(bytes), Ordering::Relaxed);
+        if !self.file_saw_candidate_aot.swap(true, Ordering::Relaxed) {
+            self.shared.candidate_aot_files.fetch_add(1, Ordering::Relaxed);
+        }
+        self.record_candidate_midscan_cutover_if_needed();
+        self.record_candidate_mixed_if_needed();
     }
 
-    fn record_stock_commit(&self, bytes: usize) {
+    #[inline]
+    fn record_candidate_stock_commit(&self, bytes: usize) {
+        if !self.shared.telemetry_enabled {
+            return;
+        }
         let bytes = u64_len(bytes);
-        self.file_stock_committed_bytes.fetch_add(bytes, Ordering::Release);
+        self.file_candidate_stock_committed_bytes
+            .fetch_add(bytes, Ordering::Release);
         let previous = self
             .shared
-            .stock_committed_bytes
+            .candidate_stock_committed_bytes
             .fetch_add(bytes, Ordering::Release);
         #[cfg(test)]
         {
@@ -693,13 +727,62 @@ impl BackgroundFreMatcher {
         let _ = previous;
     }
 
-    fn record_mixed_if_needed(&self) {
-        if self.file_saw_stock.load(Ordering::Relaxed)
-            && self.file_saw_aot.load(Ordering::Relaxed)
-            && !self.file_mixed_recorded.swap(true, Ordering::Relaxed)
+    fn record_candidate_mixed_if_needed(&self) {
+        if self.file_saw_candidate_stock.load(Ordering::Relaxed)
+            && self.file_saw_candidate_aot.load(Ordering::Relaxed)
+            && !self
+                .file_candidate_mixed_recorded
+                .swap(true, Ordering::Relaxed)
         {
-            self.shared.mixed_files.fetch_add(1, Ordering::Relaxed);
+            self.shared.candidate_mixed_files.fetch_add(1, Ordering::Relaxed);
         }
+    }
+
+    fn record_candidate_midscan_cutover_if_needed(&self) {
+        let stock_bytes =
+            self.file_candidate_stock_committed_bytes.load(Ordering::Acquire);
+        if stock_bytes == 0
+            || self
+                .file_candidate_midscan_cutover_recorded
+                .swap(true, Ordering::Relaxed)
+        {
+            return;
+        }
+        self.shared
+            .candidate_midscan_cutover_files
+            .fetch_add(1, Ordering::Relaxed);
+        let ordinal = self.current_file_ordinal.load(Ordering::Relaxed);
+        self.shared.record_first_cutover(ordinal, stock_bytes);
+        if let Some(Ok(factory)) = self.shared.outcome.get() {
+            log::debug!(
+                "FRE AOT background candidate-discovery mid-scan cutover in \
+                 file ordinal {ordinal} after {stock_bytes} committed stock \
+                 bytes: {}",
+                factory.description
+            );
+        }
+    }
+
+    #[inline]
+    fn record_stock_span_call(&self, bytes: usize) {
+        if !self.shared.telemetry_enabled {
+            return;
+        }
+        self.shared.stock_span_calls.fetch_add(1, Ordering::Relaxed);
+        self.shared
+            .stock_span_bytes
+            .fetch_add(u64_len(bytes), Ordering::Relaxed);
+    }
+
+    #[inline]
+    fn record_stock_capture_call(&self, bytes: usize) {
+        if !self.shared.telemetry_enabled {
+            return;
+        }
+        self.shared.stock_capture_calls.fetch_add(1, Ordering::Relaxed);
+        self.shared
+            .stock_capture_bytes
+            .fetch_add(u64_len(bytes), Ordering::Relaxed);
     }
 
     fn pending_window_end(&self, haystack: &[u8], start: usize) -> usize {
@@ -733,10 +816,11 @@ impl Clone for BackgroundFreMatcher {
             stock: self.stock.clone(),
             shared: Arc::clone(&self.shared),
             current_file_ordinal: AtomicU64::new(0),
-            file_saw_stock: AtomicBool::new(false),
-            file_saw_aot: AtomicBool::new(false),
-            file_mixed_recorded: AtomicBool::new(false),
-            file_stock_committed_bytes: AtomicU64::new(0),
+            file_saw_candidate_stock: AtomicBool::new(false),
+            file_saw_candidate_aot: AtomicBool::new(false),
+            file_candidate_mixed_recorded: AtomicBool::new(false),
+            file_candidate_midscan_cutover_recorded: AtomicBool::new(false),
+            file_candidate_stock_committed_bytes: AtomicU64::new(0),
         }
     }
 }
@@ -764,16 +848,9 @@ impl Matcher for BackgroundFreMatcher {
         haystack: &[u8],
         at: usize,
     ) -> Result<Option<Match>, String> {
-        if let Some(native) = self.native() {
-            match native.find_at(haystack, at) {
-                Ok(found) => {
-                    self.record_aot_window(haystack.len().saturating_sub(at));
-                    return Ok(found);
-                }
-                Err(error) => self.disable_native(&error),
-            }
-        }
-        self.record_stock_window(haystack.len().saturating_sub(at));
+        // SelectedEnd deliberately cannot recover a match start. Full-span
+        // consumers and captures therefore retain the stock matcher.
+        self.record_stock_span_call(haystack.len().saturating_sub(at));
         Ok(Self::stock_result(self.stock.find_at(haystack, at)))
     }
 
@@ -799,6 +876,7 @@ impl Matcher for BackgroundFreMatcher {
         at: usize,
         caps: &mut RegexCaptures,
     ) -> Result<bool, String> {
+        self.record_stock_capture_call(haystack.len().saturating_sub(at));
         Ok(Self::stock_result(self.stock.captures_at(haystack, at, caps)))
     }
 
@@ -811,22 +889,7 @@ impl Matcher for BackgroundFreMatcher {
     where
         F: FnMut(Match) -> Result<bool, E>,
     {
-        if let Some(native) = self.native() {
-            return match native.try_find_iter(haystack, matched) {
-                Ok(result) => {
-                    self.record_aot_window(haystack.len());
-                    Ok(result)
-                }
-                Err(error) => {
-                    // The callback may already have observed matches, so this
-                    // iterator cannot be replayed safely with stock. Disable
-                    // native publication for later calls and fail this one.
-                    self.disable_native(&error);
-                    Err(error)
-                }
-            };
-        }
-        self.record_stock_window(haystack.len());
+        self.record_stock_span_call(haystack.len());
         Ok(Self::stock_result(self.stock.try_find_iter(haystack, matched)))
     }
 
@@ -837,15 +900,17 @@ impl Matcher for BackgroundFreMatcher {
         at: usize,
     ) -> Result<Option<usize>, String> {
         if let Some(native) = self.native() {
-            match native.find_at(haystack, at) {
-                Ok(found) => {
-                    self.record_aot_window(haystack.len().saturating_sub(at));
-                    return Ok(found.map(|found| found.end()));
+            match native.find_end_at(haystack, at) {
+                Ok(end) => {
+                    self.record_candidate_aot_window(
+                        haystack.len().saturating_sub(at),
+                    );
+                    return Ok(end);
                 }
                 Err(error) => self.disable_native(&error),
             }
         }
-        self.record_stock_window(haystack.len().saturating_sub(at));
+        self.record_candidate_stock_window(haystack.len().saturating_sub(at));
         Ok(Self::stock_result(self.stock.shortest_match_at(haystack, at)))
     }
 
@@ -856,28 +921,26 @@ impl Matcher for BackgroundFreMatcher {
     ) -> Result<Option<LineMatchKind>, String> {
         if haystack.is_empty() {
             if let Some(native) = self.native() {
-                match native.find_in(haystack, 0, 0) {
-                    Ok(found) => {
-                        self.record_aot_window(0);
-                        return Ok(found.map(|found| {
-                            LineMatchKind::Confirmed(found.end())
-                        }));
+                match native.find_end_in(haystack, 0, 0) {
+                    Ok(end) => {
+                        self.record_candidate_aot_window(0);
+                        return Ok(end.map(LineMatchKind::Confirmed));
                     }
                     Err(error) => self.disable_native(&error),
                 }
             }
-            self.record_stock_window(0);
+            self.record_candidate_stock_window(0);
             return Ok(self.stock.find_candidate_line_in(haystack, 0, 0));
         }
         let mut start = 0;
         while start < haystack.len() {
             if let Some(native) = self.native() {
-                match native.find_in(haystack, start, haystack.len()) {
-                    Ok(found) => {
-                        self.record_aot_window(haystack.len() - start);
-                        return Ok(found.map(|found| {
-                            LineMatchKind::Confirmed(found.end())
-                        }));
+                match native.find_end_in(haystack, start, haystack.len()) {
+                    Ok(end) => {
+                        self.record_candidate_aot_window(
+                            haystack.len() - start,
+                        );
+                        return Ok(end.map(LineMatchKind::Confirmed));
                     }
                     Err(error) => self.disable_native(&error),
                 }
@@ -894,13 +957,13 @@ impl Matcher for BackgroundFreMatcher {
             } else {
                 haystack.len()
             };
-            self.record_stock_window(end - start);
+            self.record_candidate_stock_window(end - start);
             if let Some(found) =
                 self.stock.find_candidate_line_in(haystack, start, end)
             {
                 return Ok(Some(found));
             }
-            self.record_stock_commit(end - start);
+            self.record_candidate_stock_commit(end - start);
             if end == haystack.len() {
                 return Ok(None);
             }
@@ -1188,6 +1251,87 @@ fn start_accelerator_name(
     }
 }
 
+fn output_contract_name(
+    output: fre_aot_regex::OutputContract,
+) -> &'static str {
+    use fre_aot_regex::OutputContract;
+
+    match output {
+        OutputContract::Exists => "exists",
+        OutputContract::SelectedEnd => "selected_end",
+        OutputContract::Span => "span",
+    }
+}
+
+fn entry_abi_name(entry_abi: fre_aot_regex::EntryAbi) -> &'static str {
+    use fre_aot_regex::EntryAbi;
+
+    match entry_abi {
+        EntryAbi::ExistsSearchV1 => "exists_search_v1",
+        EntryAbi::SelectedEndSearchV1 => "selected_end_search_v1",
+        EntryAbi::SpanSearchV1 => "span_search_v1",
+    }
+}
+
+/// Return the most specific complete forward/reverse geometry authenticated
+/// by the compile receipt. Optimizer-selected contextual, compiler-K0 and slow
+/// DFA sidecars take precedence over the stable semantic DFA. An installed
+/// ordered finite-language machine is reported as its own forward-only
+/// geometry instead of being mislabeled with the semantic DFA geometry. A
+/// direct NFA or another route with no complete-machine receipt is absent.
+fn selected_machine_states(
+    receipt: &fre_aot_regex::CompileReceipt,
+) -> (Option<&'static str>, Option<u64>, Option<u64>) {
+    if let Some(report) = &receipt.slow_context_aot {
+        return (
+            Some("slow_context_aot"),
+            Some(u64_len(report.dfa.forward_states)),
+            Some(u64_len(report.dfa.reverse_states)),
+        );
+    }
+    if let Some(report) = &receipt.compiler_k0_aot {
+        return (
+            Some("compiler_k0_aot"),
+            Some(u64_len(report.finalization.output.forward_states)),
+            Some(u64_len(report.finalization.output.reverse_states)),
+        );
+    }
+    if let Some(report) = &receipt.slow_aot {
+        return (
+            Some("slow_aot"),
+            Some(u64_len(report.dfa.forward_states)),
+            Some(u64_len(report.dfa.reverse_states)),
+        );
+    }
+    if let Some(report) = &receipt.ordered_finite_language_aot {
+        return (
+            Some("ordered_finite_language"),
+            Some(u64_len(report.states)),
+            Some(0),
+        );
+    }
+    if receipt.engine == fre_aot_regex::EngineKind::OrderedContextDfa {
+        if let Some(stats) = receipt
+            .context_determinization
+            .as_ref()
+            .and_then(|report| report.stats.as_ref())
+        {
+            return (
+                Some("context_determinization"),
+                Some(u64_len(stats.forward_states)),
+                Some(u64_len(stats.reverse_states)),
+            );
+        }
+    }
+    receipt.dfa.as_ref().map_or((None, None, None), |stats| {
+        (
+            Some("semantic_dfa"),
+            Some(u64_len(stats.forward_states)),
+            Some(u64_len(stats.reverse_states)),
+        )
+    })
+}
+
 fn compile_error_classification(
     error: &fre_aot_regex::CompileError,
 ) -> &'static str {
@@ -1289,7 +1433,7 @@ fn compile_native_factory(
     use fre_aot_regex::{
         CompileMode, CompileRequest, OutputContract, compile,
     };
-    use fre_aot_regex_loader::{PublicationLimits, publish_span};
+    use fre_aot_regex_loader::{PublicationLimits, publish_selected_end};
 
     let CompileTask {
         target_feature_profile,
@@ -1321,7 +1465,7 @@ fn compile_native_factory(
     let mut request = CompileRequest::new(pattern, target)
         .profile(profile)
         .mode(CompileMode::Optimizing)
-        .output(OutputContract::Span);
+        .output(OutputContract::SelectedEnd);
     if let Some(limit) = regex_size_limit {
         request = request.size_limit(limit);
     }
@@ -1346,6 +1490,11 @@ fn compile_native_factory(
         return Err("compilation_cancelled".to_owned());
     }
     let receipt = compiled.receipt();
+    let (
+        compiled_state_source,
+        compiled_forward_states,
+        compiled_reverse_states,
+    ) = selected_machine_states(receipt);
     {
         let mut classification = receipt_classification.lock().unwrap();
         classification.compiler_engine =
@@ -1355,9 +1504,29 @@ fn compile_native_factory(
         );
         classification.start_accelerator =
             Some(start_accelerator_name(receipt.start_accelerator));
+        classification.compiled_output_contract =
+            Some(output_contract_name(receipt.output));
+        classification.compiled_entry_abi =
+            Some(entry_abi_name(receipt.entry_abi));
+        classification.compiled_state_source = compiled_state_source;
+        classification.compiled_forward_states = compiled_forward_states;
+        classification.compiled_reverse_states = compiled_reverse_states;
+        classification.compiled_reverse_start_recovery =
+            Some(receipt.passes.contains(
+                &fre_aot_regex::OptimizationPass::ReverseStartRecovery,
+            ));
         classification.runtime_helper_required =
             receipt.runtime_helper_required;
         classification.publication_stage = "publish";
+    }
+    if receipt.output != OutputContract::SelectedEnd
+        || receipt.entry_abi != fre_aot_regex::EntryAbi::SelectedEndSearchV1
+    {
+        let mut classification = receipt_classification.lock().unwrap();
+        classification.publication_stage = "artifact_validation";
+        classification.publication_refusal_class =
+            Some("compiled_contract_mismatch");
+        return Err("compiled_contract_mismatch".to_owned());
     }
     let description = format!(
         "mode=optimizing,publication=in-process,route=direct-native,\
@@ -1375,7 +1544,8 @@ fn compile_native_factory(
         ),
     );
     let publish_started = Instant::now();
-    let published = publish_span(compiled, PublicationLimits::default());
+    let published =
+        publish_selected_end(compiled, PublicationLimits::default());
     publish_ns
         .store(duration_ns(publish_started.elapsed()), Ordering::Release);
     let published = match published {
@@ -1539,6 +1709,12 @@ mod tests {
         classification.compiler_engine = Some("ordered_dfa");
         classification.engine_selection_reason = Some("complete_dfa");
         classification.start_accelerator = Some("aarch64_sve2");
+        classification.compiled_output_contract = Some("selected_end");
+        classification.compiled_entry_abi = Some("selected_end_search_v1");
+        classification.compiled_state_source = Some("semantic_dfa");
+        classification.compiled_forward_states = Some(17);
+        classification.compiled_reverse_states = Some(0);
+        classification.compiled_reverse_start_recovery = Some(false);
         classification.publication_stage = "artifact_validation";
         classification.publication_refusal_class =
             Some("runtime_helper_required");
@@ -1547,6 +1723,7 @@ mod tests {
         state.outcome.set(Err("runtime_helper_required".to_owned())).unwrap();
 
         let receipt = state.receipt_json();
+        assert_eq!(receipt["schema"], RECEIPT_SCHEMA);
         assert_eq!(receipt["target_feature_profile"], "sve2");
         assert_eq!(
             receipt["requested_target_feature_bits"],
@@ -1557,6 +1734,12 @@ mod tests {
         assert_eq!(receipt["compiler_engine"], "ordered_dfa");
         assert_eq!(receipt["engine_selection_reason"], "complete_dfa");
         assert_eq!(receipt["start_accelerator"], "aarch64_sve2");
+        assert_eq!(receipt["compiled_output_contract"], "selected_end");
+        assert_eq!(receipt["compiled_entry_abi"], "selected_end_search_v1");
+        assert_eq!(receipt["compiled_state_source"], "semantic_dfa");
+        assert_eq!(receipt["compiled_forward_states"], 17);
+        assert_eq!(receipt["compiled_reverse_states"], 0);
+        assert_eq!(receipt["compiled_reverse_start_recovery"], false);
         assert_eq!(receipt["publication_stage"], "artifact_validation");
         assert_eq!(
             receipt["publication_refusal_class"],
@@ -1578,22 +1761,84 @@ mod tests {
         );
     }
 
+    #[test]
+    fn selected_end_receipts_have_no_reverse_start_recovery() {
+        use fre_aot_regex::{
+            CompileMode, CompileRequest, OutputContract, compile,
+        };
+        use fre_aot_regex_loader::host_target;
+
+        let target = host_target().unwrap();
+        let mut saw_complete_machine = false;
+        for pattern in ["a", "a+b", "(?:ab|ac|ad|ae)"] {
+            let compiled = compile(
+                CompileRequest::new(pattern, target)
+                    .mode(CompileMode::Optimizing)
+                    .output(OutputContract::SelectedEnd),
+            )
+            .unwrap();
+            let (source, forward, reverse) =
+                selected_machine_states(compiled.receipt());
+            assert_eq!(source.is_some(), forward.is_some(), "{pattern}");
+            assert_eq!(forward.is_some(), reverse.is_some(), "{pattern}");
+            if let Some(forward) = forward {
+                saw_complete_machine = true;
+                assert!(forward > 0, "{pattern}");
+                assert!(reverse.is_some(), "{pattern}/{source:?}");
+            }
+            assert!(
+                !compiled.receipt().passes.contains(
+                    &fre_aot_regex::OptimizationPass::ReverseStartRecovery
+                ),
+                "{pattern}/{source:?}"
+            );
+        }
+        assert!(saw_complete_machine);
+
+        let contextual = compile(
+            CompileRequest::new(r"(?m)^[ab]+z$", target)
+                .mode(CompileMode::Optimizing)
+                .output(OutputContract::SelectedEnd),
+        )
+        .unwrap();
+        assert_eq!(
+            contextual.receipt().engine,
+            fre_aot_regex::EngineKind::OrderedContextDfa
+        );
+        let (source, forward, reverse) =
+            selected_machine_states(contextual.receipt());
+        assert_eq!(source, Some("context_determinization"));
+        assert!(forward.is_some_and(|states| states > 0));
+        assert!(reverse.is_some());
+        assert!(
+            !contextual.receipt().passes.contains(
+                &fre_aot_regex::OptimizationPass::ReverseStartRecovery
+            )
+        );
+    }
+
     fn test_factory(pattern: &str) -> Arc<NativeAotFactory> {
         use fre_aot_regex::{
             CompileMode, CompileRequest, OutputContract, compile,
         };
         use fre_aot_regex_loader::{
-            PublicationLimits, host_target, publish_span,
+            PublicationLimits, host_target, publish_selected_end,
         };
 
         let compiled = compile(
             CompileRequest::new(pattern, host_target().unwrap())
                 .mode(CompileMode::Optimizing)
-                .output(OutputContract::Span),
+                .output(OutputContract::SelectedEnd),
         )
         .unwrap();
+        assert_eq!(compiled.receipt().output, OutputContract::SelectedEnd);
+        assert_eq!(
+            compiled.receipt().entry_abi,
+            fre_aot_regex::EntryAbi::SelectedEndSearchV1
+        );
         let published =
-            publish_span(compiled, PublicationLimits::default()).unwrap();
+            publish_selected_end(compiled, PublicationLimits::default())
+                .unwrap();
         Arc::new(NativeAotFactory {
             published,
             description: "test-direct-native".to_owned(),
@@ -1608,10 +1853,11 @@ mod tests {
             stock,
             shared,
             current_file_ordinal: AtomicU64::new(0),
-            file_saw_stock: AtomicBool::new(false),
-            file_saw_aot: AtomicBool::new(false),
-            file_mixed_recorded: AtomicBool::new(false),
-            file_stock_committed_bytes: AtomicU64::new(0),
+            file_saw_candidate_stock: AtomicBool::new(false),
+            file_saw_candidate_aot: AtomicBool::new(false),
+            file_candidate_mixed_recorded: AtomicBool::new(false),
+            file_candidate_midscan_cutover_recorded: AtomicBool::new(false),
+            file_candidate_stock_committed_bytes: AtomicU64::new(0),
         }
     }
 
@@ -1626,14 +1872,38 @@ mod tests {
     fn publication_is_observed_without_a_file_boundary() {
         let (mut matcher, shared) = pending_matcher();
         matcher.begin_file();
-        assert_eq!(matcher.find(b"ba").unwrap(), Some(Match::new(1, 2)));
+        assert_eq!(matcher.shortest_match(b"ba").unwrap(), Some(2));
 
         shared.outcome.set(Ok(test_factory("."))).unwrap();
-        assert_eq!(matcher.find(b"ba").unwrap(), Some(Match::new(0, 1)));
-        assert_eq!(shared.stock_files.load(Ordering::Relaxed), 1);
-        assert_eq!(shared.aot_files.load(Ordering::Relaxed), 1);
-        assert_eq!(shared.mixed_files.load(Ordering::Relaxed), 1);
+        assert_eq!(matcher.shortest_match(b"ba").unwrap(), Some(1));
+        assert_eq!(shared.candidate_stock_files.load(Ordering::Relaxed), 1);
+        assert_eq!(shared.candidate_aot_files.load(Ordering::Relaxed), 1);
+        assert_eq!(shared.candidate_mixed_files.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            shared.candidate_midscan_cutover_files.load(Ordering::Relaxed),
+            0
+        );
+        assert!(shared.first_cutover.lock().unwrap().is_none());
         assert_eq!(shared.total_files.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn disabled_telemetry_does_not_touch_hot_path_counters() {
+        let stock = grep::regex::RegexMatcherBuilder::new()
+            .line_terminator(Some(b'\n'))
+            .build("a")
+            .unwrap();
+        let mut shared = CompileState::empty();
+        Arc::get_mut(&mut shared).unwrap().telemetry_enabled = false;
+        shared.outcome.set(Ok(test_factory("a"))).unwrap();
+        let mut matcher = matcher_with(stock, Arc::clone(&shared));
+
+        matcher.begin_file();
+        assert_eq!(matcher.shortest_match(b"ba").unwrap(), Some(2));
+        assert_eq!(matcher.find(b"ba").unwrap(), Some(Match::new(1, 2)));
+        assert_eq!(shared.total_files.load(Ordering::Relaxed), 0);
+        assert_eq!(shared.candidate_aot_windows.load(Ordering::Relaxed), 0);
+        assert_eq!(shared.stock_span_calls.load(Ordering::Relaxed), 0);
     }
 
     #[test]
@@ -1694,9 +1964,13 @@ mod tests {
         }
         assert!(matcher.find_candidate_line(&haystack).unwrap().is_none());
         assert_eq!(shared.total_files.load(Ordering::Relaxed), 1);
-        assert_eq!(shared.mixed_files.load(Ordering::Relaxed), 1);
-        assert!(shared.stock_windows.load(Ordering::Relaxed) > 0);
-        assert!(shared.aot_windows.load(Ordering::Relaxed) > 0);
+        assert_eq!(shared.candidate_mixed_files.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            shared.candidate_midscan_cutover_files.load(Ordering::Relaxed),
+            1
+        );
+        assert!(shared.candidate_stock_windows.load(Ordering::Relaxed) > 0);
+        assert!(shared.candidate_aot_windows.load(Ordering::Relaxed) > 0);
         let cutover = shared.first_cutover.lock().unwrap().unwrap();
         assert_eq!(cutover.file_ordinal, 1);
         assert!(cutover.stock_committed_bytes_before_cutover > 0);
@@ -1727,12 +2001,43 @@ mod tests {
             }
             other => panic!("expected confirmed native match, got {other:?}"),
         }
-        assert_eq!(shared.mixed_files.load(Ordering::Relaxed), 1);
+        assert_eq!(shared.candidate_mixed_files.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            shared.candidate_midscan_cutover_files.load(Ordering::Relaxed),
+            1
+        );
         assert!(
-            shared.stock_committed_bytes.load(Ordering::Acquire)
+            shared.candidate_stock_committed_bytes.load(Ordering::Acquire)
                 >= u64_len(PENDING_SCAN_QUANTUM)
         );
-        assert!(shared.aot_windows.load(Ordering::Relaxed) > 0);
+        assert!(shared.candidate_aot_windows.load(Ordering::Relaxed) > 0);
+    }
+
+    #[test]
+    fn empty_native_probe_does_not_manufacture_midscan_cutover() {
+        let stock = grep::regex::RegexMatcherBuilder::new()
+            .line_terminator(Some(b'\n'))
+            .build("z")
+            .unwrap();
+        let shared = CompileState::empty();
+        let mut matcher = matcher_with(stock, Arc::clone(&shared));
+        matcher.begin_file();
+
+        assert!(matcher.find_candidate_line(b"a\n").unwrap().is_none());
+        assert!(
+            shared.candidate_stock_committed_bytes.load(Ordering::Acquire) > 0
+        );
+        shared.outcome.set(Ok(test_factory("z"))).unwrap();
+        assert!(matcher.find_candidate_line(b"").unwrap().is_none());
+
+        assert_eq!(shared.candidate_aot_windows.load(Ordering::Relaxed), 0);
+        assert_eq!(shared.candidate_aot_files.load(Ordering::Relaxed), 0);
+        assert_eq!(shared.candidate_mixed_files.load(Ordering::Relaxed), 0);
+        assert_eq!(
+            shared.candidate_midscan_cutover_files.load(Ordering::Relaxed),
+            0
+        );
+        assert!(shared.first_cutover.lock().unwrap().is_none());
     }
 
     #[test]
@@ -1743,7 +2048,7 @@ mod tests {
             .unwrap();
         let shared = CompileState::empty();
         shared.outcome.set(Ok(test_factory("a"))).unwrap();
-        let mut matcher = matcher_with(stock, shared);
+        let mut matcher = matcher_with(stock, Arc::clone(&shared));
         matcher.begin_file();
         assert_eq!(matcher.capture_index("letter"), Some(1));
         assert_eq!(matcher.capture_count(), 2);
@@ -1754,33 +2059,47 @@ mod tests {
         let mut captures = matcher.new_captures().unwrap();
         assert!(matcher.captures(b"a", &mut captures).unwrap());
         assert_eq!(captures.get(1), Some(Match::new(0, 1)));
+        assert_eq!(shared.stock_capture_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(shared.stock_capture_bytes.load(Ordering::Relaxed), 1);
+        assert_eq!(shared.candidate_stock_windows.load(Ordering::Relaxed), 0);
+        assert_eq!(shared.candidate_aot_windows.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn span_and_candidate_telemetry_are_disjoint() {
+        let stock = grep::regex::RegexMatcherBuilder::new()
+            .line_terminator(Some(b'\n'))
+            .build("a")
+            .unwrap();
+        let shared = CompileState::empty();
+        shared.outcome.set(Ok(test_factory("a"))).unwrap();
+        let mut matcher = matcher_with(stock, Arc::clone(&shared));
+        matcher.begin_file();
+
+        assert_eq!(matcher.find(b"ba").unwrap(), Some(Match::new(1, 2)));
+        assert_eq!(shared.stock_span_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(shared.stock_span_bytes.load(Ordering::Relaxed), 2);
+        assert_eq!(shared.candidate_stock_files.load(Ordering::Relaxed), 0);
+        assert_eq!(shared.candidate_aot_files.load(Ordering::Relaxed), 0);
+
+        assert_eq!(matcher.shortest_match(b"ba").unwrap(), Some(2));
+        assert_eq!(shared.candidate_aot_windows.load(Ordering::Relaxed), 1);
+        assert_eq!(shared.candidate_aot_files.load(Ordering::Relaxed), 1);
+        assert_eq!(shared.candidate_mixed_files.load(Ordering::Relaxed), 0);
     }
 
     #[test]
     fn invalid_native_window_fails_closed() {
-        let matcher = NativeAotMatcher { factory: test_factory("a") };
-        assert!(matcher.find_at(b"abc", 4).is_err());
+        let factory = test_factory("a");
+        let matcher = NativeAotMatcher { factory: &factory };
+        assert!(matcher.find_end_at(b"abc", 4).is_err());
     }
 
     #[test]
-    fn native_empty_match_iteration_makes_bytewise_progress() {
-        let matcher = NativeAotMatcher { factory: test_factory("a*") };
-        let mut matches = vec![];
-        matcher
-            .try_find_iter(b"ab", |found| {
-                matches.push(found);
-                Ok::<bool, ()>(true)
-            })
-            .unwrap()
-            .unwrap();
-        let stock = RegexMatcher::new("a*").unwrap();
-        let mut expected = vec![];
-        stock
-            .find_iter(b"ab", |found| {
-                expected.push(found);
-                true
-            })
-            .unwrap();
-        assert_eq!(matches, expected);
+    fn native_selected_end_handles_empty_match() {
+        let factory = test_factory("a*");
+        let matcher = NativeAotMatcher { factory: &factory };
+        assert_eq!(matcher.find_end_at(b"ab", 0).unwrap(), Some(1));
+        assert_eq!(matcher.find_end_at(b"bb", 0).unwrap(), Some(0));
     }
 }

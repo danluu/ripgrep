@@ -1,5 +1,10 @@
 # Background FRE AOT mid-scan experiment
 
+> Historical receipt-v2 experiment only. Its harness is deliberately pinned
+> to the earlier Span contract and must not be run against the current v4
+> SelectedEnd binary. Use `experiments/background-aot-representative/` for
+> current correctness and timing work.
+
 This is the receipt-v2 replacement for `experiments/background-aot`. The old
 experiment measured file-boundary selection and an external-linker pipeline;
 those results do not describe the direct in-process publisher or line-aligned

@@ -44,8 +44,50 @@ BACKGROUND_FLAG = "--fre-aot-background"
 RECEIPT_ENV = "RG_FRE_AOT_BACKGROUND_RECEIPT"
 CORRECTNESS_GATE_ENV = "RG_FRE_AOT_BACKGROUND_TEST_MIN_STOCK_BYTES"
 CPU_PROFILE_ENV = "RG_FRE_AOT_BACKGROUND_CPU_PROFILE"
-RECEIPT_SCHEMA = "ripgrep.fre-aot-background.v3"
+RECEIPT_SCHEMA = "ripgrep.fre-aot-background.v4"
 RESULT_SCHEMA = "ripgrep.fre-aot-representative"
+COMPILED_OUTPUT_CONTRACT = "selected_end"
+COMPILED_ENTRY_ABI = "selected_end_search_v1"
+COMPILED_STATE_SOURCES = frozenset((
+    "semantic_dfa", "context_determinization", "slow_aot",
+    "compiler_k0_aot", "slow_context_aot", "ordered_finite_language",
+))
+DFA_COMPILER_ENGINES = frozenset(("ordered_dfa", "ordered_context_dfa"))
+NON_DFA_COMPILER_ENGINES = frozenset(("ordered_nfa",))
+KNOWN_COMPILER_ENGINES = DFA_COMPILER_ENGINES | NON_DFA_COMPILER_ENGINES
+CANDIDATE_DISCOVERY_COUNTER_FIELDS = (
+    "candidate_stock_files",
+    "candidate_fre_aot_files",
+    "candidate_mixed_engine_files",
+    "candidate_midscan_cutover_files",
+    "candidate_stock_windows",
+    "candidate_fre_aot_windows",
+    "candidate_stock_window_bytes",
+    "candidate_stock_committed_bytes",
+    "candidate_fre_aot_window_bytes",
+)
+FIRST_CANDIDATE_MIDSCAN_CUTOVER_FIELDS = (
+    "first_candidate_midscan_cutover_file_ordinal",
+    "first_candidate_midscan_cutover_ns_since_start",
+    "first_candidate_midscan_cutover_stock_committed_bytes",
+)
+STOCK_WORK_COUNTER_FIELDS = (
+    "stock_span_calls",
+    "stock_span_bytes",
+    "stock_capture_calls",
+    "stock_capture_bytes",
+)
+FORCED_MIDSCAN_LINE_BYTES = 4096
+FORCED_MIDSCAN_FILE_BYTES = 16 * 1024 * 1024
+FORCED_MIDSCAN_STOCK_BYTES = 4 * 1024 * 1024
+FORCED_MIDSCAN_PATTERN = r"a{0,99}b"
+FORCED_MIDSCAN_MARKER_LINES = (
+    128,
+    FORCED_MIDSCAN_FILE_BYTES // FORCED_MIDSCAN_LINE_BYTES - 1,
+)
+FORCED_MIDSCAN_CORPUS_SHA256 = (
+    "c9e3251528b667620ac9610fce1b4689f3a3cf0d7a0a9d2e6808fe77c8acafaa"
+)
 
 EXPECTED_OOT = {
     "window_actions": 161,
@@ -662,6 +704,7 @@ def run_once(
     capture_receipt: bool,
     cpu_profile: str,
     timeout_seconds: float,
+    test_min_stock_bytes: int = 0,
 ) -> dict[str, Any]:
     command = [str(binary)]
     if background:
@@ -681,6 +724,10 @@ def run_once(
             environment[CPU_PROFILE_ENV] = cpu_profile
             if capture_receipt:
                 environment[RECEIPT_ENV] = str(receipt_path)
+            if test_min_stock_bytes > 0:
+                environment[CORRECTNESS_GATE_ENV] = str(
+                    test_min_stock_bytes
+                )
         before = resource.getrusage(resource.RUSAGE_CHILDREN)
         started = time.perf_counter_ns()
         try:
@@ -708,7 +755,11 @@ def run_once(
         receipt_parse_error = False
         if receipt_path.is_file():
             try:
-                receipt = json.loads(receipt_path.read_text())
+                parsed_receipt = json.loads(receipt_path.read_text())
+                if isinstance(parsed_receipt, Mapping):
+                    receipt = parsed_receipt
+                else:
+                    receipt_parse_error = True
             except (OSError, UnicodeError, json.JSONDecodeError):
                 receipt_parse_error = True
         entries = {path.name for path in temporary.iterdir()}
@@ -776,32 +827,108 @@ def receipt_decline_class(receipt: Mapping[str, Any] | None) -> str:
 def validate_receipt(
     receipt: Mapping[str, Any] | None,
     requested_cpu_profile: str,
+    expected_test_min_stock_bytes: int = 0,
 ) -> list[str]:
     failures = []
     if receipt is None:
         return ["missing_receipt"]
+    if not isinstance(receipt, Mapping):
+        return ["receipt_not_object"]
     if receipt.get("schema") != RECEIPT_SCHEMA:
         failures.append("schema")
     if receipt.get("direct_native_only") is not True:
         failures.append("not_direct_native")
-    if receipt.get("external_linker_invocations") != 0:
-        failures.append("external_linker")
     if receipt.get("outcome") not in ("ready", "declined", "unfinished"):
         failures.append("invalid_outcome")
     for field in (
-        "compile_ns", "publish_ns", "prepare_ns", "stock_files",
-        "fre_aot_files", "mixed_engine_files", "total_file_attempts",
-        "stock_windows", "fre_aot_windows", "stock_window_bytes",
-        "stock_committed_bytes", "fre_aot_window_bytes",
-        "native_call_failures", "test_min_stock_bytes",
+        "compile_ns", "publish_ns", "prepare_ns", "total_file_attempts",
+        "native_call_failures", "external_linker_invocations",
+        "test_min_stock_bytes", *CANDIDATE_DISCOVERY_COUNTER_FIELDS,
+        *STOCK_WORK_COUNTER_FIELDS,
     ):
         value = receipt.get(field)
         if not isinstance(value, int) or isinstance(value, bool) or value < 0:
             failures.append(f"invalid_{field}")
-    if receipt.get("test_min_stock_bytes") != 0:
-        failures.append("test_gate_present")
+    if receipt.get("external_linker_invocations") != 0:
+        failures.append("external_linker")
+    if receipt.get("test_min_stock_bytes") != expected_test_min_stock_bytes:
+        failures.append("test_gate_mismatch")
     if receipt.get("native_call_failures") != 0:
         failures.append("native_call_failure")
+    cutover_values = []
+    for field in FIRST_CANDIDATE_MIDSCAN_CUTOVER_FIELDS:
+        if field not in receipt:
+            failures.append(f"missing_{field}")
+            continue
+        value = receipt.get(field)
+        cutover_values.append(value)
+        if value is not None and (
+            not isinstance(value, int) or isinstance(value, bool) or value < 0
+        ):
+            failures.append(f"invalid_{field}")
+    if len(cutover_values) == len(FIRST_CANDIDATE_MIDSCAN_CUTOVER_FIELDS):
+        reported = [value is not None for value in cutover_values]
+        if any(reported) and not all(reported):
+            failures.append("incomplete_first_candidate_midscan_cutover")
+    counters = {
+        field: receipt.get(field)
+        for field in (*CANDIDATE_DISCOVERY_COUNTER_FIELDS, "total_file_attempts")
+    }
+    if all(
+        isinstance(value, int)
+        and not isinstance(value, bool)
+        and value >= 0
+        for value in counters.values()
+    ):
+        total_files = counters["total_file_attempts"]
+        stock_files = counters["candidate_stock_files"]
+        aot_files = counters["candidate_fre_aot_files"]
+        mixed_files = counters["candidate_mixed_engine_files"]
+        midscan_files = counters["candidate_midscan_cutover_files"]
+        stock_windows = counters["candidate_stock_windows"]
+        aot_windows = counters["candidate_fre_aot_windows"]
+        stock_window_bytes = counters["candidate_stock_window_bytes"]
+        stock_committed_bytes = counters["candidate_stock_committed_bytes"]
+        aot_window_bytes = counters["candidate_fre_aot_window_bytes"]
+        if stock_files > total_files or aot_files > total_files:
+            failures.append("candidate_file_count_exceeds_attempts")
+        if mixed_files > min(stock_files, aot_files):
+            failures.append("candidate_mixed_file_count_impossible")
+        minimum_mixed = max(0, stock_files + aot_files - total_files)
+        if mixed_files < minimum_mixed:
+            failures.append("candidate_mixed_file_count_below_intersection")
+        if midscan_files > mixed_files:
+            failures.append("candidate_midscan_file_count_impossible")
+        if (stock_files == 0) != (stock_windows == 0):
+            failures.append("candidate_stock_file_window_mismatch")
+        if (aot_files == 0) != (aot_windows == 0):
+            failures.append("candidate_aot_file_window_mismatch")
+        if stock_files > stock_windows or aot_files > aot_windows:
+            failures.append("candidate_file_count_exceeds_windows")
+        if (stock_windows == 0) != (stock_window_bytes == 0):
+            failures.append("candidate_stock_window_byte_mismatch")
+        if (aot_windows == 0) != (aot_window_bytes == 0):
+            failures.append("candidate_aot_window_byte_mismatch")
+        if mixed_files > 0 and (stock_windows == 0 or aot_windows == 0):
+            failures.append("candidate_mixed_without_both_window_families")
+        if stock_committed_bytes > stock_window_bytes:
+            failures.append("candidate_committed_bytes_exceed_stock_windows")
+        first_reported = (
+            len(cutover_values)
+            == len(FIRST_CANDIDATE_MIDSCAN_CUTOVER_FIELDS)
+            and all(value is not None for value in cutover_values)
+        )
+        if (midscan_files > 0) != first_reported:
+            failures.append("candidate_midscan_first_witness_mismatch")
+        if first_reported:
+            ordinal, cutover_ns, committed_before = cutover_values
+            if ordinal == 0 or ordinal > total_files:
+                failures.append("candidate_midscan_file_ordinal_out_of_range")
+            if committed_before == 0 or committed_before > stock_committed_bytes:
+                failures.append("candidate_midscan_committed_bytes_out_of_range")
+            ready_ns = receipt.get("ready_ns_since_start")
+            if isinstance(ready_ns, int) and cutover_ns < ready_ns:
+                failures.append("candidate_midscan_precedes_publication")
     selected_profile = receipt.get("target_feature_profile")
     if selected_profile != requested_cpu_profile:
         failures.append("target_profile_mismatch")
@@ -809,10 +936,88 @@ def validate_receipt(
         failures.append("invalid_publication_stage")
     if not isinstance(receipt.get("runtime_helper_required"), bool):
         failures.append("invalid_runtime_helper_required")
+    compiled_fields = (
+        "compiled_output_contract", "compiled_entry_abi",
+        "compiled_state_source",
+        "compiled_forward_states", "compiled_reverse_states",
+        "compiled_reverse_start_recovery",
+    )
+    for field in compiled_fields:
+        if field not in receipt:
+            failures.append(f"missing_{field}")
+    compiled_output_contract = receipt.get("compiled_output_contract")
+    compiled_entry_abi = receipt.get("compiled_entry_abi")
+    compiled_state_source = receipt.get("compiled_state_source")
+    compiled_forward_states = receipt.get("compiled_forward_states")
+    compiled_reverse_states = receipt.get("compiled_reverse_states")
+    compiled_reverse_start_recovery = receipt.get(
+        "compiled_reverse_start_recovery"
+    )
+    if (
+        compiled_output_contract is not None
+        and compiled_output_contract != COMPILED_OUTPUT_CONTRACT
+    ):
+        failures.append("invalid_compiled_output_contract")
+    if (
+        compiled_entry_abi is not None
+        and compiled_entry_abi != COMPILED_ENTRY_ABI
+    ):
+        failures.append("invalid_compiled_entry_abi")
+    if (
+        compiled_state_source is not None
+        and compiled_state_source not in COMPILED_STATE_SOURCES
+    ):
+        failures.append("invalid_compiled_state_source")
+    for field, value in (
+        ("compiled_forward_states", compiled_forward_states),
+        ("compiled_reverse_states", compiled_reverse_states),
+    ):
+        if value is not None and (
+            not isinstance(value, int) or isinstance(value, bool) or value < 0
+        ):
+            failures.append(f"invalid_{field}")
+    if compiled_reverse_start_recovery is not None and not isinstance(
+        compiled_reverse_start_recovery, bool
+    ):
+        failures.append("invalid_compiled_reverse_start_recovery")
+    compiler_engine = receipt.get("compiler_engine")
+    if (
+        compiler_engine is not None
+        and compiler_engine not in KNOWN_COMPILER_ENGINES
+    ):
+        failures.append("invalid_compiler_engine")
+    if compiler_engine is None:
+        if any(receipt.get(field) is not None for field in compiled_fields):
+            failures.append("compiled_metadata_without_compiler_engine")
+    elif compiler_engine in KNOWN_COMPILER_ENGINES:
+        if compiled_output_contract != COMPILED_OUTPUT_CONTRACT:
+            failures.append("compiled_output_contract_not_selected_end")
+        if compiled_entry_abi != COMPILED_ENTRY_ABI:
+            failures.append("compiled_entry_abi_not_selected_end_search_v1")
+        if compiler_engine in DFA_COMPILER_ENGINES:
+            if compiled_forward_states is None:
+                failures.append("missing_compiled_forward_states")
+            if compiled_reverse_states is None:
+                failures.append("missing_compiled_reverse_states")
+        # An OrderedNfa semantic program can still select a complete slow-DFA,
+        # compiler-K0 or contextual-DFA native sidecar. Its selected machine
+        # geometry is therefore either an integer pair or an absent pair.
+        if (compiled_forward_states is None) != (
+            compiled_reverse_states is None
+        ):
+            failures.append("incomplete_compiled_state_geometry")
+        states_reported = compiled_forward_states is not None
+        if states_reported != (compiled_state_source is not None):
+            failures.append("compiled_state_source_geometry_mismatch")
+        if compiled_forward_states == 0:
+            failures.append("compiled_forward_states_zero")
+        if compiled_reverse_start_recovery is not False:
+            failures.append("selected_end_reverse_start_recovery_present")
     for field in (
         "requested_target_feature_bits", "host_target_feature_bits",
         "target_feature_bits", "published_code_bytes",
         "published_read_only_data_bytes", "published_total_mapped_bytes",
+        "ready_ns_since_start",
     ):
         value = receipt.get(field)
         if value is not None and (
@@ -863,8 +1068,9 @@ def validate_receipt(
         for field in (
             "target_feature_bits", "compiler_engine",
             "engine_selection_reason", "start_accelerator",
+            "compiled_output_contract", "compiled_entry_abi",
             "published_code_bytes", "published_read_only_data_bytes",
-            "published_total_mapped_bytes",
+            "published_total_mapped_bytes", "ready_ns_since_start",
         ):
             if receipt.get(field) is None:
                 failures.append(f"ready_missing_{field}")
@@ -955,17 +1161,39 @@ def target_validation_matrix(
 def route_class(receipt: Mapping[str, Any] | None) -> str:
     if receipt is None:
         return "no_receipt"
-    stock = int(receipt.get("stock_windows", 0) or 0) > 0
-    aot = int(receipt.get("fre_aot_windows", 0) or 0) > 0
-    if int(receipt.get("mixed_engine_files", 0) or 0) > 0:
-        return "same_file_mixed"
+    stock_windows = receipt.get("candidate_stock_windows")
+    aot_windows = receipt.get("candidate_fre_aot_windows")
+    mixed_files = receipt.get("candidate_mixed_engine_files")
+    midscan_files = receipt.get("candidate_midscan_cutover_files")
+    stock = (
+        isinstance(stock_windows, int)
+        and not isinstance(stock_windows, bool)
+        and stock_windows > 0
+    )
+    aot = (
+        isinstance(aot_windows, int)
+        and not isinstance(aot_windows, bool)
+        and aot_windows > 0
+    )
+    if (
+        isinstance(midscan_files, int)
+        and not isinstance(midscan_files, bool)
+        and midscan_files > 0
+    ):
+        return "same_file_midscan_cutover"
+    if (
+        isinstance(mixed_files, int)
+        and not isinstance(mixed_files, bool)
+        and mixed_files > 0
+    ):
+        return "same_file_operation_mix"
     if stock and aot:
         return "cross_file_split"
     if aot:
         return "aot_only"
     if stock:
         return "stock_only"
-    return "no_matcher_windows"
+    return "no_candidate_windows"
 
 
 def compact_private(result: Mapping[str, Any]) -> dict[str, Any]:
@@ -1027,6 +1255,205 @@ def probe_one(
         "background": compact_private(background),
         "stock": compact_private(stock_result),
     }
+
+
+def create_forced_midscan_corpus(path: Path) -> None:
+    line_count = FORCED_MIDSCAN_FILE_BYTES // FORCED_MIDSCAN_LINE_BYTES
+    marker_lines = set(FORCED_MIDSCAN_MARKER_LINES)
+    ordinary = b"a" * (FORCED_MIDSCAN_LINE_BYTES - 1) + b"\n"
+    marker = (
+        b"a" * (FORCED_MIDSCAN_LINE_BYTES - 2) + b"b\n"
+    )
+    with path.open("xb") as output:
+        for line in range(line_count):
+            output.write(marker if line in marker_lines else ordinary)
+    if path.stat().st_size != FORCED_MIDSCAN_FILE_BYTES:
+        raise HarnessError("forced mid-scan corpus size mismatch")
+    if sha256_file(path) != FORCED_MIDSCAN_CORPUS_SHA256:
+        raise HarnessError("forced mid-scan corpus digest mismatch")
+
+
+def forced_midscan_expected_stdout() -> bytes:
+    matched = b"a" * 99 + b"b"
+    records = []
+    for line in FORCED_MIDSCAN_MARKER_LINES:
+        byte_offset = (
+            line * FORCED_MIDSCAN_LINE_BYTES
+            + FORCED_MIDSCAN_LINE_BYTES - 2 - 99
+        )
+        records.append(
+            f"{line + 1}:{byte_offset}:".encode() + matched + b"\n"
+        )
+    return b"".join(records)
+
+
+def run_forced_midscan_gate(
+    *,
+    corpus: Path,
+    candidate: Path,
+    stock: Path,
+    cwd: Path,
+    cpu_profile: str,
+    timeout_seconds: float,
+) -> dict[str, Any]:
+    args = [
+        "--engine=default", "--no-config", "--no-ignore", "--text",
+        "--color=never", "--no-heading", "--no-filename",
+        "--threads=1", "--only-matching", "--byte-offset",
+        "--line-number", FORCED_MIDSCAN_PATTERN, str(corpus),
+    ]
+    normal = run_once(
+        binary=candidate, args=args, cwd=cwd, background=False,
+        capture_receipt=False, cpu_profile=cpu_profile,
+        timeout_seconds=timeout_seconds,
+    )
+    background = run_once(
+        binary=candidate, args=args, cwd=cwd, background=True,
+        capture_receipt=True, cpu_profile=cpu_profile,
+        timeout_seconds=timeout_seconds,
+        test_min_stock_bytes=FORCED_MIDSCAN_STOCK_BYTES,
+    )
+    stock_result = run_once(
+        binary=stock, args=args, cwd=cwd, background=False,
+        capture_receipt=False, cpu_profile=cpu_profile,
+        timeout_seconds=timeout_seconds,
+    )
+    exact_normal_background = outputs_equal(
+        normal, background, "literal"
+    )
+    exact_stock_normal = outputs_equal(stock_result, normal, "literal")
+    gate = {
+        "cpu_profile": cpu_profile,
+        "exact_normal_background": exact_normal_background,
+        "exact_stock_normal": exact_stock_normal,
+        "failures": [],
+        "comparison_records": {
+            "normal": comparison_record(normal, "literal"),
+            "background": comparison_record(background, "literal"),
+            "stock": comparison_record(stock_result, "literal"),
+        },
+        "normal": compact_private(normal),
+        "background": compact_private(background),
+        "stock": compact_private(stock_result),
+    }
+    gate["failures"] = validate_forced_midscan_gate_record(
+        gate, cpu_profile
+    )
+    return gate
+
+
+def forced_midscan_gate_summary(
+    gates: Sequence[Mapping[str, Any]],
+) -> dict[str, Any]:
+    return {
+        "profiles": len(gates),
+        "passed": sum(not gate.get("failures") for gate in gates),
+        "all_passed": bool(gates) and all(
+            not gate.get("failures") for gate in gates
+        ),
+        "failures": dict(sorted(Counter(
+            failure
+            for gate in gates
+            for failure in gate.get("failures", [])
+        ).items())),
+        "routes": dict(sorted(Counter(
+            route_class(gate.get("background", {}).get("receipt"))
+            for gate in gates
+        ).items())),
+    }
+
+
+def validate_forced_midscan_gate_record(
+    gate: Mapping[str, Any], cpu_profile: str
+) -> list[str]:
+    failures = []
+    normal = gate.get("normal")
+    background = gate.get("background")
+    stock = gate.get("stock")
+    comparisons = gate.get("comparison_records")
+    if not all(
+        isinstance(value, Mapping)
+        for value in (normal, background, stock, comparisons)
+    ) or not all(
+        isinstance(comparisons.get(arm), Mapping)
+        for arm in ("normal", "background", "stock")
+    ):
+        return ["forced_midscan_evidence_missing"]
+    receipt = background.get("receipt")
+    failures.extend(validate_receipt(
+        receipt, cpu_profile, FORCED_MIDSCAN_STOCK_BYTES
+    ))
+    if background.get("receipt_parse_error") is not False:
+        failures.append("malformed_receipt")
+    if background.get("unexpected_temporary_artifacts") != 0:
+        failures.append("unexpected_temporary_artifacts")
+    normal_background = comparisons["normal"] == comparisons["background"]
+    stock_normal = comparisons["stock"] == comparisons["normal"]
+    expected_stdout = output_record(forced_midscan_expected_stdout())
+    expected_stderr = output_record(b"")
+    for arm, result in (
+        ("normal", normal),
+        ("background", background),
+        ("stock", stock),
+    ):
+        comparison = comparisons[arm]
+        stdout = result.get("stdout")
+        stderr = result.get("stderr")
+        if (
+            not isinstance(stdout, Mapping)
+            or not isinstance(stderr, Mapping)
+            or comparison.get("status") != result.get("status")
+            or comparison.get("stderr_sha256") != stderr.get("sha256")
+            or comparison.get("semantic_stdout_sha256")
+            != stdout.get("sha256")
+        ):
+            failures.append(f"forced_midscan_{arm}_evidence_mismatch")
+        if result.get("status") != 0:
+            failures.append(f"forced_midscan_{arm}_did_not_match")
+        if stdout != expected_stdout:
+            failures.append(f"forced_midscan_{arm}_unexpected_stdout")
+        if stderr != expected_stderr:
+            failures.append(f"forced_midscan_{arm}_unexpected_stderr")
+    if gate.get("exact_normal_background") != normal_background:
+        failures.append("forced_midscan_normal_background_evidence_mismatch")
+    if gate.get("exact_stock_normal") != stock_normal:
+        failures.append("forced_midscan_stock_normal_evidence_mismatch")
+    if not normal_background:
+        failures.append("normal_background_output_mismatch")
+    if not stock_normal:
+        failures.append("stock_normal_output_mismatch")
+    if isinstance(receipt, Mapping):
+        expected = {
+            "outcome": "ready",
+            "total_file_attempts": 1,
+            "candidate_stock_files": 1,
+            "candidate_fre_aot_files": 1,
+            "candidate_mixed_engine_files": 1,
+            "candidate_midscan_cutover_files": 1,
+            "first_candidate_midscan_cutover_file_ordinal": 1,
+        }
+        for field, value in expected.items():
+            if receipt.get(field) != value:
+                failures.append(f"forced_midscan_{field}_mismatch")
+        for field in (
+            "candidate_stock_windows",
+            "candidate_fre_aot_windows",
+            "candidate_stock_window_bytes",
+            "candidate_fre_aot_window_bytes",
+        ):
+            value = receipt.get(field)
+            if not isinstance(value, int) or value <= 0:
+                failures.append(f"forced_midscan_{field}_not_positive")
+        committed = receipt.get(
+            "first_candidate_midscan_cutover_stock_committed_bytes"
+        )
+        if not isinstance(committed, int) or not (
+            FORCED_MIDSCAN_STOCK_BYTES
+            <= committed
+            < FORCED_MIDSCAN_FILE_BYTES
+        ):
+            failures.append("forced_midscan_committed_prefix_out_of_range")
+    return sorted(set(failures))
 
 
 def probe_receipt_failures(
@@ -1167,6 +1594,25 @@ def distribution(values: Sequence[float]) -> dict[str, float] | None:
     }
 
 
+def nonnegative_integer_distribution(
+    values: Sequence[int],
+) -> dict[str, int | float] | None:
+    if not values:
+        return None
+    as_float = [float(value) for value in values]
+    return {
+        "count": len(values),
+        "total": sum(values),
+        "min": min(values),
+        "p10": percentile(as_float, 0.10),
+        "p25": percentile(as_float, 0.25),
+        "median": median(values),
+        "p75": percentile(as_float, 0.75),
+        "p90": percentile(as_float, 0.90),
+        "max": max(values),
+    }
+
+
 def aggregate_observations(
     observations: Sequence[Mapping[str, Any]],
     cases: Mapping[str, QueryCase],
@@ -1187,6 +1633,20 @@ def aggregate_observations(
     host_feature_bits = Counter()
     effective_feature_bits = Counter()
     runtime_helpers = Counter()
+    compiled_output_contracts = Counter()
+    compiled_entry_abis = Counter()
+    compiled_state_sources = Counter()
+    compiled_reverse_start_recovery = Counter()
+    compiled_state_reporting = Counter()
+    candidate_discovery_totals = {
+        field: 0 for field in CANDIDATE_DISCOVERY_COUNTER_FIELDS
+    }
+    stock_work_totals = {field: 0 for field in STOCK_WORK_COUNTER_FIELDS}
+    first_candidate_midscan_cutovers = {
+        field: [] for field in FIRST_CANDIDATE_MIDSCAN_CUTOVER_FIELDS
+    }
+    compiled_forward_states = []
+    compiled_reverse_states = []
     hits = Counter()
     compile_ns = []
     publish_ns = []
@@ -1225,6 +1685,68 @@ def aggregate_observations(
                 else "not_required" if receipt.get("runtime_helper_required") is False
                 else "unreported"
             ] += 1
+            compiled_output_contracts[
+                str(receipt.get("compiled_output_contract", "unreported"))
+            ] += 1
+            compiled_entry_abis[
+                str(receipt.get("compiled_entry_abi", "unreported"))
+            ] += 1
+            compiled_state_sources[
+                str(receipt.get("compiled_state_source", "unreported"))
+            ] += 1
+            recovery = receipt.get("compiled_reverse_start_recovery")
+            compiled_reverse_start_recovery[
+                "present" if recovery is True
+                else "absent" if recovery is False
+                else "unreported"
+            ] += 1
+            for field in CANDIDATE_DISCOVERY_COUNTER_FIELDS:
+                value = receipt.get(field)
+                if (
+                    isinstance(value, int)
+                    and not isinstance(value, bool)
+                    and value >= 0
+                ):
+                    candidate_discovery_totals[field] += value
+            for field in STOCK_WORK_COUNTER_FIELDS:
+                value = receipt.get(field)
+                if (
+                    isinstance(value, int)
+                    and not isinstance(value, bool)
+                    and value >= 0
+                ):
+                    stock_work_totals[field] += value
+            for field in FIRST_CANDIDATE_MIDSCAN_CUTOVER_FIELDS:
+                value = receipt.get(field)
+                if (
+                    isinstance(value, int)
+                    and not isinstance(value, bool)
+                    and value >= 0
+                ):
+                    first_candidate_midscan_cutovers[field].append(value)
+            forward_states = receipt.get("compiled_forward_states")
+            reverse_states = receipt.get("compiled_reverse_states")
+            if (
+                isinstance(forward_states, int)
+                and not isinstance(forward_states, bool)
+                and forward_states >= 0
+            ):
+                compiled_forward_states.append(forward_states)
+            if (
+                isinstance(reverse_states, int)
+                and not isinstance(reverse_states, bool)
+                and reverse_states >= 0
+            ):
+                compiled_reverse_states.append(reverse_states)
+            compiler_engine = receipt.get("compiler_engine")
+            if isinstance(forward_states, int) and isinstance(
+                reverse_states, int
+            ):
+                compiled_state_reporting["complete_machine_reported"] += 1
+            elif compiler_engine in KNOWN_COMPILER_ENGINES:
+                compiled_state_reporting["no_complete_machine_report"] += 1
+            else:
+                compiled_state_reporting["not_compiled"] += 1
         normal = row["normal"]
         hits["matched" if normal["status"] == 0 else "no_match" if normal["status"] == 1 else "error"] += 1
         if receipt and receipt.get("outcome") == "ready":
@@ -1240,6 +1762,19 @@ def aggregate_observations(
         "background_outcomes": dict(sorted(outcomes.items())),
         "decline_classes": dict(sorted(declines.items())),
         "routing": dict(sorted(routes.items())),
+        "candidate_discovery_accounting": {
+            **candidate_discovery_totals,
+            "receipts_with_first_candidate_midscan_cutover": len(
+                first_candidate_midscan_cutovers[
+                    "first_candidate_midscan_cutover_file_ordinal"
+                ]
+            ),
+            **{
+                field: nonnegative_integer_distribution(values)
+                for field, values in first_candidate_midscan_cutovers.items()
+            },
+        },
+        "stock_matcher_work_accounting": stock_work_totals,
         "receipt_validation_failures": dict(sorted(receipt_failures.items())),
         "semantic_normalizations": dict(sorted(normalization.items())),
         "receipt_classification": {
@@ -1254,6 +1789,25 @@ def aggregate_observations(
             "compiler_engines": dict(sorted(compiler_engines.items())),
             "engine_selection_reasons": dict(sorted(engine_selection_reasons.items())),
             "start_accelerators": dict(sorted(accelerators.items())),
+            "compiled_output_contracts": dict(
+                sorted(compiled_output_contracts.items())
+            ),
+            "compiled_entry_abis": dict(sorted(compiled_entry_abis.items())),
+            "compiled_state_sources": dict(
+                sorted(compiled_state_sources.items())
+            ),
+            "compiled_reverse_start_recovery": dict(
+                sorted(compiled_reverse_start_recovery.items())
+            ),
+            "compiled_state_reporting": dict(
+                sorted(compiled_state_reporting.items())
+            ),
+            "compiled_forward_states": nonnegative_integer_distribution(
+                compiled_forward_states
+            ),
+            "compiled_reverse_states": nonnegative_integer_distribution(
+                compiled_reverse_states
+            ),
             "publication_stages": dict(sorted(publication_stages.items())),
             "publication_refusal_classes": dict(sorted(publication_refusals.items())),
             "runtime_helpers": dict(sorted(runtime_helpers.items())),
@@ -1429,14 +1983,22 @@ def provenance(
     fre_corpus_source = git_record(args.fre_corpus_repo)
     if not fre_corpus_source["clean"]:
         raise HarnessError("FRE corpus source mirror is dirty")
+    frozen_fre_commit = git_text(
+        args.fre_corpus_repo,
+        ("rev-parse", f"{args.fre_corpus_commit}^{{commit}}"),
+    )
+    frozen_fre_tree = git_text(
+        args.fre_corpus_repo,
+        ("rev-parse", f"{args.fre_corpus_commit}^{{tree}}"),
+    )
     if (
-        fre_corpus_source["commit"] != corpora["fre"]["commit"]
-        or fre_corpus_source["tree"] != corpora["fre"]["tree"]
+        frozen_fre_commit != corpora["fre"]["commit"]
+        or frozen_fre_tree != corpora["fre"]["tree"]
     ):
         raise HarnessError("FRE source mirror does not match corpus commit")
     fre_dependency = fre_dependency_record(args.candidate_source)
-    if fre_dependency["locked_revision"] != corpora["fre"]["commit"]:
-        raise HarnessError("compiled FRE dependency does not match corpus commit")
+    if fre_dependency["locked_revision"] != fre_corpus_source["commit"]:
+        raise HarnessError("FRE source mirror does not match compiled dependency")
     sve_vl = sve_vector_length_bytes()
     if (
         args.expected_sve_vl_bytes is not None
@@ -1458,7 +2020,10 @@ def provenance(
         "fre_dependency": fre_dependency,
         "fre_corpus_source_mirror": {
             **fre_corpus_source,
-            "role": "clean source mirror used for the FRE benchmark corpus",
+            "role": (
+                "clean dependency mirror and object source for the frozen "
+                "FRE corpus archive"
+            ),
         },
         "binaries": {"candidate": candidate, "stock": stock},
         "corpora": corpora,
@@ -1733,12 +2298,32 @@ def run_probe(args: argparse.Namespace) -> None:
     with tempfile.TemporaryDirectory(prefix="rg-fre-representative-") as text:
         temporary = Path(text)
         corpus_paths, corpus_records = create_corpora(args, temporary)
+        forced_midscan_path = temporary / "forced-midscan-v1.txt"
+        create_forced_midscan_corpus(forced_midscan_path)
+        forced_midscan_config = {
+            "fixture": "bounded-repeat-two-markers-v1",
+            "file_bytes": FORCED_MIDSCAN_FILE_BYTES,
+            "line_bytes": FORCED_MIDSCAN_LINE_BYTES,
+            "marker_matches": 2,
+            "test_min_stock_bytes": FORCED_MIDSCAN_STOCK_BYTES,
+            "corpus_sha256": sha256_file(forced_midscan_path),
+        }
         run_panels = panels_for(corpus_paths)
         prov = provenance(args, corpus_records, selection_record)
         workload_start = load_snapshot()
         private_rows = []
+        forced_midscan_gates = []
         public_panels: dict[str, Any] = {}
         for cpu_profile in args.cpu_profile:
+            print(f"probe {cpu_profile} forced-midscan", flush=True)
+            forced_midscan_gates.append(run_forced_midscan_gate(
+                corpus=forced_midscan_path,
+                candidate=args.binary,
+                stock=args.stock_binary,
+                cwd=args.candidate_source,
+                cpu_profile=cpu_profile,
+                timeout_seconds=args.timeout_seconds,
+            ))
             for panel in run_panels:
                 cases = oot if panel.id == "ripgrep-default-output" else all_cases
                 rows = []
@@ -1800,6 +2385,8 @@ def run_probe(args: argparse.Namespace) -> None:
             "end": workload_end,
         },
         "rows": private_rows,
+        "forced_midscan_config": forced_midscan_config,
+        "forced_midscan_gates": forced_midscan_gates,
     }
     public = {
         "schema": f"{RESULT_SCHEMA}.probe.public.v1",
@@ -1812,6 +2399,10 @@ def run_probe(args: argparse.Namespace) -> None:
             "fresh_processes": True,
             "filesystem_cache_state": "cache-hot/uncontrolled after one archive materialization; no eviction between repeated scans",
             "timing_role": "classification/correctness probe only; not formal timing",
+            "forced_midscan_gate": (
+                "deterministic correctness-only publication barrier; never "
+                "used by timed invocations"
+            ),
             "cpu_profiles": args.cpu_profile,
             "oot_end_unix": OOT_END_UNIX,
             "oot_expected_counts": EXPECTED_OOT,
@@ -1828,6 +2419,10 @@ def run_probe(args: argparse.Namespace) -> None:
         "cohorts": {"oot": cohort_profile(oot), "wider": cohort_profile(wider)},
         "panels": public_panels,
         "target_validation_matrix": target_matrix,
+        "forced_midscan_config": forced_midscan_config,
+        "forced_midscan_gate": forced_midscan_gate_summary(
+            forced_midscan_gates
+        ),
         "post_run_private_freeze_verified": (
             args.selection_manifest_input is None
         ),
@@ -2022,6 +2617,38 @@ def validate_probe(
     private_probe = json.loads(args.probe_private.read_text())
     expected_manifest = case_manifest([*oot, *wider])
     method = probe.get("method", {})
+    forced_config = private_probe.get("forced_midscan_config")
+    expected_forced_config = {
+        "fixture": "bounded-repeat-two-markers-v1",
+        "file_bytes": FORCED_MIDSCAN_FILE_BYTES,
+        "line_bytes": FORCED_MIDSCAN_LINE_BYTES,
+        "marker_matches": 2,
+        "test_min_stock_bytes": FORCED_MIDSCAN_STOCK_BYTES,
+    }
+    if not isinstance(forced_config, Mapping) or any(
+        forced_config.get(field) != value
+        for field, value in expected_forced_config.items()
+    ) or forced_config.get("corpus_sha256") != FORCED_MIDSCAN_CORPUS_SHA256:
+        raise HarnessError("forced mid-scan configuration is invalid")
+    private_forced_gates = private_probe.get("forced_midscan_gates")
+    if not isinstance(private_forced_gates, list):
+        raise HarnessError("forced mid-scan gates are missing")
+    forced_by_profile = {}
+    for gate in private_forced_gates:
+        if not isinstance(gate, Mapping):
+            raise HarnessError("forced mid-scan gate is not an object")
+        profile = gate.get("cpu_profile")
+        if profile not in args.cpu_profile or profile in forced_by_profile:
+            raise HarnessError("forced mid-scan profile matrix is invalid")
+        recomputed_failures = validate_forced_midscan_gate_record(
+            gate, str(profile)
+        )
+        if gate.get("failures") != recomputed_failures:
+            raise HarnessError("forced mid-scan gate evidence disagrees")
+        forced_by_profile[profile] = gate
+    if set(forced_by_profile) != set(args.cpu_profile):
+        raise HarnessError("forced mid-scan profile matrix is incomplete")
+    forced_summary = forced_midscan_gate_summary(private_forced_gates)
     recomputed_panels, computed_target_matrix = (
         validate_and_aggregate_private_probe(
             private_probe,
@@ -2060,6 +2687,9 @@ def validate_probe(
         or probe.get("target_validation_matrix") != computed_target_matrix
         or private_probe.get("target_validation_matrix")
         != computed_target_matrix
+        or probe.get("forced_midscan_config") != forced_config
+        or probe.get("forced_midscan_gate") != forced_summary
+        or forced_summary.get("all_passed") is not True
         or computed_target_matrix.get("qualified") is not True
     ):
         raise HarnessError("probe does not match the benchmark inputs")

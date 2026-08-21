@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import os
 from pathlib import Path
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 
 HERE = Path(__file__).resolve().parent
@@ -20,7 +22,140 @@ sys.modules[SPEC.name] = HARNESS
 SPEC.loader.exec_module(HARNESS)
 
 
+def receipt_fixture(**overrides):
+    receipt = {
+        "schema": HARNESS.RECEIPT_SCHEMA,
+        "outcome": "declined",
+        "decline_reason": "unsupported profile",
+        "publication_stage": "compile",
+        "publication_refusal_class": "profile_fixed_strings",
+        "direct_native_only": True,
+        "external_linker_invocations": 0,
+        "target_feature_profile": "auto",
+        "requested_target_feature_bits": 7 << 32,
+        "host_target_feature_bits": 7 << 32,
+        "target_feature_bits": 7 << 32,
+        "compiler_engine": None,
+        "engine_selection_reason": None,
+        "start_accelerator": None,
+        "compiled_output_contract": None,
+        "compiled_entry_abi": None,
+        "compiled_state_source": None,
+        "compiled_forward_states": None,
+        "compiled_reverse_states": None,
+        "compiled_reverse_start_recovery": None,
+        "runtime_helper_required": False,
+        "published_code_bytes": None,
+        "published_read_only_data_bytes": None,
+        "published_total_mapped_bytes": None,
+        "ready_ns_since_start": None,
+        "compile_ns": 0,
+        "publish_ns": 0,
+        "prepare_ns": 0,
+        "total_file_attempts": 0,
+        "native_call_failures": 0,
+        "test_min_stock_bytes": 0,
+        "first_candidate_midscan_cutover_file_ordinal": None,
+        "first_candidate_midscan_cutover_ns_since_start": None,
+        "first_candidate_midscan_cutover_stock_committed_bytes": None,
+    }
+    for field in (
+        *HARNESS.CANDIDATE_DISCOVERY_COUNTER_FIELDS,
+        *HARNESS.STOCK_WORK_COUNTER_FIELDS,
+    ):
+        receipt[field] = 0
+    receipt.update(overrides)
+    return receipt
+
+
+def ready_receipt(**overrides):
+    receipt = receipt_fixture(
+        outcome="ready",
+        decline_reason=None,
+        publication_stage="published",
+        publication_refusal_class=None,
+        compiler_engine="ordered_dfa",
+        engine_selection_reason="complete_dfa",
+        start_accelerator="aarch64_sve2",
+        compiled_output_contract=HARNESS.COMPILED_OUTPUT_CONTRACT,
+        compiled_entry_abi=HARNESS.COMPILED_ENTRY_ABI,
+        compiled_state_source="semantic_dfa",
+        compiled_forward_states=17,
+        compiled_reverse_states=0,
+        compiled_reverse_start_recovery=False,
+        published_code_bytes=4096,
+        published_read_only_data_bytes=1024,
+        published_total_mapped_bytes=8192,
+        ready_ns_since_start=10,
+        compile_ns=5,
+        publish_ns=2,
+        prepare_ns=7,
+    )
+    receipt.update(overrides)
+    return receipt
+
+
 class HarnessTests(unittest.TestCase):
+    def test_run_once_scrubs_control_environment(self) -> None:
+        with tempfile.TemporaryDirectory() as text:
+            root = Path(text)
+            executable = root / "inspect-env"
+            executable.write_text(
+                "#!/bin/sh\n"
+                "printf '%s|%s|%s|%s\\n' "
+                '"${RG_FRE_AOT_BACKGROUND_RECEIPT-unset}" '
+                '"${RG_FRE_AOT_BACKGROUND_TEST_MIN_STOCK_BYTES-unset}" '
+                '"${RG_FRE_AOT_BACKGROUND_CPU_PROFILE-unset}" '
+                '"${RIPGREP_CONFIG_PATH-unset}"\n'
+            )
+            executable.chmod(0o700)
+            inherited = {
+                HARNESS.RECEIPT_ENV: "inherited-receipt",
+                HARNESS.CORRECTNESS_GATE_ENV: "inherited-gate",
+                HARNESS.CPU_PROFILE_ENV: "inherited-profile",
+                "RIPGREP_CONFIG_PATH": "inherited-config",
+            }
+            with mock.patch.dict(os.environ, inherited):
+                normal = HARNESS.run_once(
+                    binary=executable,
+                    args=[],
+                    cwd=root,
+                    background=False,
+                    capture_receipt=False,
+                    cpu_profile="auto",
+                    timeout_seconds=5.0,
+                    test_min_stock_bytes=123,
+                )
+                background = HARNESS.run_once(
+                    binary=executable,
+                    args=[],
+                    cwd=root,
+                    background=True,
+                    capture_receipt=False,
+                    cpu_profile="sve",
+                    timeout_seconds=5.0,
+                    test_min_stock_bytes=123,
+                )
+        self.assertEqual(b"unset|unset|unset|unset\n", normal["stdout_raw"])
+        self.assertEqual(b"unset|123|sve|unset\n", background["stdout_raw"])
+
+    def test_non_object_receipt_is_rejected_without_crashing(self) -> None:
+        self.assertEqual(
+            ["receipt_not_object"], HARNESS.validate_receipt([], "auto")
+        )
+        case = HARNESS.QueryCase("q", "test", "raw", 1, None, {})
+        row = {
+            "private_id": "q",
+            "exact_normal_background": True,
+            "exact_stock_normal": True,
+            "receipt_failures": ["malformed_receipt"],
+            "normalization": [],
+            "normal": {"status": 1},
+            "background": {"timed_out": False, "receipt": None},
+        }
+        aggregate = HARNESS.aggregate_observations([row], {"q": case})
+        self.assertEqual({"no_receipt": 1}, aggregate["routing"])
+
     def test_public_result_binds_exact_private_bytes(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -90,27 +225,7 @@ class HarnessTests(unittest.TestCase):
         self.assertIsNone(summary["paired_ratio_median"])
 
     def test_requested_profile_is_checked_when_structured_field_exists(self) -> None:
-        receipt = {
-            "schema": HARNESS.RECEIPT_SCHEMA,
-            "outcome": "declined",
-            "publication_stage": "compile",
-            "publication_refusal_class": "profile_fixed_strings",
-            "direct_native_only": True,
-            "external_linker_invocations": 0,
-            "target_feature_profile": "auto",
-            "requested_target_feature_bits": 7 << 32,
-            "host_target_feature_bits": 7 << 32,
-            "target_feature_bits": 7 << 32,
-            "runtime_helper_required": False,
-        }
-        for field in (
-            "compile_ns", "publish_ns", "prepare_ns", "stock_files",
-            "fre_aot_files", "mixed_engine_files", "total_file_attempts",
-            "stock_windows", "fre_aot_windows", "stock_window_bytes",
-            "stock_committed_bytes", "fre_aot_window_bytes",
-            "native_call_failures", "test_min_stock_bytes",
-        ):
-            receipt[field] = 0
+        receipt = receipt_fixture()
         self.assertIn(
             "target_profile_mismatch",
             HARNESS.validate_receipt(receipt, "sve"),
@@ -135,27 +250,14 @@ class HarnessTests(unittest.TestCase):
         self.assertEqual([], HARNESS.validate_receipt(receipt, "sve"))
 
     def test_unfinished_pre_detection_receipt_allows_missing_host(self) -> None:
-        receipt = {
-            "schema": HARNESS.RECEIPT_SCHEMA,
-            "outcome": "unfinished",
-            "publication_stage": "not_started",
-            "publication_refusal_class": None,
-            "direct_native_only": True,
-            "external_linker_invocations": 0,
-            "target_feature_profile": "auto",
-            "requested_target_feature_bits": None,
-            "host_target_feature_bits": None,
-            "target_feature_bits": None,
-            "runtime_helper_required": False,
-        }
-        for field in (
-            "compile_ns", "publish_ns", "prepare_ns", "stock_files",
-            "fre_aot_files", "mixed_engine_files", "total_file_attempts",
-            "stock_windows", "fre_aot_windows", "stock_window_bytes",
-            "stock_committed_bytes", "fre_aot_window_bytes",
-            "native_call_failures", "test_min_stock_bytes",
-        ):
-            receipt[field] = 0
+        receipt = receipt_fixture(
+            outcome="unfinished",
+            publication_stage="not_started",
+            publication_refusal_class=None,
+            requested_target_feature_bits=None,
+            host_target_feature_bits=None,
+            target_feature_bits=None,
+        )
         self.assertEqual([], HARNESS.validate_receipt(receipt, "auto"))
         receipt.update({
             "outcome": "declined",
@@ -164,6 +266,366 @@ class HarnessTests(unittest.TestCase):
         })
         failures = HARNESS.validate_receipt(receipt, "auto")
         self.assertIn("missing_host_target_feature_bits", failures)
+
+    def test_v4_receipt_requires_candidate_discovery_fields(self) -> None:
+        receipt = ready_receipt()
+        self.assertEqual([], HARNESS.validate_receipt(receipt, "auto"))
+
+        receipt["schema"] = "ripgrep.fre-aot-background.v3"
+        self.assertIn("schema", HARNESS.validate_receipt(receipt, "auto"))
+
+        receipt = ready_receipt(stock_windows=1)
+        del receipt["candidate_stock_windows"]
+        self.assertIn(
+            "invalid_candidate_stock_windows",
+            HARNESS.validate_receipt(receipt, "auto"),
+        )
+
+    def test_compiled_selected_end_contract_is_validated(self) -> None:
+        changes_and_failures = (
+            (
+                {"compiled_output_contract": "span"},
+                "invalid_compiled_output_contract",
+            ),
+            (
+                {"compiled_entry_abi": "span_search_v1"},
+                "invalid_compiled_entry_abi",
+            ),
+            (
+                {"compiled_forward_states": -1},
+                "invalid_compiled_forward_states",
+            ),
+            (
+                {"compiled_forward_states": 0},
+                "compiled_forward_states_zero",
+            ),
+            (
+                {"compiled_reverse_states": None},
+                "missing_compiled_reverse_states",
+            ),
+            (
+                {"compiled_reverse_start_recovery": True},
+                "selected_end_reverse_start_recovery_present",
+            ),
+        )
+        for changes, failure in changes_and_failures:
+            with self.subTest(failure=failure):
+                self.assertIn(
+                    failure,
+                    HARNESS.validate_receipt(
+                        ready_receipt(**changes), "auto"
+                    ),
+                )
+
+        nfa = ready_receipt(
+            compiler_engine="ordered_nfa",
+            engine_selection_reason="determinization_resource_limit",
+            compiled_forward_states=None,
+            compiled_reverse_states=None,
+            compiled_state_source=None,
+        )
+        self.assertEqual([], HARNESS.validate_receipt(nfa, "auto"))
+        nfa["compiled_forward_states"] = 1
+        self.assertIn(
+            "incomplete_compiled_state_geometry",
+            HARNESS.validate_receipt(nfa, "auto"),
+        )
+        nfa["compiled_reverse_states"] = 0
+        nfa["compiled_state_source"] = "slow_aot"
+        self.assertEqual([], HARNESS.validate_receipt(nfa, "auto"))
+
+        finite = ready_receipt(
+            compiled_state_source="ordered_finite_language",
+            compiled_forward_states=9,
+            compiled_reverse_states=0,
+        )
+        self.assertEqual([], HARNESS.validate_receipt(finite, "auto"))
+
+        contextual = ready_receipt(
+            compiler_engine="ordered_context_dfa",
+            engine_selection_reason="complete_context_dfa",
+            compiled_state_source="context_determinization",
+            compiled_forward_states=11,
+            compiled_reverse_states=7,
+            compiled_reverse_start_recovery=False,
+        )
+        self.assertEqual([], HARNESS.validate_receipt(contextual, "auto"))
+
+    def test_precompile_receipt_requires_nullable_compiled_fields(self) -> None:
+        receipt = receipt_fixture()
+        self.assertEqual([], HARNESS.validate_receipt(receipt, "auto"))
+        del receipt["compiled_entry_abi"]
+        self.assertIn(
+            "missing_compiled_entry_abi",
+            HARNESS.validate_receipt(receipt, "auto"),
+        )
+
+    def test_first_candidate_midscan_cutover_is_strict(self) -> None:
+        receipt = ready_receipt(
+            total_file_attempts=2,
+            candidate_stock_files=1,
+            candidate_fre_aot_files=1,
+            candidate_mixed_engine_files=1,
+            candidate_midscan_cutover_files=1,
+            candidate_stock_windows=1,
+            candidate_fre_aot_windows=1,
+            candidate_stock_window_bytes=1024,
+            candidate_stock_committed_bytes=1024,
+            candidate_fre_aot_window_bytes=1024,
+            first_candidate_midscan_cutover_file_ordinal=2,
+            first_candidate_midscan_cutover_ns_since_start=50,
+            first_candidate_midscan_cutover_stock_committed_bytes=1024,
+        )
+        self.assertEqual([], HARNESS.validate_receipt(receipt, "auto"))
+        receipt["first_candidate_midscan_cutover_ns_since_start"] = None
+        self.assertIn(
+            "incomplete_first_candidate_midscan_cutover",
+            HARNESS.validate_receipt(receipt, "auto"),
+        )
+        del receipt["first_candidate_midscan_cutover_file_ordinal"]
+        failures = HARNESS.validate_receipt(receipt, "auto")
+        self.assertIn(
+            "missing_first_candidate_midscan_cutover_file_ordinal", failures
+        )
+
+    def test_candidate_accounting_closure_is_enforced(self) -> None:
+        impossible = ready_receipt(
+            total_file_attempts=2,
+            candidate_mixed_engine_files=1,
+            candidate_midscan_cutover_files=1,
+        )
+        failures = HARNESS.validate_receipt(impossible, "auto")
+        self.assertIn("candidate_mixed_file_count_impossible", failures)
+        self.assertIn("candidate_midscan_first_witness_mismatch", failures)
+
+        overcommitted = ready_receipt(
+            total_file_attempts=1,
+            candidate_stock_files=1,
+            candidate_stock_windows=1,
+            candidate_stock_window_bytes=8,
+            candidate_stock_committed_bytes=9,
+        )
+        self.assertIn(
+            "candidate_committed_bytes_exceed_stock_windows",
+            HARNESS.validate_receipt(overcommitted, "auto"),
+        )
+
+        zero_byte_aot = ready_receipt(
+            total_file_attempts=1,
+            candidate_fre_aot_files=1,
+            candidate_fre_aot_windows=1,
+            candidate_fre_aot_window_bytes=0,
+        )
+        self.assertIn(
+            "candidate_aot_window_byte_mismatch",
+            HARNESS.validate_receipt(zero_byte_aot, "auto"),
+        )
+
+    def test_forced_midscan_gate_is_recomputed_from_evidence(self) -> None:
+        receipt = ready_receipt(
+            test_min_stock_bytes=HARNESS.FORCED_MIDSCAN_STOCK_BYTES,
+            total_file_attempts=1,
+            candidate_stock_files=1,
+            candidate_fre_aot_files=1,
+            candidate_mixed_engine_files=1,
+            candidate_midscan_cutover_files=1,
+            candidate_stock_windows=4,
+            candidate_fre_aot_windows=1,
+            candidate_stock_window_bytes=5 * 1024 * 1024,
+            candidate_stock_committed_bytes=4 * 1024 * 1024,
+            candidate_fre_aot_window_bytes=12 * 1024 * 1024,
+            first_candidate_midscan_cutover_file_ordinal=1,
+            first_candidate_midscan_cutover_ns_since_start=20,
+            first_candidate_midscan_cutover_stock_committed_bytes=(
+                HARNESS.FORCED_MIDSCAN_STOCK_BYTES
+            ),
+        )
+        expected_stdout = HARNESS.output_record(
+            HARNESS.forced_midscan_expected_stdout()
+        )
+        expected_stderr = HARNESS.output_record(b"")
+        comparison = {
+            "status": 0,
+            "stderr_sha256": expected_stderr["sha256"],
+            "semantic_stdout_sha256": expected_stdout["sha256"],
+        }
+        arm = {
+            "status": 0,
+            "stdout": expected_stdout,
+            "stderr": expected_stderr,
+        }
+        gate = {
+            "cpu_profile": "auto",
+            "exact_normal_background": True,
+            "exact_stock_normal": True,
+            "comparison_records": {
+                "normal": comparison,
+                "background": comparison,
+                "stock": comparison,
+            },
+            "normal": dict(arm),
+            "background": {
+                **arm,
+                "receipt": receipt,
+                "receipt_parse_error": False,
+                "unexpected_temporary_artifacts": 0,
+            },
+            "stock": dict(arm),
+        }
+        self.assertEqual(
+            [], HARNESS.validate_forced_midscan_gate_record(gate, "auto")
+        )
+        gate["normal"]["status"] = 1
+        self.assertIn(
+            "forced_midscan_normal_evidence_mismatch",
+            HARNESS.validate_forced_midscan_gate_record(gate, "auto"),
+        )
+        gate["normal"]["status"] = 0
+        gate["normal"]["stdout"] = HARNESS.output_record(b"wrong\n")
+        failures = HARNESS.validate_forced_midscan_gate_record(gate, "auto")
+        self.assertIn("forced_midscan_normal_evidence_mismatch", failures)
+        self.assertIn("forced_midscan_normal_unexpected_stdout", failures)
+
+    def test_ready_receipt_requires_publication_timestamp(self) -> None:
+        receipt = ready_receipt(ready_ns_since_start=None)
+        failures = HARNESS.validate_receipt(receipt, "auto")
+        self.assertIn("ready_missing_ready_ns_since_start", failures)
+
+        receipt = ready_receipt(ready_ns_since_start="late")
+        failures = HARNESS.validate_receipt(receipt, "auto")
+        self.assertIn("invalid_ready_ns_since_start", failures)
+
+    def test_routing_uses_only_candidate_discovery_work(self) -> None:
+        receipt = ready_receipt(
+            total_file_attempts=2,
+            candidate_fre_aot_files=1,
+            candidate_fre_aot_windows=1,
+            stock_span_calls=3,
+            stock_span_bytes=300,
+            stock_capture_calls=2,
+            stock_capture_bytes=200,
+        )
+        self.assertEqual("aot_only", HARNESS.route_class(receipt))
+        receipt.update({
+            "candidate_stock_files": 1,
+            "candidate_stock_windows": 1,
+        })
+        self.assertEqual("cross_file_split", HARNESS.route_class(receipt))
+        receipt["candidate_mixed_engine_files"] = 1
+        self.assertEqual(
+            "same_file_operation_mix", HARNESS.route_class(receipt)
+        )
+        receipt.update({
+            "candidate_midscan_cutover_files": 1,
+            "candidate_stock_window_bytes": 3,
+            "candidate_stock_committed_bytes": 3,
+            "first_candidate_midscan_cutover_file_ordinal": 1,
+            "first_candidate_midscan_cutover_ns_since_start": 5,
+            "first_candidate_midscan_cutover_stock_committed_bytes": 3,
+        })
+        self.assertEqual(
+            "same_file_midscan_cutover", HARNESS.route_class(receipt)
+        )
+
+        stock_work_only = ready_receipt(stock_span_calls=1, stock_span_bytes=3)
+        self.assertEqual(
+            "no_candidate_windows", HARNESS.route_class(stock_work_only)
+        )
+
+    def test_v4_accounting_is_aggregated_separately(self) -> None:
+        cases = {
+            "dfa": HARNESS.QueryCase("dfa", "test", "raw", 1, None, {}),
+            "nfa": HARNESS.QueryCase("nfa", "test", "raw", 2, None, {}),
+        }
+
+        def row(private_id, receipt):
+            return {
+                "private_id": private_id,
+                "exact_normal_background": True,
+                "exact_stock_normal": True,
+                "receipt_failures": [],
+                "normalization": [],
+                "normal": {"status": 0},
+                "background": {
+                    "timed_out": False,
+                    "receipt": receipt,
+                },
+            }
+
+        dfa = ready_receipt(
+            candidate_stock_files=1,
+            candidate_fre_aot_files=1,
+            candidate_mixed_engine_files=1,
+            candidate_midscan_cutover_files=1,
+            total_file_attempts=1,
+            candidate_stock_windows=2,
+            candidate_fre_aot_windows=3,
+            candidate_stock_window_bytes=200,
+            candidate_stock_committed_bytes=150,
+            candidate_fre_aot_window_bytes=300,
+            stock_span_calls=4,
+            stock_span_bytes=40,
+            first_candidate_midscan_cutover_file_ordinal=1,
+            first_candidate_midscan_cutover_ns_since_start=5,
+            first_candidate_midscan_cutover_stock_committed_bytes=150,
+        )
+        nfa = ready_receipt(
+            compiler_engine="ordered_nfa",
+            engine_selection_reason="determinization_resource_limit",
+            compiled_forward_states=None,
+            compiled_reverse_states=None,
+            compiled_state_source=None,
+            total_file_attempts=1,
+            candidate_fre_aot_files=1,
+            candidate_fre_aot_windows=2,
+            candidate_fre_aot_window_bytes=250,
+            stock_capture_calls=2,
+            stock_capture_bytes=20,
+        )
+        aggregate = HARNESS.aggregate_observations(
+            [row("dfa", dfa), row("nfa", nfa)], cases
+        )
+        self.assertEqual(
+            {"aot_only": 1, "same_file_midscan_cutover": 1},
+            aggregate["routing"],
+        )
+        self.assertEqual(
+            5,
+            aggregate["candidate_discovery_accounting"][
+                "candidate_fre_aot_windows"
+            ],
+        )
+        self.assertEqual(
+            1,
+            aggregate["candidate_discovery_accounting"][
+                "receipts_with_first_candidate_midscan_cutover"
+            ],
+        )
+        self.assertEqual(
+            4,
+            aggregate["stock_matcher_work_accounting"]["stock_span_calls"],
+        )
+        self.assertEqual(
+            2,
+            aggregate["stock_matcher_work_accounting"][
+                "stock_capture_calls"
+            ],
+        )
+        classification = aggregate["receipt_classification"]
+        self.assertEqual(
+            {HARNESS.COMPILED_OUTPUT_CONTRACT: 2},
+            classification["compiled_output_contracts"],
+        )
+        self.assertEqual(
+            {
+                "complete_machine_reported": 1,
+                "no_complete_machine_report": 1,
+            },
+            classification["compiled_state_reporting"],
+        )
+        self.assertEqual(
+            17, classification["compiled_forward_states"]["total"]
+        )
 
     def test_matrix_requires_one_qualified_receipt_per_profile(self) -> None:
         host = 7 << 32
