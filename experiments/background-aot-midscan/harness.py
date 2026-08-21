@@ -364,6 +364,10 @@ def command_record(command: Sequence[str]) -> str:
     ).stdout.strip()
 
 
+def load_average_record() -> list[float]:
+    return list(os.getloadavg())
+
+
 def fre_dependency_record() -> dict[str, Any]:
     cargo_toml = REPO / "Cargo.toml"
     matcher = re.compile(
@@ -829,6 +833,7 @@ def run_benchmark(args: argparse.Namespace) -> None:
     verify_corpus(manifest_path, manifest)
     provenance = common_header(args, manifest_path, manifest)
     validate_provenance(provenance, "timing")
+    run_load_start = load_average_record()
     checkpoint_path = args.output.with_name(args.output.name + ".partial")
     if checkpoint_path.exists():
         raise SystemExit(f"refusing to replace checkpoint: {checkpoint_path}")
@@ -844,6 +849,7 @@ def run_benchmark(args: argparse.Namespace) -> None:
 
     rows = []
     for phase, cell in enumerate(cells):
+        cell_load_start = load_average_record()
         print(f"{cell['id']}: warmup", flush=True)
         for pair_index in range(args.warmup_pairs):
             run_pair(
@@ -868,10 +874,13 @@ def run_benchmark(args: argparse.Namespace) -> None:
             for pair_index in range(args.pairs)
         ]
         summary = pair_summary(samples)
+        cell_load_end = load_average_record()
         rows.append(
             {
                 **cell,
                 "args": list(cell["args"]),
+                "load_average_start": cell_load_start,
+                "load_average_end": cell_load_end,
                 "summary": summary,
                 "receipt_summary": receipt_summary(samples),
                 "samples": samples,
@@ -883,6 +892,7 @@ def run_benchmark(args: argparse.Namespace) -> None:
                 "schema": f"{RESULT_SCHEMA}.benchmark.partial.v1",
                 **provenance,
                 "started_unix": args.started_unix,
+                "load_average_start": run_load_start,
                 "completed_cells": rows,
             },
         )
@@ -921,6 +931,8 @@ def run_benchmark(args: argparse.Namespace) -> None:
             **provenance,
             "started_unix": args.started_unix,
             "finished_unix": time.time(),
+            "load_average_start": run_load_start,
+            "load_average_end": load_average_record(),
             "post_run_corpus_verified": True,
             "post_run_provenance_verified": True,
             "cells": rows,
