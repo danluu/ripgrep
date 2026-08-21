@@ -1,7 +1,8 @@
 # Normal ripgrep with background FRE AOT cutover
 
-> Status: protocol and harness implemented; no benchmark numbers have been
-> collected yet.
+> Status: implementation and correctness gate complete. One high-load,
+> one-pair-per-cell pilot has been retained as a harness diagnostic; the full
+> paired benchmark has not yet been run.
 
 ## Question
 
@@ -15,6 +16,13 @@ registry, a query batch, or a cross-process cache.
 The primary comparison is the same binary and query with the flag off and on.
 A preserved unmodified upstream binary versus the new binary with the flag off
 is a secondary code-layout/integration control.
+
+This prototype's native publication path is macOS/AArch64-only and invokes
+`/usr/bin/clang` to turn FRE's object into a loadable Mach-O bundle. Other
+platforms asynchronously decline and continue entirely with stock ripgrep.
+The conservative synchronous eligibility gate also declines multiple patterns,
+case-insensitive modes, `-F`, `-w`, `-x`, multiline, CRLF, null-data, and
+no-Unicode searches. Decline is fallback behavior, not a search error.
 
 ## Why the corpus is multi-file
 
@@ -75,10 +83,12 @@ no-match cutover, and early-match cancellation. The tiny one-file checks still
 validate stock/unfinished behavior; they are not presented as active-FRE
 coverage.
 
-Compiler and routing diagnostics never share stdout or stderr. They use a
+The correctness and timing harnesses run without `--debug` or `--trace`, so
+compiler and routing diagnostics do not share stdout or stderr. They use a
 unique create-new path named by `RG_FRE_AOT_BACKGROUND_RECEIPT`. Thus a
 background compiler failure cannot be hidden by excluding diagnostic lines
-from the equality check.
+from the equality check. Explicit ripgrep debug/trace logging can still report
+the route on stderr, as normal for those modes.
 
 ## Receipt gate
 
@@ -90,15 +100,16 @@ Every flagged timing invocation publishes schema
 - cutover ordinal and timestamp exist if and only if an FRE file exists;
 - publication readiness precedes the first cutover;
 - `compile_ns` measures only FRE's in-process `compile(request)` call;
-- `prepare_ns` measures the complete background transaction through object
-  write, link, load, symbol resolution, and publication readiness;
-- each phase duration is zero if that phase did not complete before the exit
-  snapshot; a completed `prepare_ns >= compile_ns`, and a `ready` receipt has
-  a nonzero preparation duration plus a readiness timestamp at least as large
-  as `prepare_ns`;
+- `prepare_ns` measures the preparation-attempt duration through success or
+  early failure; only a `ready` outcome proves object write, link, load, and
+  symbol resolution all completed;
+- each phase duration is zero if that phase did not return before the exit
+  snapshot; a nonzero `prepare_ns >= compile_ns`, and a `ready` receipt has a
+  nonzero preparation duration plus an artifact-ready timestamp at least as
+  large as `prepare_ns`;
 - declined and unfinished runs never report an FRE file;
-- a cutover cell has `ready`, `stock_files > 0`, and `fre_aot_files > 0` on
-  every warmup and measured invocation;
+- the timing matrix retains every valid outcome; actual mixed stock/FRE samples
+  are counted instead of requiring cutover as a harness precondition;
 - the ignore-case control reports `declined` and remains entirely stock.
 
 `ready` with zero FRE files is reported separately as “compiled too late to
@@ -124,9 +135,15 @@ full-preparation, readiness, and cutover offsets to show where that overlap
 occurred. On a short `unfinished` run, the child can exit before preparation
 completes; its wall time includes the background work actually performed up to
 exit, not a hypothetical completed artifact. Any sample with a `ready`
-receipt necessarily completed its entire compile/write/link/load/publication
-transaction inside the measured process lifetime. The only performance
-endpoint is complete child wall time.
+receipt necessarily completed its entire compile/write/link/load transaction
+and made the artifact available inside the measured process lifetime. The only
+performance endpoint is complete child wall time.
+
+An “FRE file” means FRE performs group-zero span and matching-line discovery
+for that file. Ripgrep's stock matcher still owns capture extraction and matcher
+metadata, so replacement and capture output remain governed by stock semantics.
+After promotion, an invalid native status or span fails closed for that call;
+the implementation never swaps routes in the middle of a file.
 
 There is no persistent compiled-query cache. Every flagged sample starts a new
 process and recompiles. Each invocation gets a unique `TMPDIR`; any file or
@@ -215,7 +232,10 @@ every child timing boundary.
 
 ## Results
 
-No timings have been run.
+The full run is pending. A deliberately non-inferential pilot used one warmup
+and one measured pair per cell while the host load was approximately 21--22.
+It existed to exercise the harness and is retained as
+`results/benchmark-pilot.json`; its apparent ratios are not headline results.
 
 | Cell | Normal median | Background median | Normal/background paired median [95%] | Stock/FRE files | Result |
 |---|---:|---:|---:|---:|---|
@@ -233,6 +253,10 @@ No timings have been run.
   expose a different fraction of FRE work.
 - Warm filesystem pages model repeated searches, not cold storage.
 - Background compilation changes CPU allocation and may contend with search.
+- Core FRE compilation can be abandoned before filesystem work starts. Once
+  object writing/link/loading begins, normal shutdown waits to reap Clang and
+  remove the private temporary directory; an early exit can therefore pay that
+  tail. Abnormal process termination can still strand temporary files.
 - A structurally compilable query is not necessarily faster under FRE; the
   positive ambiguous and trace/source controls are specifically expected to
   show this.
