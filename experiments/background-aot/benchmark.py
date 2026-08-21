@@ -401,6 +401,8 @@ def main() -> None:
     completed_cells: list[dict[str, Any]] = []
 
     for cell_index, cell in enumerate(cells):
+        cell_started_unix = time.time()
+        cell_load_average_started = list(os.getloadavg())
         print(f"{cell.id}: warmup", flush=True)
         for warmup in range(args.warmup_pairs):
             run_pair(
@@ -470,6 +472,10 @@ def main() -> None:
         row: dict[str, Any] = {
             "id": cell.id,
             "class": cell.class_name,
+            "started_unix": cell_started_unix,
+            "finished_unix": time.time(),
+            "load_average_started": cell_load_average_started,
+            "load_average_finished": list(os.getloadavg()),
             "scenario": cell.scenario,
             "pattern": cell.pattern,
             "args": list(cell.args),

@@ -235,9 +235,9 @@ python3 experiments/background-aot/benchmark.py \
 
 The final artifact records source status, binary and manifest hashes, versions,
 host metadata, raw results, exact commands, output digests and bytes, receipts,
-statistics, a post-run corpus verification, and the predeclared break-even
-result. A partial artifact is rewritten after every completed cell, outside
-every child timing boundary.
+statistics, per-cell start/end timestamps and load averages, a post-run corpus
+verification, and the predeclared break-even result. A partial artifact is
+rewritten after every completed cell, outside every child timing boundary.
 
 ## Results
 
