@@ -75,9 +75,12 @@ background-AOT arm is faster.
 
 Interpret each timing cell together with its receipt summary:
 
-- `mixed_samples` reports natural same-file promotion.
-- `all_aot_samples` means publication beat the first matcher window.
-- `stock_only_samples` means the query ended before usable publication.
+- `routing_categories.same_file_mixed` reports natural same-file promotion.
+- `routing_categories.cross_file_split_without_midfile` reports stock use in
+  early files and AOT use in later files without a mixed file.
+- `routing_categories.all_aot` means publication beat the first matcher window.
+- `routing_categories.stock_only_*` distinguishes ready, unfinished, and
+  declined runs that never used AOT.
 - `publish_ns` measures direct in-process publication; every receipt must state
   `external_linker_invocations: 0` and `direct_native_only: true`.
 - `stock_committed_bytes` counts the line-aligned candidate-search prefix that

@@ -337,7 +337,20 @@ def git_record(path: Path) -> dict[str, Any]:
         stdout=subprocess.PIPE,
         check=True,
     ).stdout
-    return {"commit": commit, "dirty": bool(status), "status_short": status}
+    remote = subprocess.run(
+        ["git", "config", "--get", "remote.origin.url"],
+        cwd=path,
+        text=True,
+        stdout=subprocess.PIPE,
+        check=False,
+    ).stdout.strip()
+    return {
+        "path": str(path.resolve()),
+        "commit": commit,
+        "dirty": bool(status),
+        "status_short": status,
+        "origin_url": remote or None,
+    }
 
 
 def command_record(command: Sequence[str]) -> str:
@@ -442,13 +455,28 @@ def common_header(
     }
 
 
+def validate_provenance(provenance: Mapping[str, Any], activity: str) -> None:
+    if provenance["source"]["dirty"]:
+        raise SystemExit(f"refusing formal {activity} from a dirty source tree")
+    if provenance["stock_source"]["dirty"]:
+        raise SystemExit(
+            f"refusing formal {activity} from a dirty stock source tree"
+        )
+    if provenance["source"]["commit"] == provenance["stock_source"]["commit"]:
+        raise SystemExit("candidate and stock source commits must differ")
+    if (
+        provenance["binaries"]["candidate"]["sha256"]
+        == provenance["binaries"]["stock"]["sha256"]
+    ):
+        raise SystemExit("candidate and stock binaries must differ")
+
+
 def run_correctness(args: argparse.Namespace) -> None:
     manifest_path = args.manifest
     manifest = load_manifest(manifest_path)
     verify_corpus(manifest_path, manifest)
     provenance = common_header(args, manifest_path, manifest)
-    if provenance["source"]["dirty"]:
-        raise SystemExit("refusing formal correctness from a dirty source tree")
+    validate_provenance(provenance, "correctness")
     gate_bytes = int(manifest["publication_gate_bytes"])
     correctness_path = corpus_path(manifest_path, manifest["correctness"])
     tree_paths = [
@@ -591,6 +619,14 @@ def pair_summary(samples: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
     normal_rmad = relative_mad(normal)
     background_rmad = relative_mad(background)
     stable = normal_rmad <= 0.10 and background_rmad <= 0.10 and order_effect <= 0.15
+    all_samples_used_aot = all(
+        sample["background"]["receipt"]["fre_aot_windows"] > 0
+        for sample in samples
+    )
+    all_samples_mixed_inside_a_file = all(
+        sample["background"]["receipt"]["mixed_engine_files"] > 0
+        for sample in samples
+    )
     return {
         "ratio_definition": "normal elapsed / background elapsed (>1 is AOT faster)",
         "pairs": len(samples),
@@ -611,7 +647,11 @@ def pair_summary(samples: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
         "order_ratio_medians": order_medians,
         "relative_order_effect": order_effect,
         "stable": stable,
-        "descriptive_speedup_supported": stable and ci_low > 1.0,
+        "all_samples_used_aot": all_samples_used_aot,
+        "all_samples_mixed_inside_a_file": all_samples_mixed_inside_a_file,
+        "descriptive_speedup_supported": (
+            stable and ci_low > 1.0 and all_samples_used_aot
+        ),
         "multiple_comparison_adjustment": None,
     }
 
@@ -750,10 +790,8 @@ def run_pair(
 ) -> dict[str, Any]:
     orders = (
         ("normal", "background", "stock"),
-        ("background", "stock", "normal"),
-        ("stock", "normal", "background"),
         ("background", "normal", "stock"),
-        ("normal", "stock", "background"),
+        ("stock", "normal", "background"),
         ("stock", "background", "normal"),
     )
     order = orders[(pair_index + phase) % len(orders)]
@@ -780,8 +818,7 @@ def run_benchmark(args: argparse.Namespace) -> None:
     manifest = load_manifest(manifest_path)
     verify_corpus(manifest_path, manifest)
     provenance = common_header(args, manifest_path, manifest)
-    if provenance["source"]["dirty"]:
-        raise SystemExit("refusing formal timing from a dirty source tree")
+    validate_provenance(provenance, "timing")
     checkpoint_path = args.output.with_name(args.output.name + ".partial")
     if checkpoint_path.exists():
         raise SystemExit(f"refusing to replace checkpoint: {checkpoint_path}")
@@ -858,7 +895,11 @@ def run_benchmark(args: argparse.Namespace) -> None:
                 "unit": "one ordinary query in one new ripgrep process",
                 "pattern": PATTERN,
                 "primary": "same candidate flag off versus --fre-aot-background",
-                "order": "adjacent alternating AB/BA pairs",
+                "order": (
+                    "balanced rotation over four normal/background-adjacent "
+                    "triad orders; primary order and upstream-before/after are "
+                    "both balanced"
+                ),
                 "pairs": args.pairs,
                 "warmup_pairs": args.warmup_pairs,
                 "clock": "perf_counter_ns around subprocess through exit and pipe drain",
