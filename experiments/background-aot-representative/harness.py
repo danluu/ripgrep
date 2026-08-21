@@ -50,29 +50,49 @@ CPU_PROFILE_ENV = "RG_FRE_AOT_BACKGROUND_CPU_PROFILE"
 EXACT_TEDDY_POLICY_V2_ENV = (
     "RG_FRE_AOT_BACKGROUND_EXACT_TEDDY_POLICY_V2"
 )
-RECEIPT_SCHEMA = "ripgrep.fre-aot-background.v6"
+RECEIPT_SCHEMA = "ripgrep.fre-aot-background.v7"
+V6_RECEIPT_SCHEMA = "ripgrep.fre-aot-background.v6"
 V5_RECEIPT_SCHEMA = "ripgrep.fre-aot-background.v5"
 LEGACY_RECEIPT_SCHEMA = "ripgrep.fre-aot-background.v4"
 SUPPORTED_RECEIPT_SCHEMAS = frozenset((
-    LEGACY_RECEIPT_SCHEMA, V5_RECEIPT_SCHEMA, RECEIPT_SCHEMA,
+    LEGACY_RECEIPT_SCHEMA, V5_RECEIPT_SCHEMA, V6_RECEIPT_SCHEMA,
+    RECEIPT_SCHEMA,
 ))
 PRIMARY_ROUTE_RECEIPT_SCHEMAS = frozenset((
-    V5_RECEIPT_SCHEMA, RECEIPT_SCHEMA,
+    V5_RECEIPT_SCHEMA, V6_RECEIPT_SCHEMA, RECEIPT_SCHEMA,
+))
+EXACT_TEDDY_V2_RECEIPT_SCHEMAS = frozenset((
+    V6_RECEIPT_SCHEMA, RECEIPT_SCHEMA,
 ))
 EXACT_TEDDY_V2_SCHEMA_VERSION = 2
 EXACT_TEDDY_V2_OPTIMIZER_VERSION = 25
 EXACT_TEDDY_POLICY_V2_VALUES = (
     "disabled", "automatic", "force-structurally-eligible",
+    "force-selected-or-stock",
 )
 EXACT_TEDDY_V2_CAMPAIGN_POLICIES = (
-    "automatic", "force-structurally-eligible",
+    "automatic", "force-structurally-eligible", "force-selected-or-stock",
 )
 EXACT_TEDDY_POLICY_V2_RECEIPT_NAMES = {
     None: "not_requested",
     "disabled": "disabled",
     "automatic": "automatic",
     "force-structurally-eligible": "force_structurally_eligible",
+    "force-selected-or-stock": "force_selected_or_stock",
 }
+PUBLISH_ANY_COMPILED_POLICY = "publish_any_compiled_selected_end"
+AUTHENTICATED_TEDDY_ONLY_POLICY = (
+    "publish_authenticated_exact_teddy_only"
+)
+PUBLICATION_DECISIONS = frozenset((
+    "pending", "published",
+    "stock_fallback_no_authenticated_exact_teddy",
+    "compile_declined", "declined",
+))
+SUPPLEMENTAL_ROUTE_AUTHENTICATIONS = frozenset((
+    "not_available", "not_applicable", "present_verified",
+    "absent_verified",
+))
 RESULT_SCHEMA = "ripgrep.fre-aot-representative"
 COMPILED_OUTPUT_CONTRACT = "selected_end"
 COMPILED_ENTRY_ABI = "selected_end_search_v1"
@@ -794,6 +814,13 @@ def frozen_private_ids_digest(private_ids: Iterable[str]) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
+def compiler_policy_receipt_name(requested_policy: str) -> str:
+    """Map ripgrep's combined policy to the unchanged FRE V2 policy."""
+    if requested_policy == "force_selected_or_stock":
+        return "force_structurally_eligible"
+    return requested_policy
+
+
 def validate_frozen_exact_teddy_v2_force_strata(
     cases: Sequence[QueryCase],
 ) -> None:
@@ -861,7 +888,9 @@ def forced_exact_teddy_v2_selection_expectation(
     case: QueryCase,
     policy: str | None,
 ) -> bool | None:
-    if policy != "force-structurally-eligible":
+    if policy not in (
+        "force-structurally-eligible", "force-selected-or-stock",
+    ):
         return None
     return (
         case.private_id
@@ -872,6 +901,7 @@ def forced_exact_teddy_v2_selection_expectation(
 def validate_frozen_forced_exact_teddy_v2_nonselection(
     case: QueryCase,
     receipt: Mapping[str, Any] | None,
+    policy: str,
 ) -> list[str]:
     """Bind each complement case to its frozen terminal compiler fact."""
     if (
@@ -881,6 +911,10 @@ def validate_frozen_forced_exact_teddy_v2_nonselection(
         raise HarnessError("nonselection expectation applied outside complement")
     if not isinstance(receipt, Mapping):
         return ["forced_exact_teddy_v2_nonselection_receipt_missing"]
+    if policy not in (
+        "force-structurally-eligible", "force-selected-or-stock",
+    ):
+        raise HarnessError("nonselection expectation requires Force compiler")
     if (
         case.private_id
         in FROZEN_EXACT_TEDDY_V2_FORCE_COMPILE_DECLINE_PRIVATE_IDS
@@ -891,16 +925,51 @@ def validate_frozen_forced_exact_teddy_v2_nonselection(
             and receipt.get("publication_refusal_class") == "compile_object"
             and receipt.get("decline_reason") == "compile_object"
         )
+        if policy == "force-selected-or-stock":
+            valid = valid and (
+                receipt.get("aot_publication_decision")
+                == "compile_declined"
+                and receipt.get("compiled_artifact_available") is False
+                and receipt.get("published_primary_native_route") is None
+                and receipt.get("stock_candidate_scanner_active") is True
+            )
         return [] if valid else [
             "forced_exact_teddy_v2_expected_compile_object_decline"
         ]
-    valid = (
-        receipt.get("outcome") == "ready"
-        and receipt.get("compiled_primary_native_route") == "ordered_dfa"
-        and receipt.get("compiled_state_source") == "semantic_dfa"
-    )
+    if policy == "force-selected-or-stock":
+        valid = (
+            receipt.get("outcome") == "stock_fallback"
+            and receipt.get("compiled_primary_native_route") == "ordered_dfa"
+            and receipt.get("compiled_state_source") == "semantic_dfa"
+            and receipt.get("aot_publication_policy")
+            == AUTHENTICATED_TEDDY_ONLY_POLICY
+            and receipt.get("aot_publication_decision")
+            == "stock_fallback_no_authenticated_exact_teddy"
+            and receipt.get("compiled_artifact_available") is True
+            and receipt.get("supplemental_route_authentication")
+            == "absent_verified"
+            and receipt.get("published_primary_native_route") is None
+            and receipt.get("publication_stage")
+            == "not_published_by_policy"
+            and receipt.get("publication_refusal_class") is None
+            and receipt.get("stock_candidate_scanner_active") is True
+            and all(receipt.get(field) is None for field in (
+                "published_code_bytes", "published_read_only_data_bytes",
+                "published_total_mapped_bytes", "ready_ns_since_start",
+            ))
+        )
+    else:
+        valid = (
+            receipt.get("outcome") == "ready"
+            and receipt.get("compiled_primary_native_route") == "ordered_dfa"
+            and receipt.get("compiled_state_source") == "semantic_dfa"
+        )
     return [] if valid else [
-        "forced_exact_teddy_v2_expected_ready_ordered_dfa"
+        (
+            "selected_or_stock_expected_authenticated_stock_fallback"
+            if policy == "force-selected-or-stock"
+            else "forced_exact_teddy_v2_expected_ready_ordered_dfa"
+        )
     ]
 
 
@@ -1253,7 +1322,11 @@ def receipt_decline_class(receipt: Mapping[str, Any] | None) -> str:
         return "no_receipt"
     outcome = receipt.get("outcome")
     if outcome != "declined":
-        return str(outcome) if outcome in ("ready", "unfinished") else "invalid"
+        return (
+            str(outcome)
+            if outcome in ("ready", "stock_fallback", "unfinished")
+            else "invalid"
+        )
     refusal = receipt.get("publication_refusal_class")
     stage = receipt.get("publication_stage")
     if isinstance(refusal, str) and refusal:
@@ -1970,8 +2043,9 @@ def validate_compile_receipt_v2(
     require_forced_exact_teddy_v2: bool,
 ) -> list[str]:
     failures = []
+    compiler_policy = compiler_policy_receipt_name(requested_policy)
     if require_forced_exact_teddy_v2 and (
-        requested_policy != "force_structurally_eligible"
+        compiler_policy != "force_structurally_eligible"
     ):
         failures.append("forced_exact_teddy_v2_policy_mismatch")
     stable_report = receipt.get("exact_finite_selected_end_teddy_aot")
@@ -2005,7 +2079,7 @@ def validate_compile_receipt_v2(
         failures.append("compile_receipt_v2_optimizer_version")
     if (
         compile_receipt.get("exact_finite_selected_end_teddy_policy")
-        != requested_policy
+        != compiler_policy
     ):
         failures.append("compile_receipt_v2_policy_mismatch")
     report = compile_receipt.get(
@@ -2036,7 +2110,7 @@ def validate_compile_receipt_v2(
             failures.append("forced_exact_teddy_v2_report_required")
         return failures
     failures.extend(validate_exact_teddy_v2_report(
-        report, receipt, requested_policy=requested_policy
+        report, receipt, requested_policy=compiler_policy
     ))
     return failures
 
@@ -2051,16 +2125,41 @@ def definitive_forced_exact_teddy_v2_nonselection(
     missing, unfinished, pre-target, or otherwise ambiguous observation.
     """
     if (
-        receipt.get("schema") != RECEIPT_SCHEMA
+        receipt.get("schema") not in EXACT_TEDDY_V2_RECEIPT_SCHEMAS
         or receipt.get("wait_requested") is not True
         or receipt.get("compiler_settled") is not True
         or receipt.get("exact_finite_selected_end_teddy_policy_v2_request")
-        != "force_structurally_eligible"
+        not in ("force_structurally_eligible", "force_selected_or_stock")
         or receipt.get("exact_finite_selected_end_teddy_aot") is not None
     ):
         return False
     compile_receipt_v2 = receipt.get("compile_receipt_v2")
-    if receipt.get("outcome") == "ready":
+    requested_policy = receipt.get(
+        "exact_finite_selected_end_teddy_policy_v2_request"
+    )
+    if (
+        requested_policy == "force_selected_or_stock"
+        and receipt.get("schema") != RECEIPT_SCHEMA
+    ):
+        return False
+    if (
+        requested_policy == "force_selected_or_stock"
+        and receipt.get("outcome") == "stock_fallback"
+    ):
+        return (
+            isinstance(compile_receipt_v2, Mapping)
+            and compile_receipt_v2.get(
+                "exact_finite_selected_end_teddy_aot_v2"
+            ) is None
+            and receipt.get("supplemental_route_authentication")
+            == "absent_verified"
+            and receipt.get("aot_publication_decision")
+            == "stock_fallback_no_authenticated_exact_teddy"
+        )
+    if (
+        requested_policy == "force_structurally_eligible"
+        and receipt.get("outcome") == "ready"
+    ):
         return (
             isinstance(compile_receipt_v2, Mapping)
             and compile_receipt_v2.get(
@@ -2074,6 +2173,148 @@ def definitive_forced_exact_teddy_v2_nonselection(
         and str(receipt["publication_refusal_class"]).startswith("compile_")
         and compile_receipt_v2 is None
     )
+
+
+def validate_v7_publication_contract(
+    receipt: Mapping[str, Any],
+    *,
+    requested_policy: str,
+) -> list[str]:
+    """Validate v7's typed publication and authenticated-fallback contract."""
+    failures = []
+    required = (
+        "aot_publication_policy", "aot_publication_decision",
+        "compiled_artifact_available",
+        "supplemental_route_authentication",
+        "published_primary_native_route",
+        "stock_candidate_scanner_active",
+    )
+    for field in required:
+        if field not in receipt:
+            failures.append(f"missing_{field}")
+    policy = receipt.get("aot_publication_policy")
+    decision = receipt.get("aot_publication_decision")
+    compiled_available = receipt.get("compiled_artifact_available")
+    supplement_auth = receipt.get("supplemental_route_authentication")
+    published_route = receipt.get("published_primary_native_route")
+    stock_scanner = receipt.get("stock_candidate_scanner_active")
+    expected_publication_policy = (
+        AUTHENTICATED_TEDDY_ONLY_POLICY
+        if requested_policy == "force_selected_or_stock"
+        else PUBLISH_ANY_COMPILED_POLICY
+    )
+    if policy != expected_publication_policy:
+        failures.append("aot_publication_policy_mismatch")
+    if decision not in PUBLICATION_DECISIONS:
+        failures.append("invalid_aot_publication_decision")
+    if not isinstance(compiled_available, bool):
+        failures.append("invalid_compiled_artifact_available")
+    if supplement_auth not in SUPPLEMENTAL_ROUTE_AUTHENTICATIONS:
+        failures.append("invalid_supplemental_route_authentication")
+    if published_route is not None and published_route not in PRIMARY_NATIVE_ROUTES:
+        failures.append("invalid_published_primary_native_route")
+    if not isinstance(stock_scanner, bool):
+        failures.append("invalid_stock_candidate_scanner_active")
+
+    compiler_engine = receipt.get("compiler_engine")
+    if isinstance(compiled_available, bool) and (
+        compiled_available != (compiler_engine is not None)
+    ):
+        failures.append("compiled_artifact_availability_mismatch")
+    compile_receipt = receipt.get("compile_receipt_v2")
+    if isinstance(compile_receipt, Mapping):
+        expected_auth = (
+            "present_verified"
+            if compile_receipt.get(
+                "exact_finite_selected_end_teddy_aot_v2"
+            ) is not None
+            else "absent_verified"
+        )
+        if supplement_auth != expected_auth:
+            failures.append("supplement_authentication_receipt_mismatch")
+    elif compiler_engine is not None:
+        expected_auth = (
+            "not_applicable"
+            if requested_policy == "not_requested" else "not_available"
+        )
+        if supplement_auth != expected_auth:
+            failures.append("supplement_authentication_compile_mismatch")
+
+    outcome = receipt.get("outcome")
+    stage = receipt.get("publication_stage")
+    refusal = receipt.get("publication_refusal_class")
+    compiled_route = receipt.get("compiled_primary_native_route")
+    published_bytes = tuple(receipt.get(field) for field in (
+        "published_code_bytes", "published_read_only_data_bytes",
+        "published_total_mapped_bytes",
+    ))
+    has_published_artifact = (
+        published_route is not None
+        or any(value is not None for value in published_bytes)
+        or receipt.get("ready_ns_since_start") is not None
+    )
+    if outcome == "ready":
+        if decision != "published":
+            failures.append("ready_publication_decision_mismatch")
+        if published_route != compiled_route or published_route is None:
+            failures.append("published_route_compiled_route_mismatch")
+        if stock_scanner is not False:
+            failures.append("published_stock_candidate_scanner_active")
+        if compiled_available is not True:
+            failures.append("published_without_compiled_artifact")
+    elif outcome == "stock_fallback":
+        if requested_policy != "force_selected_or_stock":
+            failures.append("stock_fallback_without_selected_or_stock_policy")
+        if decision != "stock_fallback_no_authenticated_exact_teddy":
+            failures.append("stock_fallback_publication_decision_mismatch")
+        if stage != "not_published_by_policy":
+            failures.append("stock_fallback_publication_stage_mismatch")
+        if refusal is not None:
+            failures.append("stock_fallback_with_publication_refusal")
+        if compiled_available is not True:
+            failures.append("stock_fallback_without_compiled_artifact")
+        if supplement_auth != "absent_verified":
+            failures.append("stock_fallback_without_authenticated_absence")
+        if compiled_route in (None, EXACT_TEDDY_PRIMARY_ROUTE):
+            failures.append("stock_fallback_compiled_route_invalid")
+        if has_published_artifact:
+            failures.append("stock_fallback_has_published_artifact")
+        if stock_scanner is not True:
+            failures.append("stock_fallback_stock_scanner_inactive")
+    elif outcome == "declined":
+        expected_decision = (
+            "compile_declined"
+            if stage == "compile"
+            and isinstance(refusal, str)
+            and refusal.startswith("compile_")
+            else "declined"
+        )
+        if decision != expected_decision:
+            failures.append("declined_publication_decision_mismatch")
+        if has_published_artifact:
+            failures.append("declined_with_published_artifact")
+        if stock_scanner is not True:
+            failures.append("declined_stock_scanner_inactive")
+    elif outcome == "unfinished":
+        if decision != "pending":
+            failures.append("unfinished_publication_decision_mismatch")
+        if has_published_artifact:
+            failures.append("unfinished_with_published_artifact")
+        if stock_scanner is not True:
+            failures.append("unfinished_stock_scanner_inactive")
+
+    if requested_policy == "force_selected_or_stock":
+        if outcome == "ready" and (
+            compiled_route != EXACT_TEDDY_PRIMARY_ROUTE
+            or published_route != EXACT_TEDDY_PRIMARY_ROUTE
+            or supplement_auth != "present_verified"
+        ):
+            failures.append("selected_or_stock_published_non_teddy")
+        if outcome not in (
+            "ready", "stock_fallback", "declined", "unfinished",
+        ):
+            failures.append("selected_or_stock_invalid_outcome")
+    return failures
 
 
 def validate_receipt(
@@ -2093,15 +2334,17 @@ def validate_receipt(
     ):
         raise HarnessError("invalid expected exact Teddy V2 policy")
     if require_forced_exact_teddy_v2 and (
-        expected_exact_teddy_policy_v2
-        != "force-structurally-eligible"
+        expected_exact_teddy_policy_v2 not in (
+            "force-structurally-eligible", "force-selected-or-stock",
+        )
     ):
         raise HarnessError(
             "forced exact Teddy V2 validation requires explicit Force policy"
         )
     if require_forced_exact_teddy_v2_nonselection and (
-        expected_exact_teddy_policy_v2
-        != "force-structurally-eligible"
+        expected_exact_teddy_policy_v2 not in (
+            "force-structurally-eligible", "force-selected-or-stock",
+        )
         or not require_current_schema
         or not require_compiler_settlement
     ):
@@ -2125,17 +2368,29 @@ def validate_receipt(
         failures.append("schema")
     if require_current_schema and receipt_schema != RECEIPT_SCHEMA:
         failures.append("current_receipt_schema_required")
+    if (
+        expected_exact_teddy_policy_v2 == "force-selected-or-stock"
+        and receipt_schema != RECEIPT_SCHEMA
+    ):
+        failures.append("selected_or_stock_requires_v7")
     primary_route_receipt = (
         receipt_schema in PRIMARY_ROUTE_RECEIPT_SCHEMAS
     )
-    v6_receipt = receipt_schema == RECEIPT_SCHEMA
+    exact_teddy_v2_receipt = (
+        receipt_schema in EXACT_TEDDY_V2_RECEIPT_SCHEMAS
+    )
+    v7_receipt = receipt_schema == RECEIPT_SCHEMA
     if require_compiler_settlement and not require_current_schema:
         raise HarnessError(
             "compiler settlement validation requires the current schema"
         )
     if receipt.get("direct_native_only") is not True:
         failures.append("not_direct_native")
-    if receipt.get("outcome") not in ("ready", "declined", "unfinished"):
+    valid_outcomes = (
+        ("ready", "stock_fallback", "declined", "unfinished")
+        if v7_receipt else ("ready", "declined", "unfinished")
+    )
+    if receipt.get("outcome") not in valid_outcomes:
         failures.append("invalid_outcome")
     if primary_route_receipt:
         for field in ("wait_requested", "compiler_settled"):
@@ -2148,7 +2403,7 @@ def validate_receipt(
                 failures.append("requested_compiler_not_settled")
             if receipt.get("outcome") == "unfinished":
                 failures.append("settlement_wait_left_unfinished")
-    if v6_receipt:
+    if exact_teddy_v2_receipt:
         for field in (
             "exact_finite_selected_end_teddy_policy_v2_request",
             "compile_receipt_v2",
@@ -2160,7 +2415,8 @@ def validate_receipt(
         )
         if requested_policy not in (
             "not_requested", "disabled", "automatic",
-            "force_structurally_eligible", "invalid",
+            "force_structurally_eligible", "force_selected_or_stock",
+            "invalid",
         ):
             failures.append("invalid_exact_teddy_policy_v2_request")
         expected_request = EXACT_TEDDY_POLICY_V2_RECEIPT_NAMES[
@@ -2178,7 +2434,14 @@ def validate_receipt(
                 ),
             ))
     elif expected_exact_teddy_policy_v2 is not None:
-        failures.append("exact_teddy_policy_v2_requires_v6")
+        failures.append("exact_teddy_policy_v2_requires_v6_or_newer")
+    if v7_receipt:
+        failures.extend(validate_v7_publication_contract(
+            receipt,
+            requested_policy=str(receipt.get(
+                "exact_finite_selected_end_teddy_policy_v2_request"
+            )),
+        ))
     if require_compiler_settlement:
         if receipt.get("wait_requested") is not True:
             failures.append("compiler_settlement_not_requested")
@@ -2306,7 +2569,9 @@ def validate_receipt(
         "exact_finite_selected_end_teddy_aot"
     )
     exact_teddy_v2_report = None
-    if v6_receipt and isinstance(receipt.get("compile_receipt_v2"), Mapping):
+    if exact_teddy_v2_receipt and isinstance(
+        receipt.get("compile_receipt_v2"), Mapping
+    ):
         exact_teddy_v2_report = receipt["compile_receipt_v2"].get(
             "exact_finite_selected_end_teddy_aot_v2"
         )
@@ -2676,7 +2941,7 @@ def probe_one(
     )
     if forced_exact_teddy_v2_selected is False:
         failures.extend(validate_frozen_forced_exact_teddy_v2_nonselection(
-            case, background.get("receipt")
+            case, background.get("receipt"), str(exact_teddy_policy_v2)
         ))
     return {
         "query_argv_after_binary": list(args),
@@ -2725,7 +2990,9 @@ def run_exact_teddy_v2_gate(
         exact_teddy_policy_v2=exact_teddy_policy_v2,
         forced_exact_teddy_v2_selected=(
             True
-            if exact_teddy_policy_v2 == "force-structurally-eligible"
+            if exact_teddy_policy_v2 in (
+                "force-structurally-eligible", "force-selected-or-stock",
+            )
             else None
         ),
         collect_timing=False,
@@ -2783,7 +3050,9 @@ def validate_exact_teddy_v2_gate_record(
         require_compiler_settlement=True,
         expected_exact_teddy_policy_v2=exact_teddy_policy_v2,
         require_forced_exact_teddy_v2=(
-            exact_teddy_policy_v2 == "force-structurally-eligible"
+            exact_teddy_policy_v2 in (
+                "force-structurally-eligible", "force-selected-or-stock",
+            )
         ),
     )
     failures.extend(recomputed_receipt_failures)
@@ -3256,6 +3525,12 @@ def aggregate_observations(
     accelerators = Counter()
     publication_stages = Counter()
     publication_refusals = Counter()
+    publication_policies = Counter()
+    publication_decisions = Counter()
+    compiled_artifact_availability = Counter()
+    supplemental_route_authentication = Counter()
+    published_primary_native_routes = Counter()
+    stock_candidate_scanner = Counter()
     target_profiles = Counter()
     requested_feature_bits = Counter()
     host_feature_bits = Counter()
@@ -3315,6 +3590,36 @@ def aggregate_observations(
             publication_stages[str(receipt.get("publication_stage", "unreported"))] += 1
             publication_refusals[
                 str(receipt.get("publication_refusal_class", "none"))
+            ] += 1
+            publication_policies[
+                str(receipt.get("aot_publication_policy", "unreported"))
+            ] += 1
+            publication_decisions[
+                str(receipt.get("aot_publication_decision", "unreported"))
+            ] += 1
+            compiled_artifact_availability[
+                "available"
+                if receipt.get("compiled_artifact_available") is True
+                else "unavailable"
+                if receipt.get("compiled_artifact_available") is False
+                else "unreported"
+            ] += 1
+            supplemental_route_authentication[
+                str(receipt.get(
+                    "supplemental_route_authentication", "unreported"
+                ))
+            ] += 1
+            published_primary_native_routes[
+                str(receipt.get(
+                    "published_primary_native_route", "unreported"
+                ))
+            ] += 1
+            stock_candidate_scanner[
+                "active"
+                if receipt.get("stock_candidate_scanner_active") is True
+                else "inactive"
+                if receipt.get("stock_candidate_scanner_active") is False
+                else "unreported"
             ] += 1
             runtime_helpers[
                 "required" if receipt.get("runtime_helper_required") is True
@@ -3446,6 +3751,20 @@ def aggregate_observations(
         ),
         "publication_stages": dict(sorted(publication_stages.items())),
         "publication_refusal_classes": dict(sorted(publication_refusals.items())),
+        "aot_publication_policies": dict(sorted(publication_policies.items())),
+        "aot_publication_decisions": dict(sorted(publication_decisions.items())),
+        "compiled_artifact_availability": dict(
+            sorted(compiled_artifact_availability.items())
+        ),
+        "supplemental_route_authentication": dict(
+            sorted(supplemental_route_authentication.items())
+        ),
+        "published_primary_native_routes": dict(
+            sorted(published_primary_native_routes.items())
+        ),
+        "stock_candidate_scanner": dict(
+            sorted(stock_candidate_scanner.items())
+        ),
         "runtime_helpers": dict(sorted(runtime_helpers.items())),
     }
     if has_primary_route_receipt:
@@ -3644,6 +3963,116 @@ def aggregate_groups(
     return result
 
 
+def selected_or_stock_disposition_summary(
+    rows: Sequence[Mapping[str, Any]],
+    cpu_profiles: Sequence[str],
+    policy: str | None,
+) -> dict[str, Any] | None:
+    """Require the frozen 34 published / 9 stock / 1 decline matrix."""
+    if policy != "force-selected-or-stock":
+        return None
+    expected_ordinary = (
+        FROZEN_EXACT_TEDDY_V2_FORCE_NONSELECTED_PRIVATE_IDS
+        - FROZEN_EXACT_TEDDY_V2_FORCE_COMPILE_DECLINE_PRIVATE_IDS
+    )
+    per_profile = {}
+    for profile in cpu_profiles:
+        panel_rows = [
+            row for row in rows
+            if row.get("cpu_profile") == profile
+            and row.get("panel") == EXACT_TEDDY_CENSUS_PANEL
+        ]
+        by_id = {
+            str(row.get("private_id")): row for row in panel_rows
+        }
+        if (
+            len(panel_rows)
+            != FROZEN_EXACT_TEDDY_V2_STRUCTURAL_COUNTS["total"]
+            or set(by_id)
+            != FROZEN_EXACT_TEDDY_V2_STRUCTURAL_PRIVATE_IDS
+        ):
+            raise HarnessError(
+                "selected-or-stock disposition panel is incomplete"
+            )
+        selected = 0
+        ordinary_stock_fallback = 0
+        compile_decline = 0
+        invalid = 0
+        for private_id, row in by_id.items():
+            receipt = row.get("background", {}).get("receipt")
+            if not isinstance(receipt, Mapping) or row.get("receipt_failures"):
+                invalid += 1
+                continue
+            if private_id in FROZEN_EXACT_TEDDY_V2_FORCE_SELECTED_PRIVATE_IDS:
+                valid = (
+                    receipt.get("outcome") == "ready"
+                    and receipt.get("aot_publication_decision") == "published"
+                    and receipt.get("supplemental_route_authentication")
+                    == "present_verified"
+                    and receipt.get("compiled_primary_native_route")
+                    == EXACT_TEDDY_PRIMARY_ROUTE
+                    and receipt.get("published_primary_native_route")
+                    == EXACT_TEDDY_PRIMARY_ROUTE
+                    and receipt.get("stock_candidate_scanner_active") is False
+                )
+                selected += int(valid)
+            elif private_id in expected_ordinary:
+                valid = (
+                    receipt.get("outcome") == "stock_fallback"
+                    and receipt.get("aot_publication_decision")
+                    == "stock_fallback_no_authenticated_exact_teddy"
+                    and receipt.get("supplemental_route_authentication")
+                    == "absent_verified"
+                    and receipt.get("published_primary_native_route") is None
+                    and receipt.get("stock_candidate_scanner_active") is True
+                )
+                ordinary_stock_fallback += int(valid)
+            else:
+                valid = (
+                    private_id
+                    in FROZEN_EXACT_TEDDY_V2_FORCE_COMPILE_DECLINE_PRIVATE_IDS
+                    and receipt.get("outcome") == "declined"
+                    and receipt.get("aot_publication_decision")
+                    == "compile_declined"
+                    and receipt.get("publication_refusal_class")
+                    == "compile_object"
+                    and receipt.get("stock_candidate_scanner_active") is True
+                )
+                compile_decline += int(valid)
+            invalid += int(not valid)
+        observed = {
+            "selected_teddy_published": selected,
+            "ordinary_compiled_stock_fallback": ordinary_stock_fallback,
+            "compile_object_decline": compile_decline,
+            "invalid": invalid,
+        }
+        per_profile[profile] = {
+            **observed,
+            "qualified": observed == {
+                "selected_teddy_published": 34,
+                "ordinary_compiled_stock_fallback": 9,
+                "compile_object_decline": 1,
+                "invalid": 0,
+            },
+        }
+    return {
+        "schema": f"{RESULT_SCHEMA}.selected-or-stock-disposition.v1",
+        "panel": EXACT_TEDDY_CENSUS_PANEL,
+        "policy": policy,
+        "expected_per_profile": {
+            "fixed_itt": 44,
+            "selected_teddy_published": 34,
+            "ordinary_compiled_stock_fallback": 9,
+            "compile_object_decline": 1,
+        },
+        "per_profile": per_profile,
+        "all_profiles_qualified": bool(per_profile) and all(
+            result["qualified"] for result in per_profile.values()
+        ),
+        "timing_samples": 0,
+    }
+
+
 def exact_teddy_diagnostic_census(
     rows: Sequence[Mapping[str, Any]],
     cases: Sequence[QueryCase],
@@ -3706,7 +4135,9 @@ def exact_teddy_diagnostic_census(
                 and receipt.get("schema") == RECEIPT_SCHEMA
                 and receipt.get("wait_requested") is True
                 and receipt.get("compiler_settled") is True
-                and receipt.get("outcome") in ("ready", "declined")
+                and receipt.get("outcome") in (
+                    "ready", "stock_fallback", "declined",
+                )
             )
             if (
                 not isinstance(receipt_failures, list)
@@ -3976,6 +4407,19 @@ def exact_teddy_v2_campaign_record(
             "untimed settled authenticated Force census frozen before timing"
         ),
         "exact_teddy_policy_v2": policy,
+        "aot_publication_policy": (
+            AUTHENTICATED_TEDDY_ONLY_POLICY
+            if policy == "force-selected-or-stock"
+            else PUBLISH_ANY_COMPILED_POLICY
+        ),
+        "selected_or_stock_expected_dispositions": (
+            {
+                "selected_teddy_published": 34,
+                "ordinary_compiled_stock_fallback": 9,
+                "compile_object_decline": 1,
+            }
+            if policy == "force-selected-or-stock" else None
+        ),
         "source_selection_manifest_sha256": (
             FROZEN_EXACT_TEDDY_V2_SOURCE_MANIFEST_SHA256
         ),
@@ -4344,6 +4788,17 @@ def run_probe(args: argparse.Namespace) -> None:
                         exact_teddy_policy_v2 is not None
                     ),
                 )
+        selected_or_stock_summary = selected_or_stock_disposition_summary(
+            private_rows, args.cpu_profile, exact_teddy_policy_v2
+        )
+        if (
+            selected_or_stock_summary is not None
+            and selected_or_stock_summary.get("all_profiles_qualified")
+            is not True
+        ):
+            raise HarnessError(
+                "selected-or-stock probe did not reproduce 34/9/1"
+            )
         target_matrix = target_validation_matrix(
             private_rows, args.cpu_profile
         )
@@ -4371,6 +4826,7 @@ def run_probe(args: argparse.Namespace) -> None:
         },
         "rows": private_rows,
         "exact_teddy_v2_gates": exact_teddy_v2_gates,
+        "selected_or_stock_disposition": selected_or_stock_summary,
         "forced_midscan_config": forced_midscan_config,
         "forced_midscan_gates": forced_midscan_gates,
     }
@@ -4423,6 +4879,7 @@ def run_probe(args: argparse.Namespace) -> None:
         "exact_teddy_v2_gate": exact_teddy_v2_gate_summary(
             exact_teddy_v2_gates, exact_teddy_policy_v2
         ),
+        "selected_or_stock_disposition": selected_or_stock_summary,
         "forced_midscan_config": forced_midscan_config,
         "forced_midscan_gate": forced_midscan_gate_summary(
             forced_midscan_gates
@@ -4544,7 +5001,9 @@ def run_exact_teddy_census(args: argparse.Namespace) -> None:
                 ) is False:
                     failures.extend(
                         validate_frozen_forced_exact_teddy_v2_nonselection(
-                            case, background.get("receipt")
+                            case,
+                            background.get("receipt"),
+                            str(exact_teddy_policy_v2),
                         )
                     )
                 if background.get("receipt_parse_error"):
@@ -4607,7 +5066,10 @@ def run_exact_teddy_census(args: argparse.Namespace) -> None:
             ),
             "force_nonselection_evidence": (
                 "settled authenticated exact frozen disposition"
-                if exact_teddy_policy_v2 == "force-structurally-eligible"
+                if exact_teddy_policy_v2 in (
+                    "force-structurally-eligible",
+                    "force-selected-or-stock",
+                )
                 else None
             ),
             "wider_sample_size": args.wider_sample_size,
@@ -4801,7 +5263,8 @@ def validate_and_aggregate_private_probe(
         ) is False:
             receipt_failures.extend(
                 validate_frozen_forced_exact_teddy_v2_nonselection(
-                    case, background.get("receipt")
+                    case, background.get("receipt"),
+                    str(exact_teddy_policy_v2),
                 )
             )
         _, normalization = profile_flags(case)
@@ -4926,6 +5389,12 @@ def validate_probe(
             exact_teddy_policy_v2=exact_teddy_policy_v2,
         )
     )
+    private_rows = private_probe.get("rows")
+    if not isinstance(private_rows, list):
+        raise HarnessError("private probe rows are missing")
+    selected_or_stock_summary = selected_or_stock_disposition_summary(
+        private_rows, args.cpu_profile, exact_teddy_policy_v2
+    )
     private_census = private_probe.get("exact_teddy_diagnostic_census")
     public_census = probe.get("exact_teddy_diagnostic_census")
     if private_census is not None or public_census is not None:
@@ -4969,6 +5438,10 @@ def validate_probe(
         or probe.get("forced_midscan_config") != forced_config
         or probe.get("forced_midscan_gate") != forced_summary
         or probe.get("exact_teddy_v2_gate") != v2_gate_summary
+        or probe.get("selected_or_stock_disposition")
+        != selected_or_stock_summary
+        or private_probe.get("selected_or_stock_disposition")
+        != selected_or_stock_summary
         or forced_summary.get("all_passed") is not True
         or exact_teddy_policy_v2 is not None
         and (
@@ -4976,6 +5449,8 @@ def validate_probe(
             or v2_gate_summary.get("all_passed") is not True
         )
         or computed_target_matrix.get("qualified") is not True
+        or selected_or_stock_summary is not None
+        and selected_or_stock_summary.get("all_profiles_qualified") is not True
     ):
         raise HarnessError("probe does not match the benchmark inputs")
     expected_panels = {
@@ -5016,6 +5491,7 @@ def validate_probe(
         "private_result_sha256": sha256_file(args.probe_private),
         "selection_manifest_sha256": manifest_digest(expected_manifest),
         "exact_teddy_v2_campaign": expected_campaign,
+        "selected_or_stock_disposition": selected_or_stock_summary,
     }
 
 

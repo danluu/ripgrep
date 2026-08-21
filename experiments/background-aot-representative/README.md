@@ -5,14 +5,18 @@ newest checked-in result is the authenticated exact-Teddy V2 census,
 qualification, formal round, and reverse-order confirmation; it is a clear
 NO-GO. Historical SelectedEnd and Span-entry results remain in that file as
 explicitly labeled baselines. The current harness emits
-`ripgrep.fre-aot-background.v6` SelectedEnd receipts and continues to validate
-existing v4/v5 evidence without reinterpreting v3 results. V5 added an
+`ripgrep.fre-aot-background.v7` SelectedEnd receipts and continues to validate
+existing v4/v5/v6 evidence without reinterpreting v3 results. V5 added an
 authenticated primary-native-route record and kept a Teddy leaf's retained
 semantic-DFA incumbent explicitly separate from that primary route. V6
 preserves those fields and adds the supplemental exact-Teddy V2 compile
 receipt described below. It also attests whether receipt-only compiler
 settlement was requested and whether the compiler thread reached a definitive
 outcome.
+V7 adds a typed publication policy and decision, compiled-versus-published
+route identities, authenticated V2-supplement presence or absence, compiled
+artifact availability, and the settled candidate scanner. Intentional policy
+nonpublication is therefore distinct from a compile or loader failure.
 
 This harness tests the normal ripgrep path against the same binary with
 `--fre-aot-background` on frozen, actual ripgrep query shapes. It does not use
@@ -38,7 +42,7 @@ cases whose retained semantics required normalization. Public JSON contains aggr
 private JSON contains the exact patterns and per-process observations and is
 ignored by Git.
 
-## Exact-Teddy V2 policy campaigns (receipt v6)
+## Exact-Teddy V2 policy campaigns (receipt v7)
 
 This iteration pins all four direct FRE crates and every corresponding
 lockfile entry to FRE commit
@@ -46,13 +50,20 @@ lockfile entry to FRE commit
 without `--exact-teddy-policy-v2`, ripgrep does not set
 `RG_FRE_AOT_BACKGROUND_EXACT_TEDDY_POLICY_V2` and calls the stable V1 compile
 API. An explicit campaign accepts exactly one policy per harness invocation:
-`automatic` or `force-structurally-eligible`. The harness sets that hidden
+`automatic`, `force-structurally-eligible`, or
+`force-selected-or-stock`. The first two retain their existing compile and
+publication behavior. The new combined policy sends the unchanged FRE
+`ForceStructurallyEligible` request, but publishes only when the V2 module and
+receipt authenticate a supplemental SelectedEnd Teddy route. Authenticated
+absence drops the ordinary compiled artifact before loader publication and
+settles candidate discovery on the stock scanner; a compile decline remains a
+compile decline. The harness sets that hidden
 environment variable only for the candidate-background child. It removes the
 variable from candidate-normal, stock, provenance, archive, tool-version, and
 all other child environments, including when the parent shell already has it
 set. The policy is never inferred from a pattern or receipt.
 
-Both explicit campaigns use the result-blind
+All explicit campaigns use the result-blind
 `frozen-structural-44-v1` cohort. It was frozen before compilation results or
 timings: case-sensitive simple exact alternations with at least four arms,
 every arm a nonempty exact byte literal, and minimum byte width at least three.
@@ -113,8 +124,14 @@ accelerated incumbent: V2 policy
 `ordinary_public_complete_dfa`, performance admission bypassed, tail entry
 enabled, a non-`none` accelerator, and a matching authenticated nested lowering.
 Each complement case must instead authenticate its frozen definitive
-nonselection: nine ready ordinary-DFA receipts and the one `compile_object`
-decline. Missing, unfinished, pre-target, selected-on-the-wrong-case, or other
+nonselection. Ordinary Force still requires nine ready, published ordinary
+DFA receipts and one `compile_object` decline. Under selected-or-stock, the
+nine ordinary artifacts must settle as `stock_fallback` with authenticated
+supplement absence, no published route or mapped-byte fields, and an active
+stock candidate scanner; the same one case must retain its `compile_object`
+decline. The canonical count-panel probe requires exactly 34 published Teddy,
+9 authenticated stock fallbacks, and 1 compile decline in every profile.
+Missing, unfinished, pre-target, selected-on-the-wrong-case, or other
 dispositions fail the probe.
 Automatic is the matched control and validates its V2 policy receipt without
 requiring the forced route to be selected.
@@ -125,6 +142,7 @@ the complete `probe` command below and using distinct output paths:
 ```sh
 --exact-teddy-policy-v2 automatic
 --exact-teddy-policy-v2 force-structurally-eligible
+--exact-teddy-policy-v2 force-selected-or-stock
 ```
 
 Pass the same single flag to `benchmark`, together with the matching probe's
@@ -135,6 +153,9 @@ rejects a different policy, an ordinary 212-case probe, or a changed 44-case
 manifest. Timed runs keep the existing three arms; only the background arm
 receives the selected policy. All 44 cases remain timed and form the primary
 ITT summary; selected-34 and complement-10 summaries are secondary.
+Selected-or-stock summaries additionally expose publication decisions,
+compiled artifact availability, supplement authentication, published routes,
+and the settled stock-scanner counts.
 
 ## Fast exact-Teddy census
 
@@ -149,7 +170,7 @@ and do not embed or claim a compiler-selected census. The private result contain
 `profile/cohort/private-id` sets; the public result contains counts and
 tier/ISA/scanner contracts only. This diagnostic does not claim benchmark
 eligibility. Adding an explicit V2 policy restricts the census to the same
-fixed 44. Force requires strict route attestation for selected-34 and exact
+fixed 44. Both Force modes require strict route attestation for selected-34 and exact
 definitive nonselection for complement-10; Automatic provides the matched
 control. A malformed receipt, unexpected disposition, process error, or
 incomplete settlement aborts the census instead of emitting a nominally
@@ -167,13 +188,14 @@ python3 experiments/background-aot-representative/harness.py exact-teddy-census 
   --ripgrep-corpus-commit f9c05a949d1a0dc8e16dee28ca9605d38611faeb \
   --fre-corpus-repo /Users/danluu/dev/fre-teddy-census-d2b352b7-20260821 \
   --fre-corpus-commit 6f961465d00ff50f2096cfb05520c0653a87d2cd \
-  --exact-teddy-policy-v2 force-structurally-eligible \
+  --exact-teddy-policy-v2 force-selected-or-stock \
   --private-output experiments/background-aot-representative/results/teddy-census-force-v2.private.json \
   --public-output experiments/background-aot-representative/results/teddy-census-force-v2.public.json
 ```
 
-Replace the policy value with `automatic` (and use distinct output paths) for
-the control census. Omitting the flag retains the legacy 212-case diagnostic;
+Replace the policy value with `automatic` or
+`force-structurally-eligible` (and use distinct output paths) for the matched
+control or publish-any Force census. Omitting the flag retains the legacy 212-case diagnostic;
 `disabled` is also accepted as an explicit V2 census diagnostic.
 
 ## Probe first
@@ -193,7 +215,7 @@ python3 experiments/background-aot-representative/harness.py probe \
   --ripgrep-corpus-commit f9c05a949d1a0dc8e16dee28ca9605d38611faeb \
   --fre-corpus-repo /Users/danluu/dev/fre-teddy-census-d2b352b7-20260821 \
   --fre-corpus-commit 6f961465d00ff50f2096cfb05520c0653a87d2cd \
-  --exact-teddy-policy-v2 force-structurally-eligible \
+  --exact-teddy-policy-v2 force-selected-or-stock \
   --private-output experiments/background-aot-representative/results/probe.private.json \
   --public-output experiments/background-aot-representative/results/probe.public.json
 ```
@@ -216,7 +238,7 @@ order, for example `--cpu-profile auto --cpu-profile sve --cpu-profile sve2`.
 `asimd` is also accepted as an optional control. An unsupported requested
 profile is recorded as a decline, never silently replaced with `auto`.
 Receipts report the requested, host, and effective feature masks plus the
-compiler engine and actual start accelerator. A successfully compiled v4/v5/v6
+compiler engine and actual start accelerator. A successfully compiled v4/v5/v6/v7
 receipt also identifies the `selected_end` output contract, the
 `selected_end_search_v1` entry ABI, the source of any reported machine
 geometry, forward/reverse analysis state counts, and whether the compiler
@@ -236,7 +258,7 @@ timing, the complete probe matrix must nevertheless contain at least one fully
 target-validated receipt for every requested CPU profile, all with one common
 host feature mask.
 
-The v4/v5/v6 route counters describe candidate discovery only. A mixed-engine file
+The v4/v5/v6/v7 route counters describe candidate discovery only. A mixed-engine file
 can merely reflect different matcher operations. A genuine mid-scan cutover is
 counted separately and requires a nonempty, line-aligned stock prefix to be
 committed before AOT scans a later suffix. Candidate file/byte totals and the
@@ -307,7 +329,7 @@ Only start this after reviewing a complete, clean probe:
 ```sh
 python3 experiments/background-aot-representative/harness.py benchmark \
   [the same input options as probe] \
-  --exact-teddy-policy-v2 force-structurally-eligible \
+  --exact-teddy-policy-v2 force-selected-or-stock \
   --probe-public experiments/background-aot-representative/results/probe.public.json \
   --probe-private experiments/background-aot-representative/results/probe.private.json \
   --pairs 12 --warmup-pairs 2 \
@@ -320,7 +342,11 @@ candidate's normal path, and the candidate's background-AOT path. A four-order
 rotation balances whether stock comes before or after while keeping normal and
 background adjacent and balancing NB/BN. Timed processes do not write receipts,
 because receipt publication would charge only the background arm; all receipt
-classification comes from the mandatory matching untimed probe. The primary
+classification comes from the mandatory matching untimed probe. For
+selected-or-stock, the benchmark gate also binds that probe's exact
+per-profile 34/9/1 disposition summary, both probe-file hashes, the explicit
+policy string, and all three frozen manifests. Timed children cannot silently
+acquire receipts or a different policy. The primary
 statistic is the median paired `normal/background` elapsed-time ratio for each
 pattern, but only when every configured sample for that pattern has valid
 statuses and exact stock/normal/background output. The report also shows NB

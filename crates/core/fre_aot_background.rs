@@ -36,7 +36,7 @@ const EXACT_TEDDY_POLICY_V2_ENV: &str =
     "RG_FRE_AOT_BACKGROUND_EXACT_TEDDY_POLICY_V2";
 const TEST_MIN_STOCK_BYTES_ENV: &str =
     "RG_FRE_AOT_BACKGROUND_TEST_MIN_STOCK_BYTES";
-const RECEIPT_SCHEMA: &str = "ripgrep.fre-aot-background.v6";
+const RECEIPT_SCHEMA: &str = "ripgrep.fre-aot-background.v7";
 const PENDING_SCAN_QUANTUM: usize = 1 << 20;
 const EXACT_TEDDY_INPUT_FLOOR_BYTES: usize = 4096;
 const EXACT_TEDDY_RUNTIME_VERIFICATION_BUDGET: u16 = 64;
@@ -75,6 +75,7 @@ enum ExactTeddyPolicyV2Request {
     Disabled,
     Automatic,
     ForceStructurallyEligible,
+    ForceSelectedOrStock,
 }
 
 impl ExactTeddyPolicyV2Request {
@@ -84,6 +85,7 @@ impl ExactTeddyPolicyV2Request {
             Self::Disabled => "disabled",
             Self::Automatic => "automatic",
             Self::ForceStructurallyEligible => "force_structurally_eligible",
+            Self::ForceSelectedOrStock => "force_selected_or_stock",
         }
     }
 
@@ -96,9 +98,85 @@ impl ExactTeddyPolicyV2Request {
             Self::NotRequested => None,
             Self::Disabled => Some(Policy::Disabled),
             Self::Automatic => Some(Policy::Automatic),
-            Self::ForceStructurallyEligible => {
+            Self::ForceStructurallyEligible | Self::ForceSelectedOrStock => {
                 Some(Policy::ForceStructurallyEligible)
             }
+        }
+    }
+
+    const fn publication_policy(self) -> AotPublicationPolicy {
+        match self {
+            Self::ForceSelectedOrStock => {
+                AotPublicationPolicy::AuthenticatedExactTeddyOnly
+            }
+            _ => AotPublicationPolicy::PublishAnyCompiledSelectedEnd,
+        }
+    }
+}
+
+/// The experimental post-compile publication contract. This is deliberately
+/// separate from FRE's compiler policy: existing Automatic and Force requests
+/// continue to publish every successfully compiled SelectedEnd artifact.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AotPublicationPolicy {
+    PublishAnyCompiledSelectedEnd,
+    AuthenticatedExactTeddyOnly,
+}
+
+impl AotPublicationPolicy {
+    const fn name(self) -> &'static str {
+        match self {
+            Self::PublishAnyCompiledSelectedEnd => {
+                "publish_any_compiled_selected_end"
+            }
+            Self::AuthenticatedExactTeddyOnly => {
+                "publish_authenticated_exact_teddy_only"
+            }
+        }
+    }
+}
+
+/// A terminal or in-progress decision emitted independently from the older
+/// decline fields. In particular, authenticated policy nonpublication is a
+/// successful stock fallback, not a compiler or loader refusal.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AotPublicationDecision {
+    Pending,
+    Published,
+    StockFallbackNoAuthenticatedExactTeddy,
+    CompileDeclined,
+    Declined,
+}
+
+impl AotPublicationDecision {
+    const fn name(self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Published => "published",
+            Self::StockFallbackNoAuthenticatedExactTeddy => {
+                "stock_fallback_no_authenticated_exact_teddy"
+            }
+            Self::CompileDeclined => "compile_declined",
+            Self::Declined => "declined",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SupplementalRouteAuthentication {
+    NotAvailable,
+    NotApplicable,
+    PresentVerified,
+    AbsentVerified,
+}
+
+impl SupplementalRouteAuthentication {
+    const fn name(self) -> &'static str {
+        match self {
+            Self::NotAvailable => "not_available",
+            Self::NotApplicable => "not_applicable",
+            Self::PresentVerified => "present_verified",
+            Self::AbsentVerified => "absent_verified",
         }
     }
 }
@@ -136,6 +214,12 @@ struct ReceiptClassification {
     compile_receipt_v2: Option<fre_aot_regex::CompileReceiptV2>,
     exact_finite_selected_end_teddy_aot:
         Option<fre_aot_regex::ExactFiniteSelectedEndTeddyAotReport>,
+    aot_publication_policy: AotPublicationPolicy,
+    aot_publication_decision: AotPublicationDecision,
+    compiled_artifact_available: bool,
+    supplemental_route_authentication: SupplementalRouteAuthentication,
+    published_primary_native_route: Option<&'static str>,
+    stock_candidate_scanner_active: bool,
     publication_stage: &'static str,
     publication_refusal_class: Option<&'static str>,
     runtime_helper_required: bool,
@@ -164,6 +248,14 @@ impl ReceiptClassification {
             exact_finite_selected_end_teddy_policy_v2_request: "not_requested",
             compile_receipt_v2: None,
             exact_finite_selected_end_teddy_aot: None,
+            aot_publication_policy:
+                AotPublicationPolicy::PublishAnyCompiledSelectedEnd,
+            aot_publication_decision: AotPublicationDecision::Pending,
+            compiled_artifact_available: false,
+            supplemental_route_authentication:
+                SupplementalRouteAuthentication::NotAvailable,
+            published_primary_native_route: None,
+            stock_candidate_scanner_active: true,
             publication_stage: "not_started",
             publication_refusal_class: None,
             runtime_helper_required: false,
@@ -221,7 +313,13 @@ impl NativeAotMatcher<'_> {
     }
 }
 
-type CompileOutcome = Result<Arc<NativeAotFactory>, String>;
+#[derive(Debug)]
+enum SuccessfulCompileOutcome {
+    Published(Arc<NativeAotFactory>),
+    StockFallback,
+}
+
+type CompileOutcome = Result<SuccessfulCompileOutcome, String>;
 
 enum CompletedCompilation {
     Stable(fre_aot_regex::CompiledRegex),
@@ -494,7 +592,10 @@ impl CompileState {
                 // outside `prepare_ns`, and benchmark runners must reject it.
                 // Poll only transient strong references so an early search
                 // can still drop the state and detach this pure-memory task.
-                if outcome.is_ok() {
+                if matches!(
+                    &outcome,
+                    Ok(SuccessfulCompileOutcome::Published(_))
+                ) {
                     loop {
                         let Some(snapshot) = Weak::upgrade(&weak) else {
                             return;
@@ -517,10 +618,16 @@ impl CompileState {
                 let ready_ns = duration_ns(state.started.elapsed());
                 let elapsed_compile_ns = compile_ns.load(Ordering::Acquire);
                 match &outcome {
-                    Ok(factory) => log::debug!(
+                    Ok(SuccessfulCompileOutcome::Published(factory)) => log::debug!(
                         "FRE AOT background ready after {elapsed_prepare_ns}ns \
                          (core compile {elapsed_compile_ns}ns): {}",
                         factory.description
+                    ),
+                    Ok(SuccessfulCompileOutcome::StockFallback) => log::debug!(
+                        "FRE AOT background selected stock fallback after \
+                         {elapsed_prepare_ns}ns (core compile \
+                         {elapsed_compile_ns}ns): no authenticated exact \
+                         Teddy supplement"
                     ),
                     Err(reason) => log::debug!(
                         "FRE AOT background decline after \
@@ -529,7 +636,10 @@ impl CompileState {
                          {reason}; using stock Rust regex"
                     ),
                 }
-                if outcome.is_ok() {
+                if matches!(
+                    &outcome,
+                    Ok(SuccessfulCompileOutcome::Published(_))
+                ) {
                     state.ready_ns.store(ready_ns, Ordering::Relaxed);
                 }
                 let _ = state.outcome.set(outcome);
@@ -587,8 +697,18 @@ impl CompileState {
     }
 
     fn receipt_json(&self) -> serde_json::Value {
-        let (outcome, decline_reason) = match self.outcome.get() {
-            Some(Ok(_)) => ("ready", None),
+        // Take one terminal-state snapshot. Classification is populated
+        // before the compiler installs this outcome, so a non-wait receipt
+        // may otherwise combine `unfinished` with the next state’s typed
+        // publication view.
+        let settled_outcome = self.outcome.get();
+        let (outcome, decline_reason) = match settled_outcome {
+            Some(Ok(SuccessfulCompileOutcome::Published(_))) => {
+                ("ready", None)
+            }
+            Some(Ok(SuccessfulCompileOutcome::StockFallback)) => {
+                ("stock_fallback", None)
+            }
             Some(Err(reason)) => ("declined", Some(reason.as_str())),
             None => (
                 "unfinished",
@@ -596,8 +716,10 @@ impl CompileState {
             ),
         };
         let first = *self.first_cutover.lock().unwrap();
-        let ready_ns = match self.outcome.get() {
-            Some(Ok(_)) => Some(self.ready_ns.load(Ordering::Relaxed)),
+        let ready_ns = match settled_outcome {
+            Some(Ok(SuccessfulCompileOutcome::Published(_))) => {
+                Some(self.ready_ns.load(Ordering::Relaxed))
+            }
             _ => None,
         };
         let classification =
@@ -610,6 +732,39 @@ impl CompileState {
             .compile_receipt_v2
             .as_ref()
             .map(compile_receipt_v2_json);
+        let (
+            publication_decision,
+            published_primary_native_route,
+            stock_candidate_scanner_active,
+            published_code_bytes,
+            published_read_only_data_bytes,
+            published_total_mapped_bytes,
+        ) = match settled_outcome {
+            Some(Ok(_)) => (
+                classification.aot_publication_decision,
+                classification.published_primary_native_route,
+                classification.stock_candidate_scanner_active,
+                classification.published_code_bytes,
+                classification.published_read_only_data_bytes,
+                classification.published_total_mapped_bytes,
+            ),
+            Some(Err(_)) => (
+                match classification.aot_publication_decision {
+                    AotPublicationDecision::CompileDeclined => {
+                        AotPublicationDecision::CompileDeclined
+                    }
+                    _ => AotPublicationDecision::Declined,
+                },
+                None,
+                true,
+                None,
+                None,
+                None,
+            ),
+            None => {
+                (AotPublicationDecision::Pending, None, true, None, None, None)
+            }
+        };
         let mut receipt = serde_json::json!({
             "schema": RECEIPT_SCHEMA,
             "outcome": outcome,
@@ -631,14 +786,20 @@ impl CompileState {
             "exact_finite_selected_end_teddy_policy_v2_request": classification.exact_finite_selected_end_teddy_policy_v2_request,
             "compile_receipt_v2": compile_receipt_v2,
             "exact_finite_selected_end_teddy_aot": exact_finite_selected_end_teddy_aot,
+            "aot_publication_policy": classification.aot_publication_policy.name(),
+            "aot_publication_decision": publication_decision.name(),
+            "compiled_artifact_available": classification.compiled_artifact_available,
+            "supplemental_route_authentication": classification.supplemental_route_authentication.name(),
+            "published_primary_native_route": published_primary_native_route,
+            "stock_candidate_scanner_active": stock_candidate_scanner_active,
             "wait_requested": self.wait_requested,
             "compiler_settled": self.compiler_settled.load(Ordering::Acquire),
             "publication_stage": classification.publication_stage,
             "publication_refusal_class": classification.publication_refusal_class,
             "runtime_helper_required": classification.runtime_helper_required,
-            "published_code_bytes": classification.published_code_bytes,
-            "published_read_only_data_bytes": classification.published_read_only_data_bytes,
-            "published_total_mapped_bytes": classification.published_total_mapped_bytes,
+            "published_code_bytes": published_code_bytes,
+            "published_read_only_data_bytes": published_read_only_data_bytes,
+            "published_total_mapped_bytes": published_total_mapped_bytes,
             // `compile_ns` is FRE's stable compile call or an explicitly
             // requested V2 compile call; both still emit the deterministic
             // object. `publish_ns` is direct in-process relocation/mapping/
@@ -787,10 +948,12 @@ impl BackgroundFreMatcher {
             return None;
         }
         match self.shared.outcome.get() {
-            Some(Ok(factory)) => {
+            Some(Ok(SuccessfulCompileOutcome::Published(factory))) => {
                 Some(NativeAotMatcher { factory: factory.as_ref() })
             }
-            Some(Err(_)) | None => None,
+            Some(Ok(SuccessfulCompileOutcome::StockFallback))
+            | Some(Err(_))
+            | None => None,
         }
     }
 
@@ -870,7 +1033,10 @@ impl BackgroundFreMatcher {
                 }
             };
             if let Some(factory) = factory {
-                self.shared.outcome.set(Ok(factory)).unwrap();
+                self.shared
+                    .outcome
+                    .set(Ok(SuccessfulCompileOutcome::Published(factory)))
+                    .unwrap();
             }
         }
         #[cfg(not(test))]
@@ -903,7 +1069,9 @@ impl BackgroundFreMatcher {
             .fetch_add(1, Ordering::Relaxed);
         let ordinal = self.current_file_ordinal.load(Ordering::Relaxed);
         self.shared.record_first_cutover(ordinal, stock_bytes);
-        if let Some(Ok(factory)) = self.shared.outcome.get() {
+        if let Some(Ok(SuccessfulCompileOutcome::Published(factory))) =
+            self.shared.outcome.get()
+        {
             log::debug!(
                 "FRE AOT background candidate-discovery mid-scan cutover in \
                  file ordinal {ordinal} after {stock_bytes} committed stock \
@@ -1270,6 +1438,9 @@ fn parse_exact_teddy_policy_v2(
         "force-structurally-eligible" => {
             Some(ExactTeddyPolicyV2Request::ForceStructurallyEligible)
         }
+        "force-selected-or-stock" => {
+            Some(ExactTeddyPolicyV2Request::ForceSelectedOrStock)
+        }
         _ => None,
     }
 }
@@ -1290,6 +1461,7 @@ fn classification_for_profile_and_policy(
     let mut classification = classification_for_profile(profile);
     classification.exact_finite_selected_end_teddy_policy_v2_request =
         policy.name();
+    classification.aot_publication_policy = policy.publication_policy();
     classification
 }
 
@@ -2211,6 +2383,17 @@ fn exact_teddy_report_v2_metadata_authenticates(
 /// it for the stable loader API. Automatic supplements bind back to the
 /// stable V1 report; forced supplements bind to the separately installed V2
 /// module report and must never populate the stable V1 field.
+fn forced_teddy_v2_supplement_copies_agree(
+    stable_report: Option<fre_aot_regex::ExactFiniteSelectedEndTeddyAotReport>,
+    module_v1: Option<fre_aot_regex::ExactFiniteSelectedEndTeddyAotReport>,
+    supplemental: Option<
+        fre_aot_regex::ExactFiniteSelectedEndTeddyAotReportV2,
+    >,
+    module_v2: Option<fre_aot_regex::ExactFiniteSelectedEndTeddyAotReportV2>,
+) -> bool {
+    stable_report.is_none() && module_v1.is_none() && supplemental == module_v2
+}
+
 fn copy_authenticated_exact_finite_selected_end_teddy_v2(
     compiled: &fre_aot_regex::CompiledRegexV2,
     requested_policy: fre_aot_regex::ExactFiniteSelectedEndTeddyPolicyV2,
@@ -2269,20 +2452,22 @@ fn copy_authenticated_exact_finite_selected_end_teddy_v2(
                 }
         }
         Policy::ForceStructurallyEligible => {
-            stable_report.is_none()
-                && module_v1.is_none()
-                && supplemental == module_v2
-                && supplemental.is_none_or(|report| {
-                    exact_teddy_report_v2_metadata_authenticates(
-                        &report,
-                        requested_policy,
-                        Basis::ForcedStructuralEligibility,
-                    ) && exact_teddy_report_authenticates(
-                        compiled.compiled(),
-                        &report.lowering,
-                        Basis::ForcedStructuralEligibility,
-                    )
-                })
+            forced_teddy_v2_supplement_copies_agree(
+                stable_report,
+                module_v1,
+                supplemental,
+                module_v2,
+            ) && supplemental.is_none_or(|report| {
+                exact_teddy_report_v2_metadata_authenticates(
+                    &report,
+                    requested_policy,
+                    Basis::ForcedStructuralEligibility,
+                ) && exact_teddy_report_authenticates(
+                    compiled.compiled(),
+                    &report.lowering,
+                    Basis::ForcedStructuralEligibility,
+                )
+            })
         }
     };
     if !valid {
@@ -2510,6 +2695,50 @@ fn publication_error_classification(
     }
 }
 
+fn record_compiled_classification(
+    classification: &mut ReceiptClassification,
+    receipt: &fre_aot_regex::CompileReceipt,
+    compile_receipt_v2: Option<fre_aot_regex::CompileReceiptV2>,
+    exact_finite_selected_end_teddy_aot: Option<
+        fre_aot_regex::ExactFiniteSelectedEndTeddyAotReport,
+    >,
+) -> &'static str {
+    let (
+        compiled_state_source,
+        compiled_forward_states,
+        compiled_reverse_states,
+    ) = selected_machine_states_with_v2(receipt, compile_receipt_v2.as_ref());
+    let primary_native_route = selected_primary_native_route_with_v2(
+        receipt,
+        compile_receipt_v2.as_ref(),
+    );
+    classification.compiler_engine =
+        Some(compiler_engine_name(receipt.engine));
+    classification.engine_selection_reason =
+        Some(engine_selection_reason_name(receipt.engine_selection_reason));
+    classification.start_accelerator =
+        Some(start_accelerator_name(receipt.start_accelerator));
+    classification.compiled_output_contract =
+        Some(output_contract_name(receipt.output));
+    classification.compiled_entry_abi =
+        Some(entry_abi_name(receipt.entry_abi));
+    classification.compiled_state_source = compiled_state_source;
+    classification.compiled_forward_states = compiled_forward_states;
+    classification.compiled_reverse_states = compiled_reverse_states;
+    classification.compiled_reverse_start_recovery = Some(
+        receipt
+            .passes
+            .contains(&fre_aot_regex::OptimizationPass::ReverseStartRecovery),
+    );
+    classification.compiled_primary_native_route = Some(primary_native_route);
+    classification.compile_receipt_v2 = compile_receipt_v2;
+    classification.exact_finite_selected_end_teddy_aot =
+        exact_finite_selected_end_teddy_aot;
+    classification.runtime_helper_required = receipt.runtime_helper_required;
+    classification.compiled_artifact_available = true;
+    primary_native_route
+}
+
 fn compile_native_factory(
     pattern: String,
     task: CompileTask<'_>,
@@ -2536,6 +2765,8 @@ fn compile_native_factory(
         target_plan_for_profile(target_feature_profile);
     classification.exact_finite_selected_end_teddy_policy_v2_request =
         exact_teddy_policy_v2.name();
+    classification.aot_publication_policy =
+        exact_teddy_policy_v2.publication_policy();
     *receipt_classification.lock().unwrap() = classification;
     let target = match target {
         Ok(target) => target,
@@ -2578,6 +2809,8 @@ fn compile_native_factory(
             let mut classification = receipt_classification.lock().unwrap();
             classification.publication_stage = "compile";
             classification.publication_refusal_class = Some(refusal_class);
+            classification.aot_publication_decision =
+                AotPublicationDecision::CompileDeclined;
             return Err(refusal_class.to_owned());
         }
     };
@@ -2585,7 +2818,14 @@ fn compile_native_factory(
         return Err("compilation_cancelled".to_owned());
     }
     let (compiled, compile_receipt_v2) = match compiled {
-        CompletedCompilation::Stable(compiled) => (compiled, None),
+        CompletedCompilation::Stable(compiled) => {
+            receipt_classification
+                .lock()
+                .unwrap()
+                .supplemental_route_authentication =
+                SupplementalRouteAuthentication::NotApplicable;
+            (compiled, None)
+        }
         CompletedCompilation::V2(compiled_v2) => {
             let requested_policy = exact_teddy_policy_v2
                 .compiler_policy()
@@ -2606,6 +2846,53 @@ fn compile_native_factory(
                         return Err(refusal_class.to_owned());
                     }
                 };
+            let supplemental_route_authentication =
+                if receipt_v2.exact_finite_selected_end_teddy_aot.is_some() {
+                    SupplementalRouteAuthentication::PresentVerified
+                } else {
+                    SupplementalRouteAuthentication::AbsentVerified
+                };
+            receipt_classification
+                .lock()
+                .unwrap()
+                .supplemental_route_authentication =
+                supplemental_route_authentication;
+            if exact_teddy_policy_v2
+                == ExactTeddyPolicyV2Request::ForceSelectedOrStock
+                && receipt_v2.exact_finite_selected_end_teddy_aot.is_none()
+            {
+                let receipt = compiled_v2.receipt();
+                if receipt.output != OutputContract::SelectedEnd
+                    || receipt.entry_abi
+                        != fre_aot_regex::EntryAbi::SelectedEndSearchV1
+                {
+                    let mut classification =
+                        receipt_classification.lock().unwrap();
+                    classification.publication_stage = "artifact_validation";
+                    classification.publication_refusal_class =
+                        Some("compiled_contract_mismatch");
+                    classification.aot_publication_decision =
+                        AotPublicationDecision::Declined;
+                    return Err("compiled_contract_mismatch".to_owned());
+                }
+                let mut classification =
+                    receipt_classification.lock().unwrap();
+                record_compiled_classification(
+                    &mut classification,
+                    receipt,
+                    Some(receipt_v2),
+                    None,
+                );
+                classification.publication_stage = "not_published_by_policy";
+                classification.publication_refusal_class = None;
+                classification.aot_publication_decision =
+                    AotPublicationDecision::StockFallbackNoAuthenticatedExactTeddy;
+                classification.published_primary_native_route = None;
+                classification.stock_candidate_scanner_active = true;
+                drop(classification);
+                drop(compiled_v2);
+                return Ok(SuccessfulCompileOutcome::StockFallback);
+            }
             (compiled_v2.into_compiled(), Some(receipt_v2))
         }
     };
@@ -2621,41 +2908,15 @@ fn compile_native_factory(
             }
         };
     let receipt = compiled.receipt();
-    let (
-        compiled_state_source,
-        compiled_forward_states,
-        compiled_reverse_states,
-    ) = selected_machine_states_with_v2(receipt, compile_receipt_v2.as_ref());
+    let primary_native_route;
     {
         let mut classification = receipt_classification.lock().unwrap();
-        classification.compiler_engine =
-            Some(compiler_engine_name(receipt.engine));
-        classification.engine_selection_reason = Some(
-            engine_selection_reason_name(receipt.engine_selection_reason),
+        primary_native_route = record_compiled_classification(
+            &mut classification,
+            receipt,
+            compile_receipt_v2,
+            exact_finite_selected_end_teddy_aot,
         );
-        classification.start_accelerator =
-            Some(start_accelerator_name(receipt.start_accelerator));
-        classification.compiled_output_contract =
-            Some(output_contract_name(receipt.output));
-        classification.compiled_entry_abi =
-            Some(entry_abi_name(receipt.entry_abi));
-        classification.compiled_state_source = compiled_state_source;
-        classification.compiled_forward_states = compiled_forward_states;
-        classification.compiled_reverse_states = compiled_reverse_states;
-        classification.compiled_reverse_start_recovery =
-            Some(receipt.passes.contains(
-                &fre_aot_regex::OptimizationPass::ReverseStartRecovery,
-            ));
-        classification.compiled_primary_native_route =
-            Some(selected_primary_native_route_with_v2(
-                receipt,
-                compile_receipt_v2.as_ref(),
-            ));
-        classification.compile_receipt_v2 = compile_receipt_v2;
-        classification.exact_finite_selected_end_teddy_aot =
-            exact_finite_selected_end_teddy_aot;
-        classification.runtime_helper_required =
-            receipt.runtime_helper_required;
         classification.publication_stage = "publish";
     }
     if receipt.output != OutputContract::SelectedEnd
@@ -2707,6 +2968,11 @@ fn compile_native_factory(
         let mut classification = receipt_classification.lock().unwrap();
         classification.publication_stage = "published";
         classification.publication_refusal_class = None;
+        classification.aot_publication_decision =
+            AotPublicationDecision::Published;
+        classification.published_primary_native_route =
+            Some(primary_native_route);
+        classification.stock_candidate_scanner_active = false;
         classification.published_code_bytes =
             Some(u64_len(accounting.code_bytes()));
         classification.published_read_only_data_bytes =
@@ -2714,7 +2980,10 @@ fn compile_native_factory(
         classification.published_total_mapped_bytes =
             Some(u64_len(accounting.total_mapped_bytes()));
     }
-    Ok(Arc::new(NativeAotFactory { published, description }))
+    Ok(SuccessfulCompileOutcome::Published(Arc::new(NativeAotFactory {
+        published,
+        description,
+    })))
 }
 
 #[cfg(test)]
@@ -2864,6 +3133,25 @@ mod tests {
             parse_exact_teddy_policy_v2("force-structurally-eligible"),
             Some(ExactTeddyPolicyV2Request::ForceStructurallyEligible)
         );
+        assert_eq!(
+            parse_exact_teddy_policy_v2("force-selected-or-stock"),
+            Some(ExactTeddyPolicyV2Request::ForceSelectedOrStock)
+        );
+        assert_eq!(
+            ExactTeddyPolicyV2Request::ForceSelectedOrStock.compiler_policy(),
+            ExactTeddyPolicyV2Request::ForceStructurallyEligible
+                .compiler_policy()
+        );
+        assert_eq!(
+            ExactTeddyPolicyV2Request::ForceStructurallyEligible
+                .publication_policy(),
+            AotPublicationPolicy::PublishAnyCompiledSelectedEnd
+        );
+        assert_eq!(
+            ExactTeddyPolicyV2Request::ForceSelectedOrStock
+                .publication_policy(),
+            AotPublicationPolicy::AuthenticatedExactTeddyOnly
+        );
         assert_eq!(parse_exact_teddy_policy_v2("force"), None);
         assert_eq!(parse_exact_teddy_policy_v2("Automatic"), None);
         assert_eq!(parse_exact_teddy_policy_v2(""), None);
@@ -2884,6 +3172,173 @@ mod tests {
         assert_eq!(classification.host_target_feature_bits, None);
         assert_eq!(classification.target_feature_bits, None);
         assert_eq!(classification.publication_stage, "not_started");
+    }
+
+    #[test]
+    fn selected_or_stock_authenticates_absence_and_settles_on_stock() {
+        let cancelled = AtomicBool::new(false);
+        let compile_ns = AtomicU64::new(0);
+        let publish_ns = AtomicU64::new(0);
+        let classification =
+            Mutex::new(classification_for_profile_and_policy(
+                TargetFeatureProfile::Auto,
+                ExactTeddyPolicyV2Request::ForceSelectedOrStock,
+            ));
+        let outcome = compile_native_factory(
+            "a".to_owned(),
+            CompileTask {
+                target_feature_profile: TargetFeatureProfile::Auto,
+                exact_teddy_policy_v2:
+                    ExactTeddyPolicyV2Request::ForceSelectedOrStock,
+                regex_size_limit: None,
+                dfa_size_limit: None,
+                cancelled: &cancelled,
+                compile_ns: &compile_ns,
+                publish_ns: &publish_ns,
+                receipt_classification: &classification,
+            },
+        )
+        .unwrap();
+        assert!(matches!(outcome, SuccessfulCompileOutcome::StockFallback));
+        assert_eq!(publish_ns.load(Ordering::Acquire), 0);
+
+        let classification = classification.lock().unwrap();
+        assert_eq!(
+            classification.exact_finite_selected_end_teddy_policy_v2_request,
+            "force_selected_or_stock"
+        );
+        assert_eq!(
+            classification.aot_publication_policy,
+            AotPublicationPolicy::AuthenticatedExactTeddyOnly
+        );
+        assert_eq!(
+            classification.aot_publication_decision,
+            AotPublicationDecision::StockFallbackNoAuthenticatedExactTeddy
+        );
+        assert!(classification.compiled_artifact_available);
+        assert_eq!(
+            classification.supplemental_route_authentication,
+            SupplementalRouteAuthentication::AbsentVerified
+        );
+        assert_eq!(
+            classification.compiled_primary_native_route,
+            Some("ordered_dfa")
+        );
+        assert_eq!(classification.published_primary_native_route, None);
+        assert!(classification.stock_candidate_scanner_active);
+        assert_eq!(
+            classification.publication_stage,
+            "not_published_by_policy"
+        );
+        assert_eq!(classification.publication_refusal_class, None);
+        assert_eq!(classification.published_code_bytes, None);
+        assert_eq!(classification.published_read_only_data_bytes, None);
+        assert_eq!(classification.published_total_mapped_bytes, None);
+    }
+
+    #[test]
+    fn existing_automatic_and_force_still_publish_ordinary_artifacts() {
+        for exact_teddy_policy_v2 in [
+            ExactTeddyPolicyV2Request::Automatic,
+            ExactTeddyPolicyV2Request::ForceStructurallyEligible,
+        ] {
+            let cancelled = AtomicBool::new(false);
+            let compile_ns = AtomicU64::new(0);
+            let publish_ns = AtomicU64::new(0);
+            let classification =
+                Mutex::new(classification_for_profile_and_policy(
+                    TargetFeatureProfile::Auto,
+                    exact_teddy_policy_v2,
+                ));
+            let outcome = compile_native_factory(
+                "a".to_owned(),
+                CompileTask {
+                    target_feature_profile: TargetFeatureProfile::Auto,
+                    exact_teddy_policy_v2,
+                    regex_size_limit: None,
+                    dfa_size_limit: None,
+                    cancelled: &cancelled,
+                    compile_ns: &compile_ns,
+                    publish_ns: &publish_ns,
+                    receipt_classification: &classification,
+                },
+            )
+            .unwrap();
+            assert!(matches!(outcome, SuccessfulCompileOutcome::Published(_)));
+
+            let classification = classification.lock().unwrap();
+            assert_eq!(
+                classification.aot_publication_policy,
+                AotPublicationPolicy::PublishAnyCompiledSelectedEnd
+            );
+            assert_eq!(
+                classification.aot_publication_decision,
+                AotPublicationDecision::Published
+            );
+            assert!(classification.compiled_artifact_available);
+            assert_eq!(
+                classification.supplemental_route_authentication,
+                SupplementalRouteAuthentication::AbsentVerified
+            );
+            assert_eq!(
+                classification.compiled_primary_native_route,
+                Some("ordered_dfa")
+            );
+            assert_eq!(
+                classification.published_primary_native_route,
+                Some("ordered_dfa")
+            );
+            assert!(!classification.stock_candidate_scanner_active);
+            assert!(classification.published_code_bytes.is_some());
+        }
+    }
+
+    #[test]
+    fn selected_or_stock_publishes_only_authenticated_teddy() {
+        let cancelled = AtomicBool::new(false);
+        let compile_ns = AtomicU64::new(0);
+        let publish_ns = AtomicU64::new(0);
+        let classification =
+            Mutex::new(classification_for_profile_and_policy(
+                TargetFeatureProfile::Auto,
+                ExactTeddyPolicyV2Request::ForceSelectedOrStock,
+            ));
+        let outcome = compile_native_factory(
+            "samwise|samw|frodo|pippin".to_owned(),
+            CompileTask {
+                target_feature_profile: TargetFeatureProfile::Auto,
+                exact_teddy_policy_v2:
+                    ExactTeddyPolicyV2Request::ForceSelectedOrStock,
+                regex_size_limit: None,
+                dfa_size_limit: None,
+                cancelled: &cancelled,
+                compile_ns: &compile_ns,
+                publish_ns: &publish_ns,
+                receipt_classification: &classification,
+            },
+        )
+        .unwrap();
+        assert!(matches!(outcome, SuccessfulCompileOutcome::Published(_)));
+
+        let classification = classification.lock().unwrap();
+        assert_eq!(
+            classification.supplemental_route_authentication,
+            SupplementalRouteAuthentication::PresentVerified
+        );
+        assert_eq!(
+            classification.compiled_primary_native_route,
+            Some("exact_finite_selected_end_teddy")
+        );
+        assert_eq!(
+            classification.published_primary_native_route,
+            Some("exact_finite_selected_end_teddy")
+        );
+        assert_eq!(
+            classification.aot_publication_decision,
+            AotPublicationDecision::Published
+        );
+        assert!(!classification.stock_candidate_scanner_active);
+        assert!(classification.published_code_bytes.is_some());
     }
 
     #[test]
@@ -2939,6 +3394,21 @@ mod tests {
             receipt["exact_finite_selected_end_teddy_aot"],
             serde_json::Value::Null
         );
+        assert_eq!(
+            receipt["aot_publication_policy"],
+            "publish_any_compiled_selected_end"
+        );
+        assert_eq!(receipt["aot_publication_decision"], "declined");
+        assert_eq!(receipt["compiled_artifact_available"], false);
+        assert_eq!(
+            receipt["supplemental_route_authentication"],
+            "not_available"
+        );
+        assert_eq!(
+            receipt["published_primary_native_route"],
+            serde_json::Value::Null
+        );
+        assert_eq!(receipt["stock_candidate_scanner_active"], true);
         assert_eq!(receipt["publication_stage"], "artifact_validation");
         assert_eq!(
             receipt["publication_refusal_class"],
@@ -2963,6 +3433,39 @@ mod tests {
         assert_eq!(receipt["wait_requested"], true);
         assert_eq!(receipt["compiler_settled"], true);
         assert_eq!(receipt["outcome"], "declined");
+    }
+
+    #[test]
+    fn unfinished_receipt_keeps_typed_publication_view_pending() {
+        let mut classification = ReceiptClassification::pending("auto");
+        classification.publication_stage = "published";
+        classification.aot_publication_decision =
+            AotPublicationDecision::Published;
+        classification.published_primary_native_route = Some("ordered_dfa");
+        classification.stock_candidate_scanner_active = false;
+        classification.published_code_bytes = Some(4096);
+        classification.published_read_only_data_bytes = Some(1024);
+        classification.published_total_mapped_bytes = Some(8192);
+        let state = CompileState::empty_with_classification(classification);
+
+        let receipt = state.receipt_json();
+        assert_eq!(receipt["outcome"], "unfinished");
+        assert_eq!(receipt["aot_publication_decision"], "pending");
+        assert_eq!(
+            receipt["published_primary_native_route"],
+            serde_json::Value::Null
+        );
+        assert_eq!(receipt["stock_candidate_scanner_active"], true);
+        assert_eq!(receipt["published_code_bytes"], serde_json::Value::Null);
+        assert_eq!(
+            receipt["published_read_only_data_bytes"],
+            serde_json::Value::Null
+        );
+        assert_eq!(
+            receipt["published_total_mapped_bytes"],
+            serde_json::Value::Null
+        );
+        assert_eq!(receipt["publication_stage"], "published");
     }
 
     #[test]
@@ -3123,6 +3626,18 @@ mod tests {
         let report = receipt_v2
             .exact_finite_selected_end_teddy_aot
             .expect("the structurally eligible fixture selects forced V2");
+        assert!(forced_teddy_v2_supplement_copies_agree(
+            None,
+            None,
+            Some(report),
+            Some(report),
+        ));
+        assert!(!forced_teddy_v2_supplement_copies_agree(
+            None,
+            None,
+            Some(report),
+            None,
+        ));
         assert_eq!(report.requested_policy, Policy::ForceStructurallyEligible);
         assert_eq!(report.selection_basis, Basis::ForcedStructuralEligibility);
         assert!(report.performance_admission_bypassed);
@@ -3198,7 +3713,7 @@ mod tests {
             0,
         );
         let receipt_json = state.receipt_json();
-        assert_eq!(receipt_json["schema"], "ripgrep.fre-aot-background.v6");
+        assert_eq!(receipt_json["schema"], "ripgrep.fre-aot-background.v7");
         assert_eq!(
             receipt_json["exact_finite_selected_end_teddy_policy_v2_request"],
             "force_structurally_eligible"
@@ -3478,7 +3993,10 @@ mod tests {
         matcher.begin_file();
         assert_eq!(matcher.shortest_match(b"ba").unwrap(), Some(2));
 
-        shared.outcome.set(Ok(test_factory("."))).unwrap();
+        shared
+            .outcome
+            .set(Ok(SuccessfulCompileOutcome::Published(test_factory("."))))
+            .unwrap();
         assert_eq!(matcher.shortest_match(b"ba").unwrap(), Some(1));
         assert_eq!(shared.candidate_stock_files.load(Ordering::Relaxed), 1);
         assert_eq!(shared.candidate_aot_files.load(Ordering::Relaxed), 1);
@@ -3499,7 +4017,10 @@ mod tests {
             .unwrap();
         let mut shared = CompileState::empty();
         Arc::get_mut(&mut shared).unwrap().telemetry_enabled = false;
-        shared.outcome.set(Ok(test_factory("a"))).unwrap();
+        shared
+            .outcome
+            .set(Ok(SuccessfulCompileOutcome::Published(test_factory("a"))))
+            .unwrap();
         let mut matcher = matcher_with(stock, Arc::clone(&shared));
 
         matcher.begin_file();
@@ -3516,6 +4037,26 @@ mod tests {
         let expected = matcher.stock.find_candidate_line(b"zzaz").unwrap();
         let actual = matcher.find_candidate_line(b"zzaz").unwrap();
         assert_eq!(format!("{expected:?}"), format!("{actual:?}"));
+    }
+
+    #[test]
+    fn selected_or_stock_terminal_fallback_keeps_candidate_scanner_stock() {
+        let stock =
+            grep::regex::RegexMatcherBuilder::new().build("a").unwrap();
+        let shared = CompileState::empty();
+        shared
+            .outcome
+            .set(Ok(SuccessfulCompileOutcome::StockFallback))
+            .unwrap();
+        let mut matcher = matcher_with(stock, Arc::clone(&shared));
+        matcher.begin_file();
+
+        let expected = matcher.stock.find_candidate_line(b"zzaz").unwrap();
+        let actual = matcher.find_candidate_line(b"zzaz").unwrap();
+        assert_eq!(format!("{expected:?}"), format!("{actual:?}"));
+        assert!(!matcher.publication_pending());
+        assert_eq!(shared.candidate_stock_windows.load(Ordering::Relaxed), 1);
+        assert_eq!(shared.candidate_aot_windows.load(Ordering::Relaxed), 0);
     }
 
     #[test]
@@ -3631,7 +4172,10 @@ mod tests {
         assert!(
             shared.candidate_stock_committed_bytes.load(Ordering::Acquire) > 0
         );
-        shared.outcome.set(Ok(test_factory("z"))).unwrap();
+        shared
+            .outcome
+            .set(Ok(SuccessfulCompileOutcome::Published(test_factory("z"))))
+            .unwrap();
         assert!(matcher.find_candidate_line(b"").unwrap().is_none());
 
         assert_eq!(shared.candidate_aot_windows.load(Ordering::Relaxed), 0);
@@ -3651,7 +4195,10 @@ mod tests {
             .build("(?P<letter>a)")
             .unwrap();
         let shared = CompileState::empty();
-        shared.outcome.set(Ok(test_factory("a"))).unwrap();
+        shared
+            .outcome
+            .set(Ok(SuccessfulCompileOutcome::Published(test_factory("a"))))
+            .unwrap();
         let mut matcher = matcher_with(stock, Arc::clone(&shared));
         matcher.begin_file();
         assert_eq!(matcher.capture_index("letter"), Some(1));
@@ -3676,7 +4223,10 @@ mod tests {
             .build("a")
             .unwrap();
         let shared = CompileState::empty();
-        shared.outcome.set(Ok(test_factory("a"))).unwrap();
+        shared
+            .outcome
+            .set(Ok(SuccessfulCompileOutcome::Published(test_factory("a"))))
+            .unwrap();
         let mut matcher = matcher_with(stock, Arc::clone(&shared));
         matcher.begin_file();
 

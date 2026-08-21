@@ -51,6 +51,12 @@ def receipt_fixture(**overrides):
         ),
         "compile_receipt_v2": None,
         "exact_finite_selected_end_teddy_aot": None,
+        "aot_publication_policy": HARNESS.PUBLISH_ANY_COMPILED_POLICY,
+        "aot_publication_decision": "declined",
+        "compiled_artifact_available": False,
+        "supplemental_route_authentication": "not_available",
+        "published_primary_native_route": None,
+        "stock_candidate_scanner_active": True,
         "wait_requested": False,
         "compiler_settled": True,
         "runtime_helper_required": False,
@@ -74,6 +80,11 @@ def receipt_fixture(**overrides):
     ):
         receipt[field] = 0
     receipt.update(overrides)
+    if (
+        receipt.get("outcome") == "unfinished"
+        and "aot_publication_decision" not in overrides
+    ):
+        receipt["aot_publication_decision"] = "pending"
     return receipt
 
 
@@ -93,6 +104,11 @@ def ready_receipt(**overrides):
         compiled_reverse_states=0,
         compiled_reverse_start_recovery=False,
         compiled_primary_native_route="ordered_dfa",
+        aot_publication_decision="published",
+        compiled_artifact_available=True,
+        supplemental_route_authentication="not_applicable",
+        published_primary_native_route="ordered_dfa",
+        stock_candidate_scanner_active=False,
         published_code_bytes=4096,
         published_read_only_data_bytes=1024,
         published_total_mapped_bytes=8192,
@@ -102,6 +118,13 @@ def ready_receipt(**overrides):
         prepare_ns=7,
     )
     receipt.update(overrides)
+    if (
+        "compiled_primary_native_route" in overrides
+        and "published_primary_native_route" not in overrides
+    ):
+        receipt["published_primary_native_route"] = overrides[
+            "compiled_primary_native_route"
+        ]
     return receipt
 
 
@@ -189,6 +212,7 @@ def exact_teddy_ready_receipt(**overrides):
         compiled_forward_states=23,
         compiled_reverse_states=0,
         compiled_primary_native_route=HARNESS.EXACT_TEDDY_PRIMARY_ROUTE,
+        published_primary_native_route=HARNESS.EXACT_TEDDY_PRIMARY_ROUTE,
         exact_finite_selected_end_teddy_aot=exact_teddy_report_fixture(),
         published_read_only_data_bytes=372,
     )
@@ -230,6 +254,7 @@ def forced_exact_teddy_v2_ready_receipt(**overrides):
             ),
             "exact_finite_selected_end_teddy_aot_v2": report,
         },
+        supplemental_route_authentication="present_verified",
         start_accelerator="aarch64_sve",
         compiled_state_source=(
             "exact_finite_selected_end_teddy_incumbent"
@@ -237,6 +262,7 @@ def forced_exact_teddy_v2_ready_receipt(**overrides):
         compiled_forward_states=23,
         compiled_reverse_states=0,
         compiled_primary_native_route=HARNESS.EXACT_TEDDY_PRIMARY_ROUTE,
+        published_primary_native_route=HARNESS.EXACT_TEDDY_PRIMARY_ROUTE,
         exact_finite_selected_end_teddy_aot=None,
         published_read_only_data_bytes=372,
     )
@@ -257,6 +283,7 @@ def forced_exact_teddy_v2_nonselected_ready_receipt(**overrides):
             ),
             "exact_finite_selected_end_teddy_aot_v2": None,
         },
+        supplemental_route_authentication="absent_verified",
         wait_requested=True,
         compiler_settled=True,
     )
@@ -275,6 +302,52 @@ def forced_exact_teddy_v2_compile_decline_receipt(**overrides):
         compile_receipt_v2=None,
         wait_requested=True,
         compiler_settled=True,
+        aot_publication_decision="compile_declined",
+    )
+    receipt.update(overrides)
+    return receipt
+
+
+def selected_or_stock_teddy_ready_receipt(**overrides):
+    receipt = forced_exact_teddy_v2_ready_receipt(
+        exact_finite_selected_end_teddy_policy_v2_request=(
+            "force_selected_or_stock"
+        ),
+        aot_publication_policy=HARNESS.AUTHENTICATED_TEDDY_ONLY_POLICY,
+    )
+    receipt.update(overrides)
+    return receipt
+
+
+def selected_or_stock_nonselected_receipt(**overrides):
+    receipt = forced_exact_teddy_v2_nonselected_ready_receipt(
+        outcome="stock_fallback",
+        publication_stage="not_published_by_policy",
+        exact_finite_selected_end_teddy_policy_v2_request=(
+            "force_selected_or_stock"
+        ),
+        aot_publication_policy=HARNESS.AUTHENTICATED_TEDDY_ONLY_POLICY,
+        aot_publication_decision=(
+            "stock_fallback_no_authenticated_exact_teddy"
+        ),
+        published_primary_native_route=None,
+        stock_candidate_scanner_active=True,
+        published_code_bytes=None,
+        published_read_only_data_bytes=None,
+        published_total_mapped_bytes=None,
+        ready_ns_since_start=None,
+        publish_ns=0,
+    )
+    receipt.update(overrides)
+    return receipt
+
+
+def selected_or_stock_compile_decline_receipt(**overrides):
+    receipt = forced_exact_teddy_v2_compile_decline_receipt(
+        exact_finite_selected_end_teddy_policy_v2_request=(
+            "force_selected_or_stock"
+        ),
+        aot_publication_policy=HARNESS.AUTHENTICATED_TEDDY_ONLY_POLICY,
     )
     receipt.update(overrides)
     return receipt
@@ -392,6 +465,17 @@ class HarnessTests(unittest.TestCase):
                         "force-structurally-eligible"
                     ),
                 )
+                selected_or_stock = HARNESS.run_once(
+                    binary=executable,
+                    args=[],
+                    cwd=root,
+                    background=True,
+                    capture_receipt=False,
+                    cpu_profile="asimd",
+                    timeout_seconds=5.0,
+                    collect_timing=False,
+                    exact_teddy_policy_v2="force-selected-or-stock",
+                )
         self.assertEqual(
             b"|unset|unset|unset|unset|unset\n", normal["stdout_raw"]
         )
@@ -405,6 +489,11 @@ class HarnessTests(unittest.TestCase):
             b"|unset|unset|sve2|force-structurally-eligible|unset\n",
             forced["stdout_raw"],
         )
+        self.assertEqual(
+            b"|unset|unset|asimd|force-selected-or-stock|unset\n",
+            selected_or_stock["stdout_raw"],
+        )
+        self.assertIsNone(selected_or_stock["receipt"])
 
     def test_v2_policy_cannot_be_set_on_a_nonbackground_arm(self) -> None:
         with self.assertRaises(HARNESS.HarnessError):
@@ -441,13 +530,14 @@ class HarnessTests(unittest.TestCase):
                 cwd=Path("."),
                 cpu_profile="auto",
                 timeout_seconds=1.0,
-                exact_teddy_policy_v2="force-structurally-eligible",
+                exact_teddy_policy_v2="force-selected-or-stock",
             )
         self.assertEqual(3, run.call_count)
         for call in run.call_args_list:
+            self.assertFalse(call.kwargs["capture_receipt"])
             if call.kwargs["background"]:
                 self.assertEqual(
-                    "force-structurally-eligible",
+                    "force-selected-or-stock",
                     call.kwargs["exact_teddy_policy_v2"],
                 )
             else:
@@ -506,6 +596,57 @@ class HarnessTests(unittest.TestCase):
             "exact_teddy_v2_incumbent_not_accelerated",
             HARNESS.validate_exact_teddy_v2_gate_record(
                 gate, "auto", "force-structurally-eligible"
+            ),
+        )
+
+    def test_selected_or_stock_strict_select_gate_is_untimed(self) -> None:
+        panel = HARNESS.Panel(
+            HARNESS.EXACT_TEDDY_CENSUS_PANEL,
+            Path("/unused-corpus"),
+            "literal",
+            None,
+            True,
+            1,
+        )
+
+        def invoke(**kwargs):
+            receipt = (
+                selected_or_stock_teddy_ready_receipt(
+                    wait_requested=True, compiler_settled=True
+                )
+                if kwargs["background"] else None
+            )
+            return run_result(receipt)
+
+        with mock.patch.object(
+            HARNESS, "run_once", side_effect=invoke
+        ) as run:
+            gate = HARNESS.run_exact_teddy_v2_gate(
+                panel=panel,
+                candidate=Path("candidate"),
+                stock=Path("stock"),
+                cwd=Path("."),
+                cpu_profile="auto",
+                timeout_seconds=1.0,
+                exact_teddy_policy_v2="force-selected-or-stock",
+            )
+        self.assertEqual([], gate["failures"])
+        self.assertEqual(
+            HARNESS.EXACT_TEDDY_PRIMARY_ROUTE,
+            gate["background"]["receipt"][
+                "published_primary_native_route"
+            ],
+        )
+        for call in run.call_args_list:
+            self.assertFalse(call.kwargs["collect_timing"])
+        malformed = copy.deepcopy(gate)
+        malformed["background"]["receipt"][
+            "supplemental_route_authentication"
+        ] = "absent_verified"
+        self.assertIn(
+            "supplement_authentication_receipt_mismatch",
+            HARNESS.validate_exact_teddy_v2_gate_record(
+                malformed, "auto", "force-selected-or-stock"
             ),
         )
 
@@ -596,6 +737,26 @@ class HarnessTests(unittest.TestCase):
         }
         aggregate = HARNESS.aggregate_observations([row], {"q": case})
         self.assertEqual({"no_receipt": 1}, aggregate["routing"])
+
+    def test_stock_fallback_is_excluded_from_ready_timing_distributions(
+        self,
+    ) -> None:
+        case = HARNESS.QueryCase("q", "test", "raw", 1, None, {})
+        row = {
+            "private_id": "q",
+            "exact_normal_background": True,
+            "exact_stock_normal": True,
+            "receipt_failures": [],
+            "normalization": [],
+            "normal": {"status": 1},
+            "background": {
+                "timed_out": False,
+                "receipt": selected_or_stock_nonselected_receipt(),
+            },
+        }
+        aggregate = HARNESS.aggregate_observations([row], {"q": case})
+        self.assertIsNone(aggregate["ready_compile_ns"])
+        self.assertIsNone(aggregate["ready_publish_ns"])
 
     def test_public_result_binds_exact_private_bytes(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -820,6 +981,9 @@ class HarnessTests(unittest.TestCase):
             forced = HARNESS.exact_teddy_v2_campaign_record(
                 "force-structurally-eligible", cases
             )
+            selected_or_stock = HARNESS.exact_teddy_v2_campaign_record(
+                "force-selected-or-stock", cases
+            )
         self.assertEqual(44, forced["selected_patterns"])
         self.assertEqual(
             manifest_sha256,
@@ -838,6 +1002,18 @@ class HarnessTests(unittest.TestCase):
         )
         self.assertTrue(forced["result_blind"])
         self.assertFalse(forced["secondary_strata_result_blind"])
+        self.assertEqual(
+            HARNESS.AUTHENTICATED_TEDDY_ONLY_POLICY,
+            selected_or_stock["aot_publication_policy"],
+        )
+        self.assertEqual(
+            {
+                "selected_teddy_published": 34,
+                "ordinary_compiled_stock_fallback": 9,
+                "compile_object_decline": 1,
+            },
+            selected_or_stock["selected_or_stock_expected_dispositions"],
+        )
         self.assertEqual(
             34,
             forced["secondary_compiler_fact_strata"]
@@ -998,6 +1174,7 @@ class HarnessTests(unittest.TestCase):
         nfa["compiled_reverse_states"] = 0
         nfa["compiled_state_source"] = "slow_aot"
         nfa["compiled_primary_native_route"] = "slow_dfa"
+        nfa["published_primary_native_route"] = "slow_dfa"
         self.assertEqual([], HARNESS.validate_receipt(nfa, "auto"))
 
         finite = ready_receipt(
@@ -1213,25 +1390,182 @@ class HarnessTests(unittest.TestCase):
         self.assertEqual(
             [],
             HARNESS.validate_frozen_forced_exact_teddy_v2_nonselection(
-                ready_case, ready
+                ready_case, ready, "force-structurally-eligible"
             ),
         )
         self.assertEqual(
             [],
             HARNESS.validate_frozen_forced_exact_teddy_v2_nonselection(
-                decline_case, declined
+                decline_case, declined, "force-structurally-eligible"
             ),
         )
         self.assertIn(
             "forced_exact_teddy_v2_expected_ready_ordered_dfa",
             HARNESS.validate_frozen_forced_exact_teddy_v2_nonselection(
-                ready_case, declined
+                ready_case, declined, "force-structurally-eligible"
             ),
         )
         self.assertIn(
             "forced_exact_teddy_v2_expected_compile_object_decline",
             HARNESS.validate_frozen_forced_exact_teddy_v2_nonselection(
-                decline_case, ready
+                decline_case, ready, "force-structurally-eligible"
+            ),
+        )
+
+
+    def test_v7_selected_or_stock_has_three_strict_dispositions(self) -> None:
+        selected_validation = {
+            "require_current_schema": True,
+            "require_compiler_settlement": True,
+            "expected_exact_teddy_policy_v2": "force-selected-or-stock",
+            "require_forced_exact_teddy_v2": True,
+        }
+        selected = selected_or_stock_teddy_ready_receipt(
+            wait_requested=True, compiler_settled=True
+        )
+        self.assertEqual(
+            [], HARNESS.validate_receipt(
+                selected, "auto", **selected_validation
+            )
+        )
+
+        nonselected_validation = {
+            "require_current_schema": True,
+            "require_compiler_settlement": True,
+            "expected_exact_teddy_policy_v2": "force-selected-or-stock",
+            "require_forced_exact_teddy_v2_nonselection": True,
+        }
+        ordinary = selected_or_stock_nonselected_receipt()
+        decline = selected_or_stock_compile_decline_receipt()
+        for receipt in (ordinary, decline):
+            with self.subTest(outcome=receipt["outcome"]):
+                self.assertEqual(
+                    [], HARNESS.validate_receipt(
+                        receipt, "auto", **nonselected_validation
+                    )
+                )
+                self.assertTrue(
+                    HARNESS.definitive_forced_exact_teddy_v2_nonselection(
+                        receipt
+                    )
+                )
+
+        ordinary_case = HARNESS.QueryCase(
+            "oot-0002", "frozen-oot-84", "private", 1, None, {}
+        )
+        decline_case = HARNESS.QueryCase(
+            "wider-0121", "frozen-unique-sample-128", "private",
+            1, None, {},
+        )
+        for case, receipt in (
+            (ordinary_case, ordinary), (decline_case, decline),
+        ):
+            self.assertEqual(
+                [],
+                HARNESS.validate_frozen_forced_exact_teddy_v2_nonselection(
+                    case, receipt, "force-selected-or-stock"
+                ),
+                )
+
+        mutations = (
+            (
+                "published_primary_native_route", "ordered_dfa",
+                "stock_fallback_has_published_artifact",
+            ),
+            (
+                "published_code_bytes", 1,
+                "stock_fallback_has_published_artifact",
+            ),
+            (
+                "stock_candidate_scanner_active", False,
+                "stock_fallback_stock_scanner_inactive",
+            ),
+            (
+                "supplemental_route_authentication", "present_verified",
+                "supplement_authentication_receipt_mismatch",
+            ),
+        )
+        for field, value, expected in mutations:
+            with self.subTest(field=field):
+                malformed = copy.deepcopy(ordinary)
+                malformed[field] = value
+                self.assertIn(
+                    expected,
+                    HARNESS.validate_receipt(
+                        malformed, "auto", **nonselected_validation
+                    ),
+                )
+
+    def test_v7_nonpublished_states_reject_publication_evidence(self) -> None:
+        receipts = (
+            (
+                receipt_fixture(published_code_bytes=1),
+                "declined_with_published_artifact",
+            ),
+            (
+                receipt_fixture(
+                    outcome="unfinished",
+                    decline_reason=(
+                        "search finished before background compilation"
+                    ),
+                    publication_stage="published",
+                    publication_refusal_class=None,
+                    compiler_settled=False,
+                    ready_ns_since_start=1,
+                ),
+                "unfinished_with_published_artifact",
+            ),
+        )
+        for receipt, expected in receipts:
+            with self.subTest(outcome=receipt["outcome"]):
+                self.assertIn(
+                    expected, HARNESS.validate_receipt(receipt, "auto")
+                )
+
+    def test_v6_artifacts_remain_readable_but_cannot_drive_live_policy(self) -> None:
+        receipt = forced_exact_teddy_v2_ready_receipt(
+            schema=HARNESS.V6_RECEIPT_SCHEMA
+        )
+        for field in (
+            "aot_publication_policy", "aot_publication_decision",
+            "compiled_artifact_available",
+            "supplemental_route_authentication",
+            "published_primary_native_route",
+            "stock_candidate_scanner_active",
+        ):
+            del receipt[field]
+        self.assertEqual(
+            [], HARNESS.validate_receipt(
+                receipt,
+                "auto",
+                expected_exact_teddy_policy_v2=(
+                    "force-structurally-eligible"
+                ),
+                require_forced_exact_teddy_v2=True,
+            )
+        )
+        self.assertIn(
+            "current_receipt_schema_required",
+            HARNESS.validate_receipt(
+                receipt,
+                "auto",
+                expected_exact_teddy_policy_v2=(
+                    "force-structurally-eligible"
+                ),
+                require_forced_exact_teddy_v2=True,
+                require_current_schema=True,
+            ),
+        )
+        selected_or_stock_v6 = copy.deepcopy(receipt)
+        selected_or_stock_v6[
+            "exact_finite_selected_end_teddy_policy_v2_request"
+        ] = "force_selected_or_stock"
+        self.assertIn(
+            "selected_or_stock_requires_v7",
+            HARNESS.validate_receipt(
+                selected_or_stock_v6,
+                "auto",
+                expected_exact_teddy_policy_v2="force-selected-or-stock",
             ),
         )
 
@@ -2031,6 +2365,63 @@ class HarnessTests(unittest.TestCase):
         self.assertEqual(2, result["all_selected"]["count"])
         self.assertEqual({"count": 1}, result["by_cohort"]["primary"])
         self.assertNotIn("raw-one", repr(result))
+
+    def test_selected_or_stock_summary_requires_exact_34_9_1(self) -> None:
+        rows = []
+        for case in synthetic_frozen_exact_teddy_v2_cases():
+            if (
+                case.private_id
+                in HARNESS.FROZEN_EXACT_TEDDY_V2_FORCE_SELECTED_PRIVATE_IDS
+            ):
+                receipt = selected_or_stock_teddy_ready_receipt(
+                    wait_requested=True, compiler_settled=True
+                )
+            elif (
+                case.private_id
+                in HARNESS.FROZEN_EXACT_TEDDY_V2_FORCE_COMPILE_DECLINE_PRIVATE_IDS
+            ):
+                receipt = selected_or_stock_compile_decline_receipt()
+            else:
+                receipt = selected_or_stock_nonselected_receipt()
+            rows.append({
+                "private_id": case.private_id,
+                "cpu_profile": "auto",
+                "panel": HARNESS.EXACT_TEDDY_CENSUS_PANEL,
+                "background": {"receipt": receipt},
+                "receipt_failures": [],
+            })
+        summary = HARNESS.selected_or_stock_disposition_summary(
+            rows, ["auto"], "force-selected-or-stock"
+        )
+        assert summary is not None
+        self.assertTrue(summary["all_profiles_qualified"])
+        self.assertEqual(
+            {
+                "selected_teddy_published": 34,
+                "ordinary_compiled_stock_fallback": 9,
+                "compile_object_decline": 1,
+                "invalid": 0,
+                "qualified": True,
+            },
+            summary["per_profile"]["auto"],
+        )
+        malformed = copy.deepcopy(rows)
+        ordinary = next(
+            row for row in malformed
+            if row["private_id"]
+            in (
+                HARNESS.FROZEN_EXACT_TEDDY_V2_FORCE_NONSELECTED_PRIVATE_IDS
+                - HARNESS.FROZEN_EXACT_TEDDY_V2_FORCE_COMPILE_DECLINE_PRIVATE_IDS
+            )
+        )
+        ordinary["background"]["receipt"] = (
+            forced_exact_teddy_v2_nonselected_ready_receipt()
+        )
+        summary = HARNESS.selected_or_stock_disposition_summary(
+            malformed, ["auto"], "force-selected-or-stock"
+        )
+        assert summary is not None
+        self.assertFalse(summary["all_profiles_qualified"])
 
     def test_v2_aggregate_keeps_fixed44_itt_and_both_strata(self) -> None:
         cases = synthetic_frozen_exact_teddy_v2_cases()
