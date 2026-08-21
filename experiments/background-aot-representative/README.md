@@ -1,5 +1,7 @@
 # Representative background-AOT experiment
 
+The completed local and EC2 results are in [RESULTS.md](RESULTS.md).
+
 This harness tests the normal ripgrep path against the same binary with
 `--fre-aot-background` on frozen, actual ripgrep query shapes. It does not use
 the earlier synthetic `a{0,99}b` workload.
@@ -129,8 +131,9 @@ cold-cache first traversal. A
 formal run refuses a probe with missing cases, output mismatches, receipt
 validation failures, changed binaries, changed source, changed corpus trees,
 changed host/toolchain/SVE vector length, a changed raw cohort manifest, or
-changed frozen inventory. The public probe binds the complete private probe by
-SHA-256. The formal gate reconstructs the exact profile/panel/case row matrix,
+changed frozen inventory. Both public result files bind their complete private
+counterpart by SHA-256. The formal gate reconstructs the exact
+profile/panel/case row matrix,
 recomputes semantic output equality and receipt validation from private
 evidence, and requires its regenerated aggregates to equal the public report.
 Provenance parses the candidate's Cargo manifest and

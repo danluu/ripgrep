@@ -21,6 +21,25 @@ SPEC.loader.exec_module(HARNESS)
 
 
 class HarnessTests(unittest.TestCase):
+    def test_public_result_binds_exact_private_bytes(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            private = root / "result.private.json"
+            public = root / "result.public.json"
+            HARNESS.write_bound_result_pair(
+                private,
+                public,
+                {"schema": "private", "rows": [1, 2, 3]},
+                {"schema": "public", "aggregate_only": True},
+            )
+            public_value = json.loads(public.read_text())
+            self.assertEqual(
+                HARNESS.sha256_file(private),
+                public_value["private_result_sha256"],
+            )
+            self.assertEqual(0o600, private.stat().st_mode & 0o777)
+            self.assertEqual(0o644, public.stat().st_mode & 0o777)
+
     def test_unordered_output_preserves_duplicate_records(self) -> None:
         base = {"status": 0, "stderr_raw": b"", "stdout_raw": b"a\nb\na\n"}
         reordered = {

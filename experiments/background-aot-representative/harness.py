@@ -1402,6 +1402,19 @@ def write_new_json(path: Path, value: Mapping[str, Any], mode: int) -> None:
         raise
 
 
+def write_bound_result_pair(
+    private_path: Path,
+    public_path: Path,
+    private: Mapping[str, Any],
+    public: Mapping[str, Any],
+) -> None:
+    """Write a private result and bind its exact bytes into the public result."""
+    write_new_json(private_path, private, 0o600)
+    bound_public = dict(public)
+    bound_public["private_result_sha256"] = sha256_file(private_path)
+    write_new_json(public_path, bound_public, 0o644)
+
+
 def provenance(
     args: argparse.Namespace,
     corpora: Mapping[str, Any],
@@ -1821,9 +1834,9 @@ def run_probe(args: argparse.Namespace) -> None:
         "post_run_selection_verified": True,
         "post_run_provenance_verified": True,
     }
-    write_new_json(args.private_output, private, 0o600)
-    public["private_result_sha256"] = sha256_file(args.private_output)
-    write_new_json(args.public_output, public, 0o644)
+    write_bound_result_pair(
+        args.private_output, args.public_output, private, public
+    )
 
 
 def run_pair(
@@ -2221,8 +2234,9 @@ def run_benchmark(args: argparse.Namespace) -> None:
         "post_run_selection_verified": True,
         "post_run_provenance_verified": True,
     }
-    write_new_json(args.private_output, private, 0o600)
-    write_new_json(args.public_output, public, 0o644)
+    write_bound_result_pair(
+        args.private_output, args.public_output, private, public
+    )
 
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
