@@ -29,9 +29,10 @@ use grep::{
 };
 
 const RECEIPT_ENV: &str = "RG_FRE_AOT_BACKGROUND_RECEIPT";
+const CPU_PROFILE_ENV: &str = "RG_FRE_AOT_BACKGROUND_CPU_PROFILE";
 const TEST_MIN_STOCK_BYTES_ENV: &str =
     "RG_FRE_AOT_BACKGROUND_TEST_MIN_STOCK_BYTES";
-const RECEIPT_SCHEMA: &str = "ripgrep.fre-aot-background.v2";
+const RECEIPT_SCHEMA: &str = "ripgrep.fre-aot-background.v3";
 const PENDING_SCAN_QUANTUM: usize = 1 << 20;
 static RECEIPT_NONCE: AtomicU64 = AtomicU64::new(0);
 
@@ -41,6 +42,74 @@ static RECEIPT_NONCE: AtomicU64 = AtomicU64::new(0);
 struct NativeAotFactory {
     published: fre_aot_regex_loader::PublishedSpan,
     description: String,
+}
+
+/// An experiment-only restriction on the CPU features visible to FRE's
+/// native lowering. `Sve` and `Sve2` deliberately omit the ASIMD feature bit,
+/// which prevents FRE's optional ASIMD routes from being selected. The
+/// receipt still records the accelerator actually emitted so benchmark
+/// analysis can verify that contract instead of inferring it from the mask.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TargetFeatureProfile {
+    Auto,
+    Asimd,
+    Sve,
+    Sve2,
+}
+
+impl TargetFeatureProfile {
+    const fn name(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Asimd => "asimd",
+            Self::Sve => "sve",
+            Self::Sve2 => "sve2",
+        }
+    }
+}
+
+/// Pattern-free fields copied into the optional benchmark receipt. No field
+/// here contains source spelling, object identity or an error's Display text.
+#[derive(Clone, Debug)]
+struct ReceiptClassification {
+    target_feature_profile: &'static str,
+    requested_target_feature_bits: Option<u64>,
+    host_target_feature_bits: Option<u64>,
+    target_feature_bits: Option<u64>,
+    compiler_engine: Option<&'static str>,
+    engine_selection_reason: Option<&'static str>,
+    start_accelerator: Option<&'static str>,
+    publication_stage: &'static str,
+    publication_refusal_class: Option<&'static str>,
+    runtime_helper_required: bool,
+    published_code_bytes: Option<u64>,
+    published_read_only_data_bytes: Option<u64>,
+    published_total_mapped_bytes: Option<u64>,
+}
+
+impl ReceiptClassification {
+    fn pending(profile: &'static str) -> Self {
+        Self {
+            target_feature_profile: profile,
+            requested_target_feature_bits: None,
+            host_target_feature_bits: None,
+            target_feature_bits: None,
+            compiler_engine: None,
+            engine_selection_reason: None,
+            start_accelerator: None,
+            publication_stage: "not_started",
+            publication_refusal_class: None,
+            runtime_helper_required: false,
+            published_code_bytes: None,
+            published_read_only_data_bytes: None,
+            published_total_mapped_bytes: None,
+        }
+    }
+}
+
+struct TargetPlan {
+    classification: ReceiptClassification,
+    target: Result<fre_aot_regex::Target, &'static str>,
 }
 
 impl std::fmt::Debug for NativeAotFactory {
@@ -122,6 +191,16 @@ impl NativeAotMatcher {
 
 type CompileOutcome = Result<Arc<NativeAotFactory>, String>;
 
+struct CompileTask<'a> {
+    target_feature_profile: TargetFeatureProfile,
+    regex_size_limit: Option<usize>,
+    dfa_size_limit: Option<usize>,
+    cancelled: &'a AtomicBool,
+    compile_ns: &'a AtomicU64,
+    publish_ns: &'a AtomicU64,
+    receipt_classification: &'a Mutex<ReceiptClassification>,
+}
+
 #[derive(Clone, Copy, Debug)]
 struct Cutover {
     file_ordinal: u64,
@@ -155,6 +234,7 @@ struct CompileState {
     #[cfg(test)]
     test_publish_after_stock_commit:
         Mutex<Option<(u64, Arc<NativeAotFactory>)>>,
+    receipt_classification: Arc<Mutex<ReceiptClassification>>,
     receipt_path: Option<PathBuf>,
 }
 
@@ -169,7 +249,14 @@ impl std::fmt::Debug for CompileState {
 }
 
 impl CompileState {
+    #[cfg(test)]
     fn empty() -> Arc<Self> {
+        Self::empty_with_classification(ReceiptClassification::pending("auto"))
+    }
+
+    fn empty_with_classification(
+        receipt_classification: ReceiptClassification,
+    ) -> Arc<Self> {
         Arc::new(Self {
             started: Instant::now(),
             outcome: OnceLock::new(),
@@ -197,17 +284,33 @@ impl CompileState {
                 .unwrap_or(0),
             #[cfg(test)]
             test_publish_after_stock_commit: Mutex::new(None),
+            receipt_classification: Arc::new(Mutex::new(
+                receipt_classification,
+            )),
             receipt_path: std::env::var_os(RECEIPT_ENV).map(PathBuf::from),
         })
     }
 
     fn declined(reason: impl Into<String>) -> Arc<Self> {
-        let state = Self::empty();
         let reason = reason.into();
+        let (classification, failure) = match target_feature_profile_from_env()
+        {
+            Ok(profile) => {
+                let mut classification = classification_for_profile(profile);
+                classification.publication_stage = "profile_gate";
+                let refusal_class = search_profile_refusal_class(&reason);
+                classification.publication_refusal_class = Some(refusal_class);
+                (classification, refusal_class.to_owned())
+            }
+            Err(failure) => {
+                (invalid_profile_classification(), failure.to_owned())
+            }
+        };
+        let state = Self::empty_with_classification(classification);
         log::debug!(
-            "FRE AOT background decline: {reason}; using stock Rust regex"
+            "FRE AOT background decline: {failure}; using stock Rust regex"
         );
-        let _ = state.outcome.set(Err(reason));
+        let _ = state.outcome.set(Err(failure));
         state
     }
 
@@ -216,12 +319,28 @@ impl CompileState {
         regex_size_limit: Option<usize>,
         dfa_size_limit: Option<usize>,
     ) -> Arc<Self> {
-        let state = Self::empty();
+        let target_feature_profile = match target_feature_profile_from_env() {
+            Ok(profile) => profile,
+            Err(reason) => {
+                let state = Self::empty_with_classification(
+                    invalid_profile_classification(),
+                );
+                log::debug!(
+                    "FRE AOT background decline: {reason}; using stock Rust regex"
+                );
+                let _ = state.outcome.set(Err(reason.to_owned()));
+                return state;
+            }
+        };
+        let state = Self::empty_with_classification(
+            classification_for_profile(target_feature_profile),
+        );
         let weak = Arc::downgrade(&state);
         let cancelled = Arc::clone(&state.cancelled);
         let compile_ns = Arc::clone(&state.compile_ns);
         let publish_ns = Arc::clone(&state.publish_ns);
         let prepare_ns = Arc::clone(&state.prepare_ns);
+        let receipt_classification = Arc::clone(&state.receipt_classification);
         log::debug!("FRE AOT background compilation started");
         let spawn = std::thread::Builder::new()
             .name("rg-fre-aot".to_owned())
@@ -229,11 +348,15 @@ impl CompileState {
                 let prepare_started = Instant::now();
                 let outcome = compile_native_factory(
                     pattern,
-                    regex_size_limit,
-                    dfa_size_limit,
-                    &cancelled,
-                    &compile_ns,
-                    &publish_ns,
+                    CompileTask {
+                        target_feature_profile,
+                        regex_size_limit,
+                        dfa_size_limit,
+                        cancelled: &cancelled,
+                        compile_ns: &compile_ns,
+                        publish_ns: &publish_ns,
+                        receipt_classification: &receipt_classification,
+                    },
                 );
                 let elapsed_prepare_ns = duration_ns(prepare_started.elapsed());
                 prepare_ns.store(elapsed_prepare_ns, Ordering::Release);
@@ -288,7 +411,14 @@ impl CompileState {
         match spawn {
             Ok(join) => *state.join.lock().unwrap() = Some(join),
             Err(error) => {
-                let reason = format!(
+                let reason = "compiler_thread_spawn_failed".to_owned();
+                let mut classification =
+                    state.receipt_classification.lock().unwrap();
+                classification.publication_stage = "spawn";
+                classification.publication_refusal_class =
+                    Some("compiler_thread_spawn_failed");
+                drop(classification);
+                log::debug!(
                     "could not spawn FRE AOT compiler thread: {error}"
                 );
                 log::debug!("FRE AOT background decline: {reason}");
@@ -322,8 +452,7 @@ impl CompileState {
         }
     }
 
-    fn write_receipt(&self) -> Result<(), String> {
-        let Some(path) = &self.receipt_path else { return Ok(()) };
+    fn receipt_json(&self) -> serde_json::Value {
         let (outcome, decline_reason) = match self.outcome.get() {
             Some(Ok(_)) => ("ready", None),
             Some(Err(reason)) => ("declined", Some(reason.as_str())),
@@ -337,10 +466,25 @@ impl CompileState {
             Some(Ok(_)) => Some(self.ready_ns.load(Ordering::Relaxed)),
             _ => None,
         };
-        let receipt = serde_json::json!({
+        let classification =
+            self.receipt_classification.lock().unwrap().clone();
+        serde_json::json!({
             "schema": RECEIPT_SCHEMA,
             "outcome": outcome,
             "decline_reason": decline_reason,
+            "target_feature_profile": classification.target_feature_profile,
+            "requested_target_feature_bits": classification.requested_target_feature_bits,
+            "host_target_feature_bits": classification.host_target_feature_bits,
+            "target_feature_bits": classification.target_feature_bits,
+            "compiler_engine": classification.compiler_engine,
+            "engine_selection_reason": classification.engine_selection_reason,
+            "start_accelerator": classification.start_accelerator,
+            "publication_stage": classification.publication_stage,
+            "publication_refusal_class": classification.publication_refusal_class,
+            "runtime_helper_required": classification.runtime_helper_required,
+            "published_code_bytes": classification.published_code_bytes,
+            "published_read_only_data_bytes": classification.published_read_only_data_bytes,
+            "published_total_mapped_bytes": classification.published_total_mapped_bytes,
             // `compile_ns` is FRE's compile(request), which still emits the
             // deterministic object. `publish_ns` is direct in-process
             // relocation/mapping/protection. `prepare_ns` covers both.
@@ -364,7 +508,12 @@ impl CompileState {
             "external_linker_invocations": 0,
             "direct_native_only": true,
             "test_min_stock_bytes": self.test_min_stock_bytes,
-        });
+        })
+    }
+
+    fn write_receipt(&self) -> Result<(), String> {
+        let Some(path) = &self.receipt_path else { return Ok(()) };
+        let receipt = self.receipt_json();
         let mut bytes = serde_json::to_vec(&receipt)
             .map_err(|error| format!("serialize FRE AOT receipt: {error}"))?;
         bytes.push(b'\n');
@@ -859,22 +1008,311 @@ impl Drop for TemporaryReceipt {
     }
 }
 
+fn target_feature_profile_from_env()
+-> Result<TargetFeatureProfile, &'static str> {
+    match std::env::var(CPU_PROFILE_ENV) {
+        Ok(value) => parse_target_feature_profile(&value)
+            .ok_or("target_profile_invalid"),
+        Err(std::env::VarError::NotPresent) => Ok(TargetFeatureProfile::Auto),
+        Err(std::env::VarError::NotUnicode(_)) => {
+            Err("target_profile_invalid")
+        }
+    }
+}
+
+fn classification_for_profile(
+    profile: TargetFeatureProfile,
+) -> ReceiptClassification {
+    let mut classification = ReceiptClassification::pending(profile.name());
+    classification.requested_target_feature_bits =
+        fixed_profile_features(profile).map(|features| features.bits());
+    classification
+}
+
+fn invalid_profile_classification() -> ReceiptClassification {
+    let mut classification = ReceiptClassification::pending("invalid");
+    classification.publication_stage = "target_selection";
+    classification.publication_refusal_class = Some("target_profile_invalid");
+    classification
+}
+
+/// Detect and validate the host only after the stock matcher is live and the
+/// background compiler thread has started.
+fn target_plan_for_profile(profile: TargetFeatureProfile) -> TargetPlan {
+    let host = match fre_aot_regex_loader::host_target() {
+        Ok(host) => host,
+        Err(error) => {
+            let mut classification = classification_for_profile(profile);
+            classification.publication_stage = "target_detection";
+            let (_, refusal_class, runtime_helper_required) =
+                publication_error_classification(&error);
+            classification.publication_refusal_class = Some(refusal_class);
+            classification.runtime_helper_required = runtime_helper_required;
+            return TargetPlan { classification, target: Err(refusal_class) };
+        }
+    };
+    target_plan_for_host(profile, host)
+}
+
+fn parse_target_feature_profile(value: &str) -> Option<TargetFeatureProfile> {
+    match value {
+        "auto" => Some(TargetFeatureProfile::Auto),
+        "asimd" => Some(TargetFeatureProfile::Asimd),
+        "sve" => Some(TargetFeatureProfile::Sve),
+        "sve2" => Some(TargetFeatureProfile::Sve2),
+        _ => None,
+    }
+}
+
+fn fixed_profile_features(
+    profile: TargetFeatureProfile,
+) -> Option<fre_aot_regex::FeatureSet> {
+    use fre_aot_regex::{CpuFeature, FeatureSet};
+
+    match profile {
+        TargetFeatureProfile::Auto => None,
+        TargetFeatureProfile::Asimd => {
+            Some(FeatureSet::of(CpuFeature::Aarch64Asimd))
+        }
+        TargetFeatureProfile::Sve => {
+            Some(FeatureSet::of(CpuFeature::Aarch64Sve))
+        }
+        TargetFeatureProfile::Sve2 => Some(
+            FeatureSet::of(CpuFeature::Aarch64Sve)
+                .with(CpuFeature::Aarch64Sve2),
+        ),
+    }
+}
+
+fn target_plan_for_host(
+    profile: TargetFeatureProfile,
+    host: fre_aot_regex::Target,
+) -> TargetPlan {
+    use fre_aot_regex::Architecture;
+
+    let requested = fixed_profile_features(profile).unwrap_or(host.features);
+    let mut classification = ReceiptClassification::pending(profile.name());
+    classification.requested_target_feature_bits = Some(requested.bits());
+    classification.host_target_feature_bits = Some(host.features.bits());
+    if !matches!(profile, TargetFeatureProfile::Auto)
+        && host.architecture != Architecture::Aarch64
+    {
+        classification.publication_stage = "target_selection";
+        classification.publication_refusal_class =
+            Some("target_profile_architecture_mismatch");
+        return TargetPlan {
+            classification,
+            target: Err("target_profile_architecture_mismatch"),
+        };
+    }
+    if !host.features.contains(requested) {
+        classification.publication_stage = "target_selection";
+        classification.publication_refusal_class =
+            Some("target_profile_unavailable");
+        return TargetPlan {
+            classification,
+            target: Err("target_profile_unavailable"),
+        };
+    }
+    match host.with_features(requested) {
+        Ok(target) => {
+            classification.target_feature_bits = Some(target.features.bits());
+            TargetPlan { classification, target: Ok(target) }
+        }
+        Err(_) => {
+            classification.publication_stage = "target_selection";
+            classification.publication_refusal_class =
+                Some("target_profile_invalid");
+            TargetPlan {
+                classification,
+                target: Err("target_profile_invalid"),
+            }
+        }
+    }
+}
+
+fn search_profile_refusal_class(reason: &str) -> &'static str {
+    match reason {
+        "multiple patterns" => "profile_multiple_patterns",
+        "case mode other than case-sensitive" => "profile_case_mode",
+        "word or line boundary mode" => "profile_boundary_mode",
+        "fixed-string rewriting" => "profile_fixed_strings",
+        "multiline mode" => "profile_multiline",
+        "CRLF mode" => "profile_crlf",
+        "NUL line terminators" => "profile_nul_terminator",
+        "Unicode-disabled syntax" => "profile_unicode_disabled",
+        _ => "profile_unsupported",
+    }
+}
+
+fn compiler_engine_name(engine: fre_aot_regex::EngineKind) -> &'static str {
+    use fre_aot_regex::EngineKind;
+
+    match engine {
+        EngineKind::OrderedNfa => "ordered_nfa",
+        EngineKind::OrderedDfa => "ordered_dfa",
+        EngineKind::OrderedContextDfa => "ordered_context_dfa",
+    }
+}
+
+fn engine_selection_reason_name(
+    reason: fre_aot_regex::EngineSelectionReason,
+) -> &'static str {
+    use fre_aot_regex::EngineSelectionReason;
+
+    match reason {
+        EngineSelectionReason::FastMode => "fast_mode",
+        EngineSelectionReason::CompleteDfa => "complete_dfa",
+        EngineSelectionReason::CompleteContextDfa => "complete_context_dfa",
+        EngineSelectionReason::ContextAssertions => "context_assertions",
+        EngineSelectionReason::DeterminizationResourceLimit => {
+            "determinization_resource_limit"
+        }
+    }
+}
+
+fn start_accelerator_name(
+    accelerator: fre_aot_regex::StartAccelerator,
+) -> &'static str {
+    use fre_aot_regex::StartAccelerator;
+
+    match accelerator {
+        StartAccelerator::None => "none",
+        StartAccelerator::Scalar => "scalar",
+        StartAccelerator::X86Sse2 => "x86_sse2",
+        StartAccelerator::X86Avx2 => "x86_avx2",
+        StartAccelerator::X86Avx512Bw => "x86_avx512bw",
+        StartAccelerator::Aarch64Asimd => "aarch64_asimd",
+        StartAccelerator::Aarch64Sve => "aarch64_sve",
+        StartAccelerator::Aarch64Sve2 => "aarch64_sve2",
+    }
+}
+
+fn compile_error_classification(
+    error: &fre_aot_regex::CompileError,
+) -> &'static str {
+    use fre_aot_regex::CompileError;
+
+    match error {
+        CompileError::Syntax(_) => "compile_syntax",
+        CompileError::Lower(_) => "compile_lowering",
+        CompileError::Automaton(_) => "compile_automaton",
+        CompileError::Search(_) => "compile_portable_search",
+        CompileError::Object(_) => "compile_object",
+        CompileError::Resource { .. } => "compile_resource_limit",
+        CompileError::StateExplosion { .. } => "compile_state_explosion",
+        CompileError::InvalidWindow { .. } => "compile_invalid_window",
+        CompileError::PreparedAggregateRequiresSpan { .. } => {
+            "compile_output_contract"
+        }
+        CompileError::InternalInvariant(_) => "compile_internal_invariant",
+    }
+}
+
+fn publication_stage_name(
+    stage: fre_aot_regex_loader::PublicationStage,
+) -> &'static str {
+    use fre_aot_regex_loader::PublicationStage;
+
+    match stage {
+        PublicationStage::PageSize => "page_size",
+        PublicationStage::Reserve => "reserve",
+        PublicationStage::MakeWritable => "make_writable",
+        PublicationStage::Copy => "copy",
+        PublicationStage::Relocate => "relocate",
+        PublicationStage::Verify => "verify",
+        PublicationStage::ProtectText => "protect_text",
+        PublicationStage::ProtectReadOnlyData => "protect_read_only_data",
+        PublicationStage::SynchronizeInstructionCache => {
+            "synchronize_instruction_cache"
+        }
+        PublicationStage::PublishEntry => "publish_entry",
+    }
+}
+
+fn publication_error_classification(
+    error: &fre_aot_regex_loader::PublicationError,
+) -> (&'static str, &'static str, bool) {
+    use fre_aot_regex_loader::PublicationError;
+
+    match error {
+        PublicationError::UnsupportedHost => {
+            ("target_validation", "unsupported_host", false)
+        }
+        PublicationError::TargetMismatch { .. } => {
+            ("target_validation", "target_mismatch", false)
+        }
+        PublicationError::CpuFeatureUnavailable { .. } => {
+            ("target_validation", "cpu_feature_unavailable", false)
+        }
+        PublicationError::OutputMismatch { .. } => {
+            ("artifact_validation", "output_mismatch", false)
+        }
+        PublicationError::EntryAbiMismatch { .. } => {
+            ("artifact_validation", "entry_abi_mismatch", false)
+        }
+        PublicationError::RuntimeHelperRequired { .. } => {
+            ("artifact_validation", "runtime_helper_required", true)
+        }
+        PublicationError::InvalidModule { .. } => {
+            ("artifact_validation", "invalid_module", false)
+        }
+        PublicationError::Resource { .. } => {
+            ("publication_planning", "publication_resource_limit", false)
+        }
+        PublicationError::AllocationFailed { .. } => {
+            ("publication_planning", "publication_allocation", false)
+        }
+        PublicationError::ArithmeticOverflow { .. } => {
+            ("publication_planning", "publication_arithmetic", false)
+        }
+        PublicationError::RelocationOutOfRange { .. } => {
+            ("relocate", "relocation_out_of_range", false)
+        }
+        PublicationError::CopyVerificationFailed => {
+            ("verify", "copy_verification_failed", false)
+        }
+        PublicationError::JitDenied { stage, .. } => {
+            (publication_stage_name(*stage), "jit_denied", false)
+        }
+        PublicationError::SystemCall { stage, .. } => {
+            (publication_stage_name(*stage), "system_call", false)
+        }
+        _ => ("publication", "publication_other", false),
+    }
+}
+
 fn compile_native_factory(
     pattern: String,
-    regex_size_limit: Option<usize>,
-    dfa_size_limit: Option<usize>,
-    cancelled: &AtomicBool,
-    compile_ns: &AtomicU64,
-    publish_ns: &AtomicU64,
+    task: CompileTask<'_>,
 ) -> CompileOutcome {
     use fre_aot_regex::{
         CompileMode, CompileRequest, OutputContract, compile,
     };
-    use fre_aot_regex_loader::{PublicationLimits, host_target, publish_span};
+    use fre_aot_regex_loader::{PublicationLimits, publish_span};
 
-    let target = host_target().map_err(|error| {
-        format!("detect FRE AOT publication target: {error}")
-    })?;
+    let CompileTask {
+        target_feature_profile,
+        regex_size_limit,
+        dfa_size_limit,
+        cancelled,
+        compile_ns,
+        publish_ns,
+        receipt_classification,
+    } = task;
+    receipt_classification.lock().unwrap().publication_stage =
+        "target_detection";
+    let TargetPlan { classification, target } =
+        target_plan_for_profile(target_feature_profile);
+    *receipt_classification.lock().unwrap() = classification;
+    let target = match target {
+        Ok(target) => target,
+        Err(refusal_class) => return Err(refusal_class.to_owned()),
+    };
+    if cancelled.load(Ordering::SeqCst) {
+        return Err("target_detection_cancelled".to_owned());
+    }
+    receipt_classification.lock().unwrap().publication_stage = "compile";
     let mut profile = fre_syntax::RustProfile::default();
     profile.options.line_terminator = b'\n';
     // The configured-HIR rendering carries its exact Look/flag semantics
@@ -894,12 +1332,33 @@ fn compile_native_factory(
     let compiled = compile(request);
     compile_ns
         .store(duration_ns(compile_started.elapsed()), Ordering::Release);
-    let compiled = compiled
-        .map_err(|error| format!("FRE optimizing-AOT compile: {error}"))?;
+    let compiled = match compiled {
+        Ok(compiled) => compiled,
+        Err(error) => {
+            let refusal_class = compile_error_classification(&error);
+            let mut classification = receipt_classification.lock().unwrap();
+            classification.publication_stage = "compile";
+            classification.publication_refusal_class = Some(refusal_class);
+            return Err(refusal_class.to_owned());
+        }
+    };
     if cancelled.load(Ordering::SeqCst) {
-        return Err("FRE AOT compilation cancelled after compile".to_owned());
+        return Err("compilation_cancelled".to_owned());
     }
     let receipt = compiled.receipt();
+    {
+        let mut classification = receipt_classification.lock().unwrap();
+        classification.compiler_engine =
+            Some(compiler_engine_name(receipt.engine));
+        classification.engine_selection_reason = Some(
+            engine_selection_reason_name(receipt.engine_selection_reason),
+        );
+        classification.start_accelerator =
+            Some(start_accelerator_name(receipt.start_accelerator));
+        classification.runtime_helper_required =
+            receipt.runtime_helper_required;
+        classification.publication_stage = "publish";
+    }
     let description = format!(
         "mode=optimizing,publication=in-process,route=direct-native,\
          engine={:?},reason={:?},\
@@ -919,12 +1378,32 @@ fn compile_native_factory(
     let published = publish_span(compiled, PublicationLimits::default());
     publish_ns
         .store(duration_ns(publish_started.elapsed()), Ordering::Release);
-    let published = published
-        .map_err(|error| format!("publish FRE AOT in process: {error}"))?;
+    let published = match published {
+        Ok(published) => published,
+        Err(error) => {
+            let (stage, refusal_class, runtime_helper_required) =
+                publication_error_classification(&error);
+            let mut classification = receipt_classification.lock().unwrap();
+            classification.publication_stage = stage;
+            classification.publication_refusal_class = Some(refusal_class);
+            classification.runtime_helper_required = runtime_helper_required;
+            return Err(refusal_class.to_owned());
+        }
+    };
     if cancelled.load(Ordering::SeqCst) {
-        return Err(
-            "FRE AOT compilation cancelled after publication".to_owned()
-        );
+        return Err("publication_cancelled".to_owned());
+    }
+    {
+        let accounting = published.accounting();
+        let mut classification = receipt_classification.lock().unwrap();
+        classification.publication_stage = "published";
+        classification.publication_refusal_class = None;
+        classification.published_code_bytes =
+            Some(u64_len(accounting.code_bytes()));
+        classification.published_read_only_data_bytes =
+            Some(u64_len(accounting.read_only_data_bytes()));
+        classification.published_total_mapped_bytes =
+            Some(u64_len(accounting.total_mapped_bytes()));
     }
     Ok(Arc::new(NativeAotFactory { published, description }))
 }
@@ -934,6 +1413,170 @@ mod tests {
     use grep::matcher::Captures as _;
 
     use super::*;
+
+    fn aarch64_host(
+        features: fre_aot_regex::FeatureSet,
+    ) -> fre_aot_regex::Target {
+        fre_aot_regex::Target::aarch64_linux().with_features(features).unwrap()
+    }
+
+    #[test]
+    fn target_feature_profiles_select_exact_masks() {
+        use fre_aot_regex::{CpuFeature, FeatureSet};
+
+        let host_features = FeatureSet::of(CpuFeature::Aarch64Asimd)
+            .with(CpuFeature::Aarch64Sve)
+            .with(CpuFeature::Aarch64Sve2);
+        let host = aarch64_host(host_features);
+
+        let auto = target_plan_for_host(TargetFeatureProfile::Auto, host);
+        assert_eq!(auto.target.unwrap().features, host_features);
+        assert_eq!(
+            auto.classification.target_feature_bits,
+            Some(host_features.bits())
+        );
+
+        let asimd = target_plan_for_host(TargetFeatureProfile::Asimd, host);
+        let asimd_features = FeatureSet::of(CpuFeature::Aarch64Asimd);
+        assert_eq!(asimd.target.unwrap().features, asimd_features);
+        assert_eq!(
+            asimd.classification.requested_target_feature_bits,
+            Some(0x1_0000_0000)
+        );
+
+        let sve = target_plan_for_host(TargetFeatureProfile::Sve, host);
+        let sve_features = FeatureSet::of(CpuFeature::Aarch64Sve);
+        assert_eq!(sve.target.unwrap().features, sve_features);
+        assert_eq!(
+            sve.classification.requested_target_feature_bits,
+            Some(0x2_0000_0000)
+        );
+
+        let sve2 = target_plan_for_host(TargetFeatureProfile::Sve2, host);
+        let sve2_features = FeatureSet::of(CpuFeature::Aarch64Sve)
+            .with(CpuFeature::Aarch64Sve2);
+        assert_eq!(sve2.target.unwrap().features, sve2_features);
+        assert_eq!(
+            sve2.classification.requested_target_feature_bits,
+            Some(0x6_0000_0000)
+        );
+        assert_eq!(
+            sve2.classification.host_target_feature_bits,
+            Some(0x7_0000_0000)
+        );
+    }
+
+    #[test]
+    fn target_feature_profiles_fail_closed_on_wrong_host() {
+        use fre_aot_regex::{CpuFeature, FeatureSet, Target};
+
+        let missing_sve2 =
+            aarch64_host(FeatureSet::of(CpuFeature::Aarch64Sve));
+        let unavailable =
+            target_plan_for_host(TargetFeatureProfile::Sve2, missing_sve2);
+        assert_eq!(
+            unavailable.target.unwrap_err(),
+            "target_profile_unavailable"
+        );
+        assert_eq!(unavailable.classification.target_feature_bits, None);
+        assert_eq!(
+            unavailable.classification.publication_refusal_class,
+            Some("target_profile_unavailable")
+        );
+
+        let wrong_arch = target_plan_for_host(
+            TargetFeatureProfile::Sve,
+            Target::x86_64_linux(),
+        );
+        assert_eq!(
+            wrong_arch.target.unwrap_err(),
+            "target_profile_architecture_mismatch"
+        );
+        assert_eq!(wrong_arch.classification.target_feature_bits, None);
+    }
+
+    #[test]
+    fn target_feature_profile_parser_is_exact() {
+        assert_eq!(
+            parse_target_feature_profile("auto"),
+            Some(TargetFeatureProfile::Auto)
+        );
+        assert_eq!(
+            parse_target_feature_profile("asimd"),
+            Some(TargetFeatureProfile::Asimd)
+        );
+        assert_eq!(
+            parse_target_feature_profile("sve"),
+            Some(TargetFeatureProfile::Sve)
+        );
+        assert_eq!(
+            parse_target_feature_profile("sve2"),
+            Some(TargetFeatureProfile::Sve2)
+        );
+        assert_eq!(parse_target_feature_profile("SVE2"), None);
+        assert_eq!(parse_target_feature_profile(""), None);
+    }
+
+    #[test]
+    fn initial_profile_classification_defers_host_detection() {
+        let classification =
+            classification_for_profile(TargetFeatureProfile::Sve2);
+        assert_eq!(
+            classification.requested_target_feature_bits,
+            Some(0x6_0000_0000)
+        );
+        assert_eq!(classification.host_target_feature_bits, None);
+        assert_eq!(classification.target_feature_bits, None);
+        assert_eq!(classification.publication_stage, "not_started");
+    }
+
+    #[test]
+    fn receipt_has_structured_pattern_free_classification() {
+        let mut classification = ReceiptClassification::pending("sve2");
+        classification.requested_target_feature_bits = Some(0x6_0000_0000);
+        classification.host_target_feature_bits = Some(0x7_0000_0000);
+        classification.target_feature_bits = Some(0x6_0000_0000);
+        classification.compiler_engine = Some("ordered_dfa");
+        classification.engine_selection_reason = Some("complete_dfa");
+        classification.start_accelerator = Some("aarch64_sve2");
+        classification.publication_stage = "artifact_validation";
+        classification.publication_refusal_class =
+            Some("runtime_helper_required");
+        classification.runtime_helper_required = true;
+        let state = CompileState::empty_with_classification(classification);
+        state.outcome.set(Err("runtime_helper_required".to_owned())).unwrap();
+
+        let receipt = state.receipt_json();
+        assert_eq!(receipt["target_feature_profile"], "sve2");
+        assert_eq!(
+            receipt["requested_target_feature_bits"],
+            0x6_0000_0000_u64
+        );
+        assert_eq!(receipt["host_target_feature_bits"], 0x7_0000_0000_u64);
+        assert_eq!(receipt["target_feature_bits"], 0x6_0000_0000_u64);
+        assert_eq!(receipt["compiler_engine"], "ordered_dfa");
+        assert_eq!(receipt["engine_selection_reason"], "complete_dfa");
+        assert_eq!(receipt["start_accelerator"], "aarch64_sve2");
+        assert_eq!(receipt["publication_stage"], "artifact_validation");
+        assert_eq!(
+            receipt["publication_refusal_class"],
+            "runtime_helper_required"
+        );
+        assert_eq!(receipt["runtime_helper_required"], true);
+        assert_eq!(receipt["decline_reason"], "runtime_helper_required");
+    }
+
+    #[test]
+    fn runtime_helper_errors_are_classified_without_the_symbol() {
+        let error =
+            fre_aot_regex_loader::PublicationError::RuntimeHelperRequired {
+                symbol: "private-symbol-spelling".to_owned(),
+            };
+        assert_eq!(
+            publication_error_classification(&error),
+            ("artifact_validation", "runtime_helper_required", true)
+        );
+    }
 
     fn test_factory(pattern: &str) -> Arc<NativeAotFactory> {
         use fre_aot_regex::{
