@@ -2,12 +2,14 @@
 
 The completed local and EC2 results are in [RESULTS.md](RESULTS.md). Those
 checked-in results are historical Span-entry runs with v3 receipts. The
-current harness emits `ripgrep.fre-aot-background.v5` SelectedEnd receipts and
-continues to validate existing v4 evidence without reinterpreting v3 results.
-V5 adds an authenticated primary-native-route record and keeps a Teddy leaf's
-retained semantic-DFA incumbent explicitly separate from that primary route.
-It also attests whether receipt-only compiler settlement was requested and
-whether the compiler thread reached a definitive outcome.
+current harness emits `ripgrep.fre-aot-background.v6` SelectedEnd receipts and
+continues to validate existing v4/v5 evidence without reinterpreting v3
+results. V5 added an authenticated primary-native-route record and kept a
+Teddy leaf's retained semantic-DFA incumbent explicitly separate from that
+primary route. V6 preserves those fields and adds the supplemental exact-Teddy
+V2 compile receipt described below. It also attests whether receipt-only
+compiler settlement was requested and whether the compiler thread reached a
+definitive outcome.
 
 This harness tests the normal ripgrep path against the same binary with
 `--fre-aot-background` on frozen, actual ripgrep query shapes. It does not use
@@ -33,10 +35,79 @@ cases whose retained semantics required normalization. Public JSON contains aggr
 private JSON contains the exact patterns and per-process observations and is
 ignored by Git.
 
+## Exact-Teddy V2 policy campaigns (receipt v6)
+
+This iteration pins all four direct FRE crates and every corresponding
+lockfile entry to FRE commit
+`d2b352b7a051628bbcf8afc7f23d1362a850cb25`. The V2 policy is default-off:
+without `--exact-teddy-policy-v2`, ripgrep does not set
+`RG_FRE_AOT_BACKGROUND_EXACT_TEDDY_POLICY_V2` and calls the stable V1 compile
+API. An explicit campaign accepts exactly one policy per harness invocation:
+`automatic` or `force-structurally-eligible`. The harness sets that hidden
+environment variable only for the candidate-background child. It removes the
+variable from candidate-normal, stock, provenance, archive, tool-version, and
+all other child environments, including when the parent shell already has it
+set. The policy is never inferred from a pattern or receipt.
+
+Both explicit campaigns use the result-blind
+`frozen-structural-44-v1` cohort. It was frozen before compilation results or
+timings: case-sensitive simple exact alternations with at least four arms,
+every arm a nonempty exact byte literal, and minimum byte width at least three.
+The harness independently re-runs that predicate over the transported 212-case
+selection and requires this exact 14-OOT/30-wider ID set:
+
+```text
+oot-0002 oot-0003 oot-0004 oot-0005 oot-0008 oot-0019 oot-0035
+oot-0039 oot-0043 oot-0047 oot-0051 oot-0052 oot-0078 oot-0084
+wider-0001 wider-0003 wider-0006 wider-0008 wider-0010 wider-0012
+wider-0013 wider-0014 wider-0024 wider-0030 wider-0039 wider-0040
+wider-0042 wider-0047 wider-0052 wider-0058 wider-0062 wider-0064
+wider-0075 wider-0084 wider-0088 wider-0092 wider-0093 wider-0096
+wider-0108 wider-0109 wider-0111 wider-0113 wider-0118 wider-0121
+```
+
+The canonical 212-case manifest is hard-pinned to SHA-256
+`cf5960da72a770c96eb2a7e5532472f5feeca9df8214489d73baed9e35b1bb2e`;
+the ordered selected-44 case manifest is independently hard-pinned to
+`35b0037122bf2ab9a2c1641a562f23f12b88856ceb66c713ceb9403adb541823`.
+Self-consistent replacement manifests therefore fail before any workload.
+
+Campaign panel applicability remains faithful to the frozen workloads:
+`ripgrep-default-output` runs only the 14 OOT cases, while
+`fre-count-default-threads` and `fre-count-thread1` each run all 44. The
+campaign manifest still binds all 44 IDs and their exact case-manifest digest.
+
+An explicit probe is untimed and waits for compiler settlement. It also runs
+the fixed `samwise|samw|frodo|pippin` three-arm correctness gate for each CPU
+profile, with the policy present only on its background arm. Under Force,
+every fixed case (including every canonical `fre-count-thread1` row) and the
+gate must authenticate a selected, accelerated incumbent: V2 policy
+`force_structurally_eligible`, basis `forced_structural_eligibility`, source
+`ordinary_public_complete_dfa`, performance admission bypassed, tail entry
+enabled, a non-`none` accelerator, and a matching authenticated nested lowering.
+Automatic is the matched control and validates its V2 policy receipt without
+requiring the forced route to be selected.
+
+Run separate matched probes on the same binary by adding one of these flags to
+the complete `probe` command below and using distinct output paths:
+
+```sh
+--exact-teddy-policy-v2 automatic
+--exact-teddy-policy-v2 force-structurally-eligible
+```
+
+Pass the same single flag to `benchmark`, together with the matching probe's
+public and private files. The formal run reconstructs the exact 44-case
+campaign and panel matrices, compares the policy and frozen-manifest digests,
+binds both probe files by SHA-256, and rehashes them after timing. It therefore
+rejects a different policy, an ordinary 212-case probe, or a changed 44-case
+manifest. Timed runs keep the existing three arms; only the background arm
+receives the selected policy.
+
 ## Fast exact-Teddy census
 
-Before designing a timed gate, `exact-teddy-census` runs each of the frozen
-212 queries exactly once per requested CPU profile on the canonical
+Without a policy option, `exact-teddy-census` runs each of the frozen 212
+queries exactly once per requested CPU profile on the canonical
 single-thread count panel. It invokes only the background candidate, records
 no timing samples, and selects IDs solely from the authenticated compiler
 primary-route receipt after a hidden receipt-only teardown join has settled
@@ -45,7 +116,9 @@ the outcome must be non-`unfinished`. Ordinary probes never request this wait
 and do not embed or claim a compiler-selected census. The private result contains fully qualified
 `profile/cohort/private-id` sets; the public result contains counts and
 tier/ISA/scanner contracts only. This diagnostic does not claim benchmark
-eligibility:
+eligibility. Adding an explicit V2 policy restricts the census to the same
+fixed 44. Force additionally requires strict selected-route attestation for
+all 44; Automatic provides the matched control. For example:
 
 ```sh
 python3 experiments/background-aot-representative/harness.py exact-teddy-census \
@@ -57,11 +130,16 @@ python3 experiments/background-aot-representative/harness.py exact-teddy-census 
   --database /Users/danluu/.codex/thread_history_1.sqlite \
   --ripgrep-corpus-repo /Users/danluu/dev/ripgrep \
   --ripgrep-corpus-commit f9c05a949d1a0dc8e16dee28ca9605d38611faeb \
-  --fre-corpus-repo /Users/danluu/dev/fre-teddy-census-0ed0d09a-20260821 \
+  --fre-corpus-repo /Users/danluu/dev/fre-teddy-census-d2b352b7-20260821 \
   --fre-corpus-commit 6f961465d00ff50f2096cfb05520c0653a87d2cd \
-  --private-output experiments/background-aot-representative/results/teddy-census.private.json \
-  --public-output experiments/background-aot-representative/results/teddy-census.public.json
+  --exact-teddy-policy-v2 force-structurally-eligible \
+  --private-output experiments/background-aot-representative/results/teddy-census-force-v2.private.json \
+  --public-output experiments/background-aot-representative/results/teddy-census-force-v2.public.json
 ```
+
+Replace the policy value with `automatic` (and use distinct output paths) for
+the control census. Omitting the flag retains the legacy 212-case diagnostic;
+`disabled` is also accepted as an explicit V2 census diagnostic.
 
 ## Probe first
 
@@ -78,14 +156,15 @@ python3 experiments/background-aot-representative/harness.py probe \
   --database /Users/danluu/.codex/thread_history_1.sqlite \
   --ripgrep-corpus-repo /Users/danluu/dev/ripgrep \
   --ripgrep-corpus-commit f9c05a949d1a0dc8e16dee28ca9605d38611faeb \
-  --fre-corpus-repo /Users/danluu/dev/fre-teddy-census-0ed0d09a-20260821 \
+  --fre-corpus-repo /Users/danluu/dev/fre-teddy-census-d2b352b7-20260821 \
   --fre-corpus-commit 6f961465d00ff50f2096cfb05520c0653a87d2cd \
+  --exact-teddy-policy-v2 force-structurally-eligible \
   --private-output experiments/background-aot-representative/results/probe.private.json \
   --public-output experiments/background-aot-representative/results/probe.public.json
 ```
 
 The clean `--fre-corpus-repo` checkout must be at the exact FRE revision pinned
-by the candidate (`0ed0d09a2816716f47b244d44711a1070e52f3c1` for this
+by the candidate (`d2b352b7a051628bbcf8afc7f23d1362a850cb25` for this
 iteration), while `--fre-corpus-commit` deliberately remains the older frozen
 `6f96146` corpus. The harness verifies both independently. This keeps the
 searched bytes constant as compiler dependencies evolve.
@@ -102,7 +181,7 @@ order, for example `--cpu-profile auto --cpu-profile sve --cpu-profile sve2`.
 `asimd` is also accepted as an optional control. An unsupported requested
 profile is recorded as a decline, never silently replaced with `auto`.
 Receipts report the requested, host, and effective feature masks plus the
-compiler engine and actual start accelerator. A successfully compiled v4/v5
+compiler engine and actual start accelerator. A successfully compiled v4/v5/v6
 receipt also identifies the `selected_end` output contract, the
 `selected_end_search_v1` entry ABI, the source of any reported machine
 geometry, forward/reverse analysis state counts, and whether the compiler
@@ -122,7 +201,7 @@ timing, the complete probe matrix must nevertheless contain at least one fully
 target-validated receipt for every requested CPU profile, all with one common
 host feature mask.
 
-The v4/v5 route counters describe candidate discovery only. A mixed-engine file
+The v4/v5/v6 route counters describe candidate discovery only. A mixed-engine file
 can merely reflect different matcher operations. A genuine mid-scan cutover is
 counted separately and requires a nonempty, line-aligned stock prefix to be
 committed before AOT scans a later suffix. Candidate file/byte totals and the
@@ -190,6 +269,7 @@ Only start this after reviewing a complete, clean probe:
 ```sh
 python3 experiments/background-aot-representative/harness.py benchmark \
   [the same input options as probe] \
+  --exact-teddy-policy-v2 force-structurally-eligible \
   --probe-public experiments/background-aot-representative/results/probe.public.json \
   --probe-private experiments/background-aot-representative/results/probe.private.json \
   --pairs 12 --warmup-pairs 2 \

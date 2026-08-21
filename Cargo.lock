@@ -165,7 +165,7 @@ checksum = "5baebc0774151f905a1a2cc41989300b1e6fbb29aff0ceffa1064fdd3088d582"
 [[package]]
 name = "fre-aot-regex"
 version = "0.1.0"
-source = "git+https://github.com/danluu/fre.git?rev=0ed0d09a2816716f47b244d44711a1070e52f3c1#0ed0d09a2816716f47b244d44711a1070e52f3c1"
+source = "git+https://github.com/danluu/fre.git?rev=d2b352b7a051628bbcf8afc7f23d1362a850cb25#d2b352b7a051628bbcf8afc7f23d1362a850cb25"
 dependencies = [
  "fre-automata",
  "fre-capture-lab",
@@ -181,7 +181,7 @@ dependencies = [
 [[package]]
 name = "fre-aot-regex-loader"
 version = "0.1.0"
-source = "git+https://github.com/danluu/fre.git?rev=0ed0d09a2816716f47b244d44711a1070e52f3c1#0ed0d09a2816716f47b244d44711a1070e52f3c1"
+source = "git+https://github.com/danluu/fre.git?rev=d2b352b7a051628bbcf8afc7f23d1362a850cb25#d2b352b7a051628bbcf8afc7f23d1362a850cb25"
 dependencies = [
  "fre-aot-regex",
  "fre-target-features",
@@ -191,7 +191,7 @@ dependencies = [
 [[package]]
 name = "fre-aot-regex-runtime"
 version = "0.1.0"
-source = "git+https://github.com/danluu/fre.git?rev=0ed0d09a2816716f47b244d44711a1070e52f3c1#0ed0d09a2816716f47b244d44711a1070e52f3c1"
+source = "git+https://github.com/danluu/fre.git?rev=d2b352b7a051628bbcf8afc7f23d1362a850cb25#d2b352b7a051628bbcf8afc7f23d1362a850cb25"
 dependencies = [
  "fre-aot-regex",
  "fre-capture-lab",
@@ -201,7 +201,7 @@ dependencies = [
 [[package]]
 name = "fre-automata"
 version = "0.1.0"
-source = "git+https://github.com/danluu/fre.git?rev=0ed0d09a2816716f47b244d44711a1070e52f3c1#0ed0d09a2816716f47b244d44711a1070e52f3c1"
+source = "git+https://github.com/danluu/fre.git?rev=d2b352b7a051628bbcf8afc7f23d1362a850cb25#d2b352b7a051628bbcf8afc7f23d1362a850cb25"
 dependencies = [
  "fre-exact-alloc",
  "fre-simd-kernels",
@@ -212,7 +212,7 @@ dependencies = [
 [[package]]
 name = "fre-capture-lab"
 version = "0.1.0"
-source = "git+https://github.com/danluu/fre.git?rev=0ed0d09a2816716f47b244d44711a1070e52f3c1#0ed0d09a2816716f47b244d44711a1070e52f3c1"
+source = "git+https://github.com/danluu/fre.git?rev=d2b352b7a051628bbcf8afc7f23d1362a850cb25#d2b352b7a051628bbcf8afc7f23d1362a850cb25"
 dependencies = [
  "fre-exact-alloc",
  "memchr",
@@ -223,12 +223,12 @@ dependencies = [
 [[package]]
 name = "fre-exact-alloc"
 version = "0.1.0"
-source = "git+https://github.com/danluu/fre.git?rev=0ed0d09a2816716f47b244d44711a1070e52f3c1#0ed0d09a2816716f47b244d44711a1070e52f3c1"
+source = "git+https://github.com/danluu/fre.git?rev=d2b352b7a051628bbcf8afc7f23d1362a850cb25#d2b352b7a051628bbcf8afc7f23d1362a850cb25"
 
 [[package]]
 name = "fre-kernel-ir"
 version = "0.1.0"
-source = "git+https://github.com/danluu/fre.git?rev=0ed0d09a2816716f47b244d44711a1070e52f3c1#0ed0d09a2816716f47b244d44711a1070e52f3c1"
+source = "git+https://github.com/danluu/fre.git?rev=d2b352b7a051628bbcf8afc7f23d1362a850cb25#d2b352b7a051628bbcf8afc7f23d1362a850cb25"
 dependencies = [
  "sha2",
 ]
@@ -236,7 +236,7 @@ dependencies = [
 [[package]]
 name = "fre-kernels"
 version = "0.1.0"
-source = "git+https://github.com/danluu/fre.git?rev=0ed0d09a2816716f47b244d44711a1070e52f3c1#0ed0d09a2816716f47b244d44711a1070e52f3c1"
+source = "git+https://github.com/danluu/fre.git?rev=d2b352b7a051628bbcf8afc7f23d1362a850cb25#d2b352b7a051628bbcf8afc7f23d1362a850cb25"
 dependencies = [
  "aho-corasick",
  "fre-exact-alloc",
@@ -248,7 +248,7 @@ dependencies = [
 [[package]]
 name = "fre-lower"
 version = "0.1.0"
-source = "git+https://github.com/danluu/fre.git?rev=0ed0d09a2816716f47b244d44711a1070e52f3c1#0ed0d09a2816716f47b244d44711a1070e52f3c1"
+source = "git+https://github.com/danluu/fre.git?rev=d2b352b7a051628bbcf8afc7f23d1362a850cb25#d2b352b7a051628bbcf8afc7f23d1362a850cb25"
 dependencies = [
  "fre-automata",
  "fre-syntax",
@@ -258,12 +258,12 @@ dependencies = [
 [[package]]
 name = "fre-re2-syntax"
 version = "0.1.0"
-source = "git+https://github.com/danluu/fre.git?rev=0ed0d09a2816716f47b244d44711a1070e52f3c1#0ed0d09a2816716f47b244d44711a1070e52f3c1"
+source = "git+https://github.com/danluu/fre.git?rev=d2b352b7a051628bbcf8afc7f23d1362a850cb25#d2b352b7a051628bbcf8afc7f23d1362a850cb25"
 
 [[package]]
 name = "fre-ripgrep-aot-thin"
 version = "0.1.0"
-source = "git+https://github.com/danluu/fre.git?rev=0ed0d09a2816716f47b244d44711a1070e52f3c1#0ed0d09a2816716f47b244d44711a1070e52f3c1"
+source = "git+https://github.com/danluu/fre.git?rev=d2b352b7a051628bbcf8afc7f23d1362a850cb25#d2b352b7a051628bbcf8afc7f23d1362a850cb25"
 dependencies = [
  "fre-aot-regex",
  "fre-aot-regex-runtime",
@@ -273,7 +273,7 @@ dependencies = [
 [[package]]
 name = "fre-simd-kernels"
 version = "0.1.0"
-source = "git+https://github.com/danluu/fre.git?rev=0ed0d09a2816716f47b244d44711a1070e52f3c1#0ed0d09a2816716f47b244d44711a1070e52f3c1"
+source = "git+https://github.com/danluu/fre.git?rev=d2b352b7a051628bbcf8afc7f23d1362a850cb25#d2b352b7a051628bbcf8afc7f23d1362a850cb25"
 dependencies = [
  "fre-target-features",
 ]
@@ -281,7 +281,7 @@ dependencies = [
 [[package]]
 name = "fre-syntax"
 version = "0.1.0"
-source = "git+https://github.com/danluu/fre.git?rev=0ed0d09a2816716f47b244d44711a1070e52f3c1#0ed0d09a2816716f47b244d44711a1070e52f3c1"
+source = "git+https://github.com/danluu/fre.git?rev=d2b352b7a051628bbcf8afc7f23d1362a850cb25#d2b352b7a051628bbcf8afc7f23d1362a850cb25"
 dependencies = [
  "fre-re2-syntax",
  "regex-syntax",
@@ -290,7 +290,7 @@ dependencies = [
 [[package]]
 name = "fre-target-features"
 version = "0.1.0"
-source = "git+https://github.com/danluu/fre.git?rev=0ed0d09a2816716f47b244d44711a1070e52f3c1#0ed0d09a2816716f47b244d44711a1070e52f3c1"
+source = "git+https://github.com/danluu/fre.git?rev=d2b352b7a051628bbcf8afc7f23d1362a850cb25#d2b352b7a051628bbcf8afc7f23d1362a850cb25"
 dependencies = [
  "libc",
 ]

@@ -46,6 +46,10 @@ def receipt_fixture(**overrides):
         "compiled_reverse_states": None,
         "compiled_reverse_start_recovery": None,
         "compiled_primary_native_route": None,
+        "exact_finite_selected_end_teddy_policy_v2_request": (
+            "not_requested"
+        ),
+        "compile_receipt_v2": None,
         "exact_finite_selected_end_teddy_aot": None,
         "wait_requested": False,
         "compiler_settled": True,
@@ -192,6 +196,95 @@ def exact_teddy_ready_receipt(**overrides):
     return receipt
 
 
+def forced_exact_teddy_v2_ready_receipt(**overrides):
+    lowering = exact_teddy_report_fixture()
+    lowering["incumbent"].update({
+        "has_accelerator": True,
+        "scanner": "aarch64_sve",
+    })
+    report = {
+        "authenticated_compiler_report": True,
+        "schema_version": HARNESS.EXACT_TEDDY_V2_SCHEMA_VERSION,
+        "requested_policy": "force_structurally_eligible",
+        "selection_basis": "forced_structural_eligibility",
+        "incumbent_source": "ordinary_public_complete_dfa",
+        "incumbent_start_accelerator": "aarch64_sve",
+        "incumbent_anchored_prefix_filter_bytes": 0,
+        "performance_admission_bypassed": True,
+        "tail_enters_exact_incumbent": True,
+        "route_binding_sha256": "0" * 64,
+        "lowering": lowering,
+    }
+    report["route_binding_sha256"] = (
+        HARNESS.exact_teddy_v2_route_binding_sha256(report)
+    )
+    receipt = ready_receipt(
+        exact_finite_selected_end_teddy_policy_v2_request=(
+            "force_structurally_eligible"
+        ),
+        compile_receipt_v2={
+            "schema_version": HARNESS.EXACT_TEDDY_V2_SCHEMA_VERSION,
+            "optimizer_version": HARNESS.EXACT_TEDDY_V2_OPTIMIZER_VERSION,
+            "exact_finite_selected_end_teddy_policy": (
+                "force_structurally_eligible"
+            ),
+            "exact_finite_selected_end_teddy_aot_v2": report,
+        },
+        start_accelerator="aarch64_sve",
+        compiled_state_source=(
+            "exact_finite_selected_end_teddy_incumbent"
+        ),
+        compiled_forward_states=23,
+        compiled_reverse_states=0,
+        compiled_primary_native_route=HARNESS.EXACT_TEDDY_PRIMARY_ROUTE,
+        exact_finite_selected_end_teddy_aot=None,
+        published_read_only_data_bytes=372,
+    )
+    receipt.update(overrides)
+    return receipt
+
+
+def synthetic_frozen_exact_teddy_v2_cases():
+    semantics = {
+        "matcher_mode": "regex",
+        "regex_engine_request": "default",
+        "case": "case_sensitive",
+        "unicode": True,
+    }
+    return [
+        HARNESS.QueryCase(
+            private_id,
+            (
+                "frozen-oot-84"
+                if private_id.startswith("oot-")
+                else "frozen-unique-sample-128"
+            ),
+            "alpha|bravo|charlie|delta",
+            1,
+            None,
+            semantics,
+        )
+        for private_id in sorted(
+            HARNESS.FROZEN_EXACT_TEDDY_V2_STRUCTURAL_PRIVATE_IDS
+        )
+    ]
+
+
+def run_result(receipt=None):
+    empty = HARNESS.output_record(b"")
+    return {
+        "timed_out": False,
+        "status": 1,
+        "stdout": empty,
+        "stderr": empty,
+        "stdout_raw": b"",
+        "stderr_raw": b"",
+        "receipt": receipt,
+        "receipt_parse_error": False,
+        "unexpected_temporary_artifacts": 0,
+    }
+
+
 class HarnessTests(unittest.TestCase):
     def test_run_once_scrubs_control_environment(self) -> None:
         with tempfile.TemporaryDirectory() as text:
@@ -199,11 +292,12 @@ class HarnessTests(unittest.TestCase):
             executable = root / "inspect-env"
             executable.write_text(
                 "#!/bin/sh\n"
-                "printf '%s|%s|%s|%s|%s\\n' "
+                "printf '%s|%s|%s|%s|%s|%s\\n' "
                 '"${RG_FRE_AOT_BACKGROUND_RECEIPT+set}" '
                 '"${RG_FRE_AOT_BACKGROUND_RECEIPT_WAIT_FOR_COMPILER-unset}" '
                 '"${RG_FRE_AOT_BACKGROUND_TEST_MIN_STOCK_BYTES-unset}" '
                 '"${RG_FRE_AOT_BACKGROUND_CPU_PROFILE-unset}" '
+                '"${RG_FRE_AOT_BACKGROUND_EXACT_TEDDY_POLICY_V2-unset}" '
                 '"${RIPGREP_CONFIG_PATH-unset}"\n'
             )
             executable.chmod(0o700)
@@ -212,6 +306,7 @@ class HarnessTests(unittest.TestCase):
                 HARNESS.RECEIPT_WAIT_FOR_COMPILER_ENV: "inherited-wait",
                 HARNESS.CORRECTNESS_GATE_ENV: "inherited-gate",
                 HARNESS.CPU_PROFILE_ENV: "inherited-profile",
+                HARNESS.EXACT_TEDDY_POLICY_V2_ENV: "inherited-force",
                 "RIPGREP_CONFIG_PATH": "inherited-config",
             }
             with mock.patch.dict(os.environ, inherited):
@@ -248,15 +343,159 @@ class HarnessTests(unittest.TestCase):
                     collect_timing=False,
                     wait_for_compiler_settlement=True,
                 )
+                forced = HARNESS.run_once(
+                    binary=executable,
+                    args=[],
+                    cwd=root,
+                    background=True,
+                    capture_receipt=False,
+                    cpu_profile="sve2",
+                    timeout_seconds=5.0,
+                    collect_timing=False,
+                    exact_teddy_policy_v2=(
+                        "force-structurally-eligible"
+                    ),
+                )
         self.assertEqual(
-            b"|unset|unset|unset|unset\n", normal["stdout_raw"]
+            b"|unset|unset|unset|unset|unset\n", normal["stdout_raw"]
         )
         self.assertEqual(
-            b"|unset|123|sve|unset\n", background["stdout_raw"]
+            b"|unset|123|sve|unset|unset\n", background["stdout_raw"]
         )
         self.assertEqual(
-            b"set|1|unset|auto|unset\n", settlement["stdout_raw"]
+            b"set|1|unset|auto|unset|unset\n", settlement["stdout_raw"]
         )
+        self.assertEqual(
+            b"|unset|unset|sve2|force-structurally-eligible|unset\n",
+            forced["stdout_raw"],
+        )
+
+    def test_v2_policy_cannot_be_set_on_a_nonbackground_arm(self) -> None:
+        with self.assertRaises(HARNESS.HarnessError):
+            HARNESS.run_once(
+                binary=Path("unused"),
+                args=[],
+                cwd=Path("."),
+                background=False,
+                capture_receipt=False,
+                cpu_profile="auto",
+                timeout_seconds=1.0,
+                collect_timing=False,
+                exact_teddy_policy_v2="automatic",
+            )
+
+    def test_timed_campaign_policy_is_only_on_the_background_arm(self) -> None:
+        panel = HARNESS.Panel(
+            HARNESS.EXACT_TEDDY_CENSUS_PANEL,
+            Path("/unused-corpus"),
+            "literal",
+            None,
+            True,
+            1,
+        )
+        with mock.patch.object(
+            HARNESS, "run_once", side_effect=lambda **kwargs: run_result()
+        ) as run:
+            HARNESS.run_pair(
+                HARNESS.forced_exact_teddy_v2_gate_case(),
+                panel,
+                pair_index=0,
+                candidate=Path("candidate"),
+                stock=Path("stock"),
+                cwd=Path("."),
+                cpu_profile="auto",
+                timeout_seconds=1.0,
+                exact_teddy_policy_v2="force-structurally-eligible",
+            )
+        self.assertEqual(3, run.call_count)
+        for call in run.call_args_list:
+            if call.kwargs["background"]:
+                self.assertEqual(
+                    "force-structurally-eligible",
+                    call.kwargs["exact_teddy_policy_v2"],
+                )
+            else:
+                self.assertIsNone(call.kwargs["exact_teddy_policy_v2"])
+
+    def test_fixed_v2_gate_is_untimed_settled_and_strict_for_force(self) -> None:
+        panel = HARNESS.Panel(
+            HARNESS.EXACT_TEDDY_CENSUS_PANEL,
+            Path("/unused-corpus"),
+            "literal",
+            None,
+            True,
+            1,
+        )
+
+        def invoke(**kwargs):
+            receipt = None
+            if kwargs["background"]:
+                receipt = forced_exact_teddy_v2_ready_receipt(
+                    wait_requested=True,
+                    compiler_settled=True,
+                )
+            return run_result(receipt)
+
+        with mock.patch.object(
+            HARNESS, "run_once", side_effect=invoke
+        ) as run:
+            gate = HARNESS.run_exact_teddy_v2_gate(
+                panel=panel,
+                candidate=Path("candidate"),
+                stock=Path("stock"),
+                cwd=Path("."),
+                cpu_profile="auto",
+                timeout_seconds=1.0,
+                exact_teddy_policy_v2="force-structurally-eligible",
+            )
+        self.assertEqual(HARNESS.FORCED_EXACT_TEDDY_V2_GATE_PATTERN, gate["pattern"])
+        self.assertEqual([], gate["failures"])
+        for call in run.call_args_list:
+            self.assertFalse(call.kwargs["collect_timing"])
+            if call.kwargs["background"]:
+                self.assertTrue(call.kwargs["wait_for_compiler_settlement"])
+                self.assertEqual(
+                    "force-structurally-eligible",
+                    call.kwargs["exact_teddy_policy_v2"],
+                )
+            else:
+                self.assertNotIn("exact_teddy_policy_v2", call.kwargs)
+        for arm in ("normal", "background", "stock"):
+            self.assertNotIn("elapsed_ns", gate[arm])
+
+        gate["background"]["receipt"]["compile_receipt_v2"][
+            "exact_finite_selected_end_teddy_aot_v2"
+        ]["lowering"]["incumbent"]["has_accelerator"] = False
+        self.assertIn(
+            "exact_teddy_v2_incumbent_not_accelerated",
+            HARNESS.validate_exact_teddy_v2_gate_record(
+                gate, "auto", "force-structurally-eligible"
+            ),
+        )
+
+    def test_provenance_subprocesses_also_scrub_v2_policy(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            binary = Path(directory) / "binary"
+            binary.write_bytes(b"fixture")
+            completed = mock.Mock(returncode=0, stdout="version\n")
+            with (
+                mock.patch.dict(
+                    os.environ,
+                    {HARNESS.EXACT_TEDDY_POLICY_V2_ENV: "inherited"},
+                ),
+                mock.patch.object(
+                    HARNESS.subprocess, "run", return_value=completed
+                ) as run,
+            ):
+                HARNESS.git_text(Path(directory), ("rev-parse", "HEAD"))
+                HARNESS.binary_record(binary)
+                HARNESS.command_version("rustc")
+        self.assertEqual(3, run.call_count)
+        for call in run.call_args_list:
+            self.assertNotIn(
+                HARNESS.EXACT_TEDDY_POLICY_V2_ENV,
+                call.kwargs["env"],
+            )
 
     def test_settlement_mode_requires_a_background_receipt(self) -> None:
         with self.assertRaises(HARNESS.HarnessError):
@@ -369,6 +608,151 @@ class HarnessTests(unittest.TestCase):
             ),
             HARNESS.semantic_stdout_sha256(
                 missing["stdout_raw"], "unordered_lf_records"
+            ),
+        )
+
+    def test_structural_classifier_is_narrow_and_case_sensitive(self) -> None:
+        gate = HARNESS.forced_exact_teddy_v2_gate_case()
+        self.assertEqual(
+            (b"samwise", b"samw", b"frodo", b"pippin"),
+            HARNESS.structural_exact_teddy_v2_literals(gate),
+        )
+        self.assertEqual(
+            (b"one.x", b"two(y", b"three]", b"four|z"),
+            HARNESS.simple_exact_alternation_literals(
+                r"one\.x|two\(y|three\]|four\|z"
+            ),
+        )
+        rejected = (
+            "alpha|bravo|charlie",
+            "alpha||charlie|delta",
+            "aa|bbb|ccc|ddd",
+            "a.*b|bravo|charlie|delta",
+            "(alpha|bravo|charlie|delta)",
+            "[abc]|bravo|charlie|delta",
+        )
+        for pattern in rejected:
+            with self.subTest(pattern=pattern):
+                self.assertIsNone(
+                    HARNESS.simple_exact_alternation_literals(pattern)
+                )
+        insensitive = HARNESS.QueryCase(
+            "test", "test", HARNESS.FORCED_EXACT_TEDDY_V2_GATE_PATTERN,
+            1, None, {"matcher_mode": "regex", "case": "ignore_case"},
+        )
+        self.assertIsNone(
+            HARNESS.structural_exact_teddy_v2_literals(insensitive)
+        )
+
+    def test_frozen_structural_cohort_uses_immutable_ids_and_counts(self) -> None:
+        source = synthetic_frozen_exact_teddy_v2_cases()
+        semantics = source[0].semantics
+        source.append(HARNESS.QueryCase(
+            "oot-0001", "frozen-oot-84", "three|arms|only",
+            1, None, semantics,
+        ))
+        expected_cohort = source[:-1]
+        source_digest = HARNESS.manifest_digest(
+            HARNESS.case_manifest(source)
+        )
+        cohort_digest = HARNESS.manifest_digest(
+            HARNESS.case_manifest(expected_cohort)
+        )
+        with mock.patch.multiple(
+            HARNESS,
+            FROZEN_EXACT_TEDDY_V2_SOURCE_MANIFEST_SHA256=source_digest,
+            FROZEN_EXACT_TEDDY_V2_STRUCTURAL_MANIFEST_SHA256=cohort_digest,
+        ):
+            cohort = HARNESS.frozen_exact_teddy_v2_structural_cohort(
+                source
+            )
+            self.assertEqual(
+                HARNESS.FROZEN_EXACT_TEDDY_V2_STRUCTURAL_COUNTS["total"],
+                len(cohort),
+            )
+            self.assertEqual(
+                HARNESS.FROZEN_EXACT_TEDDY_V2_STRUCTURAL_PRIVATE_IDS,
+                {case.private_id for case in cohort},
+            )
+            self.assertEqual(
+                HARNESS.FROZEN_EXACT_TEDDY_V2_STRUCTURAL_COUNTS["oot"],
+                sum(case.private_id.startswith("oot-") for case in cohort),
+            )
+            self.assertEqual(
+                HARNESS.FROZEN_EXACT_TEDDY_V2_STRUCTURAL_COUNTS["wider"],
+                sum(case.private_id.startswith("wider-") for case in cohort),
+            )
+
+            changed = list(cohort)
+            first = changed[0]
+            changed[0] = HARNESS.QueryCase(
+                first.private_id, first.cohort, first.pattern,
+                first.occurrence_weight + 1, first.suffix, first.semantics,
+                first.target_kind, first.extension_class,
+            )
+            with self.assertRaises(HARNESS.HarnessError):
+                HARNESS.validate_frozen_exact_teddy_v2_structural_cohort(
+                    changed
+                )
+
+            changed_source = list(source)
+            last = changed_source[-1]
+            changed_source[-1] = HARNESS.QueryCase(
+                last.private_id, last.cohort, last.pattern,
+                last.occurrence_weight + 1, last.suffix, last.semantics,
+                last.target_kind, last.extension_class,
+            )
+            with self.assertRaises(HARNESS.HarnessError):
+                HARNESS.frozen_exact_teddy_v2_structural_cohort(
+                    changed_source
+                )
+
+    def test_policy_campaign_record_binds_policy_and_exact_frozen_manifest(self) -> None:
+        cases = synthetic_frozen_exact_teddy_v2_cases()
+        manifest_sha256 = HARNESS.manifest_digest(
+            HARNESS.case_manifest(cases)
+        )
+        with mock.patch.object(
+            HARNESS,
+            "FROZEN_EXACT_TEDDY_V2_STRUCTURAL_MANIFEST_SHA256",
+            manifest_sha256,
+        ):
+            automatic = HARNESS.exact_teddy_v2_campaign_record(
+                "automatic", cases
+            )
+            forced = HARNESS.exact_teddy_v2_campaign_record(
+                "force-structurally-eligible", cases
+            )
+        self.assertEqual(44, forced["selected_patterns"])
+        self.assertEqual(
+            manifest_sha256,
+            forced["selection_manifest_sha256"],
+        )
+        self.assertEqual(
+            HARNESS.FROZEN_EXACT_TEDDY_V2_SOURCE_MANIFEST_SHA256,
+            forced["source_selection_manifest_sha256"],
+        )
+        self.assertNotEqual(
+            automatic["exact_teddy_policy_v2"],
+            forced["exact_teddy_policy_v2"],
+        )
+        oot = [case for case in cases if case.private_id.startswith("oot-")]
+        wider = [
+            case for case in cases if case.private_id.startswith("wider-")
+        ]
+        self.assertEqual(
+            oot,
+            HARNESS.cases_for_panel(
+                "ripgrep-default-output", oot, wider, "automatic"
+            ),
+        )
+        self.assertEqual(
+            cases,
+            HARNESS.cases_for_panel(
+                HARNESS.EXACT_TEDDY_CENSUS_PANEL,
+                oot,
+                wider,
+                "force-structurally-eligible",
             ),
         )
 
@@ -548,6 +932,180 @@ class HarnessTests(unittest.TestCase):
             HARNESS.validate_receipt(receipt, "auto"),
         )
 
+    def test_v6_forced_teddy_receipt_requires_full_v2_attestation(self) -> None:
+        receipt = forced_exact_teddy_v2_ready_receipt()
+        self.assertEqual(
+            [],
+            HARNESS.validate_receipt(
+                receipt,
+                "auto",
+                expected_exact_teddy_policy_v2=(
+                    "force-structurally-eligible"
+                ),
+                require_forced_exact_teddy_v2=True,
+            ),
+        )
+        with self.assertRaises(HARNESS.HarnessError):
+            HARNESS.validate_receipt(
+                receipt,
+                "auto",
+                require_forced_exact_teddy_v2=True,
+            )
+        corrupted_policy = copy.deepcopy(receipt)
+        corrupted_policy[
+            "exact_finite_selected_end_teddy_policy_v2_request"
+        ] = "automatic"
+        corrupted_failures = HARNESS.validate_receipt(
+            corrupted_policy,
+            "auto",
+            expected_exact_teddy_policy_v2=(
+                "force-structurally-eligible"
+            ),
+            require_forced_exact_teddy_v2=True,
+        )
+        self.assertIn(
+            "exact_teddy_policy_v2_request_mismatch",
+            corrupted_failures,
+        )
+        self.assertIn(
+            "forced_exact_teddy_v2_policy_mismatch",
+            corrupted_failures,
+        )
+
+        mutations = (
+            (
+                ("compile_receipt_v2", "optimizer_version"), 24,
+                "compile_receipt_v2_optimizer_version",
+            ),
+            (
+                (
+                    "compile_receipt_v2",
+                    "exact_finite_selected_end_teddy_aot_v2",
+                    "selection_basis",
+                ),
+                "automatic_v1",
+                "exact_teddy_v2_selection_basis_mismatch",
+            ),
+            (
+                (
+                    "compile_receipt_v2",
+                    "exact_finite_selected_end_teddy_aot_v2",
+                    "incumbent_source",
+                ),
+                "private_shortcut",
+                "exact_teddy_v2_incumbent_source",
+            ),
+            (
+                (
+                    "compile_receipt_v2",
+                    "exact_finite_selected_end_teddy_aot_v2",
+                    "performance_admission_bypassed",
+                ),
+                False,
+                "exact_teddy_v2_performance_bypass_attestation",
+            ),
+            (
+                (
+                    "compile_receipt_v2",
+                    "exact_finite_selected_end_teddy_aot_v2",
+                    "tail_enters_exact_incumbent",
+                ),
+                False,
+                "exact_teddy_v2_tail_attestation",
+            ),
+            (
+                (
+                    "compile_receipt_v2",
+                    "exact_finite_selected_end_teddy_aot_v2",
+                    "lowering", "incumbent", "has_accelerator",
+                ),
+                False,
+                "exact_teddy_v2_incumbent_not_accelerated",
+            ),
+        )
+        for path, value, expected in mutations:
+            with self.subTest(expected=expected):
+                changed = copy.deepcopy(receipt)
+                owner = changed
+                for field in path[:-1]:
+                    owner = owner[field]
+                owner[path[-1]] = value
+                self.assertIn(
+                    expected,
+                    HARNESS.validate_receipt(
+                        changed,
+                        "auto",
+                        expected_exact_teddy_policy_v2=(
+                            "force-structurally-eligible"
+                        ),
+                        require_forced_exact_teddy_v2=True,
+                    ),
+                )
+
+    def test_v6_forced_teddy_rejects_v1_leakage_and_binding_changes(self) -> None:
+        receipt = forced_exact_teddy_v2_ready_receipt()
+        receipt["exact_finite_selected_end_teddy_aot"] = (
+            exact_teddy_report_fixture()
+        )
+        self.assertIn(
+            "forced_exact_teddy_v1_receipt_leakage",
+            HARNESS.validate_receipt(
+                receipt,
+                "auto",
+                expected_exact_teddy_policy_v2=(
+                    "force-structurally-eligible"
+                ),
+                require_forced_exact_teddy_v2=True,
+            ),
+        )
+
+    def test_v6_explicit_policy_allows_only_precompile_null_supplement(self) -> None:
+        early_decline = receipt_fixture(
+            exact_finite_selected_end_teddy_policy_v2_request=(
+                "force_structurally_eligible"
+            ),
+        )
+        self.assertEqual(
+            [],
+            HARNESS.validate_receipt(
+                early_decline,
+                "auto",
+                expected_exact_teddy_policy_v2=(
+                    "force-structurally-eligible"
+                ),
+            ),
+        )
+        compiled_without_supplement = ready_receipt(
+            exact_finite_selected_end_teddy_policy_v2_request=(
+                "automatic"
+            ),
+            compile_receipt_v2=None,
+        )
+        self.assertIn(
+            "compile_receipt_v2_required_after_compile",
+            HARNESS.validate_receipt(
+                compiled_without_supplement,
+                "auto",
+                expected_exact_teddy_policy_v2="automatic",
+            ),
+        )
+
+        receipt = forced_exact_teddy_v2_ready_receipt()
+        receipt["compile_receipt_v2"][
+            "exact_finite_selected_end_teddy_aot_v2"
+        ]["route_binding_sha256"] = "f" * 64
+        self.assertIn(
+            "exact_teddy_v2_route_binding_mismatch",
+            HARNESS.validate_receipt(
+                receipt,
+                "auto",
+                expected_exact_teddy_policy_v2=(
+                    "force-structurally-eligible"
+                ),
+                require_forced_exact_teddy_v2=True,
+            ),
+        )
+
     def test_exact_teddy_report_rejects_selection_boundaries(self) -> None:
         cases = (
             ("source_low", {"source_count": 3},
@@ -641,6 +1199,24 @@ class HarnessTests(unittest.TestCase):
         )["receipt_classification"]
         self.assertNotIn("primary_native_routes", classification)
         self.assertNotIn("exact_teddy_target_tiers", classification)
+
+    def test_legacy_v5_receipt_keeps_all_v5_invariants(self) -> None:
+        receipt = exact_teddy_ready_receipt(
+            schema=HARNESS.V5_RECEIPT_SCHEMA,
+        )
+        del receipt[
+            "exact_finite_selected_end_teddy_policy_v2_request"
+        ]
+        del receipt["compile_receipt_v2"]
+        self.assertEqual([], HARNESS.validate_receipt(receipt, "auto"))
+
+        receipt["wait_requested"] = True
+        receipt["compiler_settled"] = False
+        receipt["compiled_primary_native_route"] = "ordered_dfa"
+        failures = HARNESS.validate_receipt(receipt, "auto")
+        self.assertIn("requested_compiler_not_settled", failures)
+        self.assertIn("primary_native_route_state_mismatch", failures)
+        self.assertIn("exact_teddy_report_on_non_teddy_route", failures)
 
     def test_exact_teddy_census_uses_only_authenticated_primary_route(self) -> None:
         cases = [

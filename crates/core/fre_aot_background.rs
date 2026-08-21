@@ -32,9 +32,11 @@ const RECEIPT_ENV: &str = "RG_FRE_AOT_BACKGROUND_RECEIPT";
 const RECEIPT_WAIT_FOR_COMPILER_ENV: &str =
     "RG_FRE_AOT_BACKGROUND_RECEIPT_WAIT_FOR_COMPILER";
 const CPU_PROFILE_ENV: &str = "RG_FRE_AOT_BACKGROUND_CPU_PROFILE";
+const EXACT_TEDDY_POLICY_V2_ENV: &str =
+    "RG_FRE_AOT_BACKGROUND_EXACT_TEDDY_POLICY_V2";
 const TEST_MIN_STOCK_BYTES_ENV: &str =
     "RG_FRE_AOT_BACKGROUND_TEST_MIN_STOCK_BYTES";
-const RECEIPT_SCHEMA: &str = "ripgrep.fre-aot-background.v5";
+const RECEIPT_SCHEMA: &str = "ripgrep.fre-aot-background.v6";
 const PENDING_SCAN_QUANTUM: usize = 1 << 20;
 const EXACT_TEDDY_INPUT_FLOOR_BYTES: usize = 4096;
 const EXACT_TEDDY_RUNTIME_VERIFICATION_BUDGET: u16 = 64;
@@ -62,6 +64,43 @@ enum TargetFeatureProfile {
     Asimd,
     Sve,
     Sve2,
+}
+
+/// An explicitly requested experimental compiler policy. Absence is kept
+/// distinct from `Automatic`: with no environment request, ripgrep continues
+/// to call FRE's stable V1 `compile` API byte-for-byte as before.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ExactTeddyPolicyV2Request {
+    NotRequested,
+    Disabled,
+    Automatic,
+    ForceStructurallyEligible,
+}
+
+impl ExactTeddyPolicyV2Request {
+    const fn name(self) -> &'static str {
+        match self {
+            Self::NotRequested => "not_requested",
+            Self::Disabled => "disabled",
+            Self::Automatic => "automatic",
+            Self::ForceStructurallyEligible => "force_structurally_eligible",
+        }
+    }
+
+    const fn compiler_policy(
+        self,
+    ) -> Option<fre_aot_regex::ExactFiniteSelectedEndTeddyPolicyV2> {
+        use fre_aot_regex::ExactFiniteSelectedEndTeddyPolicyV2 as Policy;
+
+        match self {
+            Self::NotRequested => None,
+            Self::Disabled => Some(Policy::Disabled),
+            Self::Automatic => Some(Policy::Automatic),
+            Self::ForceStructurallyEligible => {
+                Some(Policy::ForceStructurallyEligible)
+            }
+        }
+    }
 }
 
 impl TargetFeatureProfile {
@@ -93,6 +132,8 @@ struct ReceiptClassification {
     compiled_reverse_states: Option<u64>,
     compiled_reverse_start_recovery: Option<bool>,
     compiled_primary_native_route: Option<&'static str>,
+    exact_finite_selected_end_teddy_policy_v2_request: &'static str,
+    compile_receipt_v2: Option<fre_aot_regex::CompileReceiptV2>,
     exact_finite_selected_end_teddy_aot:
         Option<fre_aot_regex::ExactFiniteSelectedEndTeddyAotReport>,
     publication_stage: &'static str,
@@ -120,6 +161,8 @@ impl ReceiptClassification {
             compiled_reverse_states: None,
             compiled_reverse_start_recovery: None,
             compiled_primary_native_route: None,
+            exact_finite_selected_end_teddy_policy_v2_request: "not_requested",
+            compile_receipt_v2: None,
             exact_finite_selected_end_teddy_aot: None,
             publication_stage: "not_started",
             publication_refusal_class: None,
@@ -180,8 +223,14 @@ impl NativeAotMatcher<'_> {
 
 type CompileOutcome = Result<Arc<NativeAotFactory>, String>;
 
+enum CompletedCompilation {
+    Stable(fre_aot_regex::CompiledRegex),
+    V2(fre_aot_regex::CompiledRegexV2),
+}
+
 struct CompileTask<'a> {
     target_feature_profile: TargetFeatureProfile,
+    exact_teddy_policy_v2: ExactTeddyPolicyV2Request,
     regex_size_limit: Option<usize>,
     dfa_size_limit: Option<usize>,
     cancelled: &'a AtomicBool,
@@ -339,13 +388,21 @@ impl CompileState {
         let reason = reason.into();
         let (classification, failure) = match target_feature_profile_from_env()
         {
-            Ok(profile) => {
-                let mut classification = classification_for_profile(profile);
-                classification.publication_stage = "profile_gate";
-                let refusal_class = search_profile_refusal_class(&reason);
-                classification.publication_refusal_class = Some(refusal_class);
-                (classification, refusal_class.to_owned())
-            }
+            Ok(profile) => match exact_teddy_policy_v2_from_env() {
+                Ok(policy) => {
+                    let mut classification =
+                        classification_for_profile_and_policy(profile, policy);
+                    classification.publication_stage = "profile_gate";
+                    let refusal_class = search_profile_refusal_class(&reason);
+                    classification.publication_refusal_class =
+                        Some(refusal_class);
+                    (classification, refusal_class.to_owned())
+                }
+                Err(failure) => (
+                    invalid_teddy_policy_v2_classification(profile),
+                    failure.to_owned(),
+                ),
+            },
             Err(failure) => {
                 (invalid_profile_classification(), failure.to_owned())
             }
@@ -378,8 +435,27 @@ impl CompileState {
                 return state;
             }
         };
+        let exact_teddy_policy_v2 = match exact_teddy_policy_v2_from_env() {
+            Ok(policy) => policy,
+            Err(reason) => {
+                let state = Self::empty_with_classification(
+                    invalid_teddy_policy_v2_classification(
+                        target_feature_profile,
+                    ),
+                );
+                log::debug!(
+                    "FRE AOT background decline: {reason}; using stock Rust regex"
+                );
+                let _ = state.outcome.set(Err(reason.to_owned()));
+                state.compiler_settled.store(true, Ordering::Release);
+                return state;
+            }
+        };
         let state = Self::empty_with_classification(
-            classification_for_profile(target_feature_profile),
+            classification_for_profile_and_policy(
+                target_feature_profile,
+                exact_teddy_policy_v2,
+            ),
         );
         let weak = Arc::downgrade(&state);
         let cancelled = Arc::clone(&state.cancelled);
@@ -399,6 +475,7 @@ impl CompileState {
                     pattern,
                     CompileTask {
                         target_feature_profile,
+                        exact_teddy_policy_v2,
                         regex_size_limit,
                         dfa_size_limit,
                         cancelled: &cancelled,
@@ -529,6 +606,10 @@ impl CompileState {
             .exact_finite_selected_end_teddy_aot
             .as_ref()
             .map(exact_finite_selected_end_teddy_receipt_json);
+        let compile_receipt_v2 = classification
+            .compile_receipt_v2
+            .as_ref()
+            .map(compile_receipt_v2_json);
         let mut receipt = serde_json::json!({
             "schema": RECEIPT_SCHEMA,
             "outcome": outcome,
@@ -547,6 +628,8 @@ impl CompileState {
             "compiled_reverse_states": classification.compiled_reverse_states,
             "compiled_reverse_start_recovery": classification.compiled_reverse_start_recovery,
             "compiled_primary_native_route": classification.compiled_primary_native_route,
+            "exact_finite_selected_end_teddy_policy_v2_request": classification.exact_finite_selected_end_teddy_policy_v2_request,
+            "compile_receipt_v2": compile_receipt_v2,
             "exact_finite_selected_end_teddy_aot": exact_finite_selected_end_teddy_aot,
             "wait_requested": self.wait_requested,
             "compiler_settled": self.compiler_settled.load(Ordering::Acquire),
@@ -556,9 +639,10 @@ impl CompileState {
             "published_code_bytes": classification.published_code_bytes,
             "published_read_only_data_bytes": classification.published_read_only_data_bytes,
             "published_total_mapped_bytes": classification.published_total_mapped_bytes,
-            // `compile_ns` is FRE's compile(request), which still emits the
-            // deterministic object. `publish_ns` is direct in-process
-            // relocation/mapping/protection. `prepare_ns` covers both.
+            // `compile_ns` is FRE's stable compile call or an explicitly
+            // requested V2 compile call; both still emit the deterministic
+            // object. `publish_ns` is direct in-process relocation/mapping/
+            // protection. `prepare_ns` covers both.
             "compile_ns": self.compile_ns.load(Ordering::Acquire),
             "publish_ns": self.publish_ns.load(Ordering::Acquire),
             "prepare_ns": self.prepare_ns.load(Ordering::Acquire),
@@ -1163,12 +1247,61 @@ fn target_feature_profile_from_env()
     }
 }
 
+fn exact_teddy_policy_v2_from_env()
+-> Result<ExactTeddyPolicyV2Request, &'static str> {
+    match std::env::var(EXACT_TEDDY_POLICY_V2_ENV) {
+        Ok(value) => parse_exact_teddy_policy_v2(&value)
+            .ok_or("exact_teddy_policy_v2_invalid"),
+        Err(std::env::VarError::NotPresent) => {
+            Ok(ExactTeddyPolicyV2Request::NotRequested)
+        }
+        Err(std::env::VarError::NotUnicode(_)) => {
+            Err("exact_teddy_policy_v2_invalid")
+        }
+    }
+}
+
+fn parse_exact_teddy_policy_v2(
+    value: &str,
+) -> Option<ExactTeddyPolicyV2Request> {
+    match value {
+        "disabled" => Some(ExactTeddyPolicyV2Request::Disabled),
+        "automatic" => Some(ExactTeddyPolicyV2Request::Automatic),
+        "force-structurally-eligible" => {
+            Some(ExactTeddyPolicyV2Request::ForceStructurallyEligible)
+        }
+        _ => None,
+    }
+}
+
 fn classification_for_profile(
     profile: TargetFeatureProfile,
 ) -> ReceiptClassification {
     let mut classification = ReceiptClassification::pending(profile.name());
     classification.requested_target_feature_bits =
         fixed_profile_features(profile).map(|features| features.bits());
+    classification
+}
+
+fn classification_for_profile_and_policy(
+    profile: TargetFeatureProfile,
+    policy: ExactTeddyPolicyV2Request,
+) -> ReceiptClassification {
+    let mut classification = classification_for_profile(profile);
+    classification.exact_finite_selected_end_teddy_policy_v2_request =
+        policy.name();
+    classification
+}
+
+fn invalid_teddy_policy_v2_classification(
+    profile: TargetFeatureProfile,
+) -> ReceiptClassification {
+    let mut classification = classification_for_profile(profile);
+    classification.exact_finite_selected_end_teddy_policy_v2_request =
+        "invalid";
+    classification.publication_stage = "policy_selection";
+    classification.publication_refusal_class =
+        Some("exact_teddy_policy_v2_invalid");
     classification
 }
 
@@ -1514,6 +1647,77 @@ fn exact_finite_selected_end_teddy_receipt_json(
     receipt
 }
 
+fn exact_teddy_policy_v2_name(
+    policy: fre_aot_regex::ExactFiniteSelectedEndTeddyPolicyV2,
+) -> &'static str {
+    use fre_aot_regex::ExactFiniteSelectedEndTeddyPolicyV2 as Policy;
+
+    match policy {
+        Policy::Disabled => "disabled",
+        Policy::Automatic => "automatic",
+        Policy::ForceStructurallyEligible => "force_structurally_eligible",
+    }
+}
+
+fn exact_teddy_selection_basis_v2_name(
+    basis: fre_aot_regex::ExactFiniteSelectedEndTeddySelectionBasisV2,
+) -> &'static str {
+    use fre_aot_regex::ExactFiniteSelectedEndTeddySelectionBasisV2 as Basis;
+
+    match basis {
+        Basis::AutomaticV1 => "automatic_v1",
+        Basis::ForcedStructuralEligibility => "forced_structural_eligibility",
+    }
+}
+
+fn exact_teddy_incumbent_source_v2_name(
+    source: fre_aot_regex::ExactFiniteSelectedEndTeddyIncumbentSourceV2,
+) -> &'static str {
+    use fre_aot_regex::ExactFiniteSelectedEndTeddyIncumbentSourceV2 as Source;
+
+    match source {
+        Source::OrdinaryPublicCompleteDfa => "ordinary_public_complete_dfa",
+    }
+}
+
+fn exact_finite_selected_end_teddy_receipt_v2_json(
+    report: &fre_aot_regex::ExactFiniteSelectedEndTeddyAotReportV2,
+) -> serde_json::Value {
+    serde_json::json!({
+        // FRE installs this report only after authenticating its route binding
+        // and the complete lowering. ripgrep additionally compares the V2
+        // compile supplement with that installed module report before the
+        // loader consumes `CompiledRegex`.
+        "authenticated_compiler_report": true,
+        "schema_version": report.schema_version,
+        "requested_policy": exact_teddy_policy_v2_name(report.requested_policy),
+        "selection_basis": exact_teddy_selection_basis_v2_name(report.selection_basis),
+        "incumbent_source": exact_teddy_incumbent_source_v2_name(report.incumbent_source),
+        "incumbent_start_accelerator": start_accelerator_name(report.incumbent_start_accelerator),
+        "incumbent_anchored_prefix_filter_bytes": report.incumbent_anchored_prefix_filter_bytes,
+        "performance_admission_bypassed": report.performance_admission_bypassed,
+        "tail_enters_exact_incumbent": report.tail_enters_exact_incumbent,
+        "route_binding_sha256": sha256_hex(&report.route_binding_sha256),
+        "lowering": exact_finite_selected_end_teddy_receipt_json(&report.lowering),
+    })
+}
+
+fn compile_receipt_v2_json(
+    receipt: &fre_aot_regex::CompileReceiptV2,
+) -> serde_json::Value {
+    serde_json::json!({
+        "schema_version": receipt.schema_version,
+        "optimizer_version": receipt.optimizer_version,
+        "exact_finite_selected_end_teddy_policy": exact_teddy_policy_v2_name(
+            receipt.exact_finite_selected_end_teddy_policy,
+        ),
+        "exact_finite_selected_end_teddy_aot_v2": receipt
+            .exact_finite_selected_end_teddy_aot
+            .as_ref()
+            .map(exact_finite_selected_end_teddy_receipt_v2_json),
+    })
+}
+
 #[derive(Clone, Copy, Debug)]
 struct ExactTeddyTierGeometry {
     plan_scan_instruction_units: u16,
@@ -1655,10 +1859,25 @@ fn exact_teddy_tier_geometry(
     })
 }
 
+#[cfg(test)]
 fn exact_teddy_report_invariants_authenticate(
     report: &fre_aot_regex::ExactFiniteSelectedEndTeddyAotReport,
     receipt: &fre_aot_regex::CompileReceipt,
 ) -> bool {
+    exact_teddy_report_invariants_authenticate_with_basis(
+        report,
+        receipt,
+        fre_aot_regex::ExactFiniteSelectedEndTeddySelectionBasisV2::AutomaticV1,
+    )
+}
+
+fn exact_teddy_report_invariants_authenticate_with_basis(
+    report: &fre_aot_regex::ExactFiniteSelectedEndTeddyAotReport,
+    receipt: &fre_aot_regex::CompileReceipt,
+    selection_basis: fre_aot_regex::ExactFiniteSelectedEndTeddySelectionBasisV2,
+) -> bool {
+    use fre_aot_regex::ExactFiniteSelectedEndTeddySelectionBasisV2 as Basis;
+
     let Some(geometry) = exact_teddy_tier_geometry(report) else {
         return false;
     };
@@ -1772,6 +1991,18 @@ fn exact_teddy_report_invariants_authenticate(
         let incumbent_code_end = report
             .incumbent_code_offset
             .checked_add(report.incumbent_code_bytes)?;
+        let incumbent_accelerator_is_valid = match selection_basis {
+            Basis::AutomaticV1 => {
+                !incumbent.has_accelerator
+                    && incumbent.scanner
+                        == fre_aot_regex::StartAccelerator::None
+            }
+            Basis::ForcedStructuralEligibility => {
+                incumbent.has_accelerator
+                    && incumbent.scanner
+                        != fre_aot_regex::StartAccelerator::None
+            }
+        };
         Some(
             (4..=64).contains(&source_count)
                 && source_count == literal_count
@@ -1813,12 +2044,15 @@ fn exact_teddy_report_invariants_authenticate(
                     == expected_verification_cost
                 && report.selection_full_cost_units == full_cost
                 && report.selection_incumbent_cost_units == incumbent_cost
-                && full_cost.checked_mul(8)?
-                    <= incumbent_cost.checked_mul(7)?
+                && (selection_basis == Basis::ForcedStructuralEligibility
+                    || full_cost.checked_mul(8)?
+                        <= incumbent_cost.checked_mul(7)?)
                 && (1..=EXACT_TEDDY_BYTE_FREQUENCY_DENOMINATOR)
                     .contains(&report.selection_root_frequency_units)
                 && root_cardinality != 0
-                && (ordinary_profitable || dense_profitable)
+                && (selection_basis == Basis::ForcedStructuralEligibility
+                    || ordinary_profitable
+                    || dense_profitable)
                 && incumbent.forward_states != 0
                 && (1..=256).contains(&incumbent.alphabet_classes)
                 && incumbent.transition_cells
@@ -1830,8 +2064,7 @@ fn exact_teddy_report_invariants_authenticate(
                     >= incumbent.minimum_native_data_bytes
                 && incumbent.hot_loads_per_byte != 0
                 && incumbent.hot_branches_per_byte != 0
-                && !incumbent.has_accelerator
-                && incumbent.scanner == fre_aot_regex::StartAccelerator::None
+                && incumbent_accelerator_is_valid
                 && report.incumbent_data_bytes == incumbent.native_data_bytes
                 && table_base == expected_table_base
                 && table_end == expected_table_end
@@ -1872,6 +2105,24 @@ fn copy_authenticated_exact_finite_selected_end_teddy(
         return Err("compiled_teddy_report_module_mismatch");
     }
     let Some(report) = receipt_report else { return Ok(None) };
+    if !exact_teddy_report_authenticates(
+        compiled,
+        &report,
+        fre_aot_regex::ExactFiniteSelectedEndTeddySelectionBasisV2::AutomaticV1,
+    ) {
+        return Err("compiled_teddy_report_authentication_failed");
+    }
+    Ok(Some(report))
+}
+
+fn exact_teddy_report_authenticates(
+    compiled: &fre_aot_regex::CompiledRegex,
+    report: &fre_aot_regex::ExactFiniteSelectedEndTeddyAotReport,
+    selection_basis: fre_aot_regex::ExactFiniteSelectedEndTeddySelectionBasisV2,
+) -> bool {
+    use fre_aot_regex::ExactFiniteSelectedEndTeddySelectionBasisV2 as Basis;
+
+    let receipt = compiled.receipt();
     let incumbent = report.incumbent_complete_dfa;
     let hashes = [
         report.artifact_identity,
@@ -1887,14 +2138,18 @@ fn copy_authenticated_exact_finite_selected_end_teddy(
     ];
     let code_end =
         report.incumbent_code_offset.checked_add(report.incumbent_code_bytes);
-    if report.artifact_identity != compiled.program().artifact_identity()
+    !(report.artifact_identity != compiled.program().artifact_identity()
         || report.artifact_identity != receipt.program_sha256
         || report.output != fre_aot_regex::OutputContract::SelectedEnd
         || report.output != receipt.output
         || receipt.entry_abi != fre_aot_regex::EntryAbi::SelectedEndSearchV1
         || report.target != receipt.target
         || report.scanner != receipt.start_accelerator
-        || !exact_teddy_report_invariants_authenticate(&report, receipt)
+        || !exact_teddy_report_invariants_authenticate_with_basis(
+            report,
+            receipt,
+            selection_basis,
+        )
         || hashes.contains(&[0; 32])
         || report.source_count == 0
         || report.literal_count
@@ -1912,8 +2167,9 @@ fn copy_authenticated_exact_finite_selected_end_teddy(
         || report.selection_probability_denominator == 0
         || report.selection_no_candidate_numerator
             > report.selection_probability_denominator
-        || report.selection_full_cost_units
-            > report.selection_incumbent_cost_units
+        || (selection_basis == Basis::AutomaticV1
+            && report.selection_full_cost_units
+                > report.selection_incumbent_cost_units)
         || report.runtime_verification_budget == 0
         || report.table_base >= report.table_end
         || report.incumbent_data_bytes != incumbent.native_data_bytes
@@ -1922,20 +2178,138 @@ fn copy_authenticated_exact_finite_selected_end_teddy(
         || code_end.is_none_or(|end| end > receipt.code_bytes)
         || incumbent.forward_states == 0
         || incumbent.alphabet_classes == 0
-        || incumbent.transition_cells == 0
+        || incumbent.transition_cells == 0)
+}
+
+fn exact_teddy_report_v2_metadata_authenticates(
+    report: &fre_aot_regex::ExactFiniteSelectedEndTeddyAotReportV2,
+    requested_policy: fre_aot_regex::ExactFiniteSelectedEndTeddyPolicyV2,
+    selection_basis: fre_aot_regex::ExactFiniteSelectedEndTeddySelectionBasisV2,
+) -> bool {
+    use fre_aot_regex::{
+        ExactFiniteSelectedEndTeddyIncumbentSourceV2 as Source,
+        ExactFiniteSelectedEndTeddySelectionBasisV2 as Basis,
+    };
+
+    report.schema_version == fre_aot_regex::COMPILE_REQUEST_V2_SCHEMA_VERSION
+        && report.requested_policy == requested_policy
+        && report.selection_basis == selection_basis
+        && report.incumbent_source == Source::OrdinaryPublicCompleteDfa
+        && report.incumbent_start_accelerator
+            == report.lowering.incumbent_complete_dfa.scanner
+        && (selection_basis != Basis::ForcedStructuralEligibility
+            || (report.lowering.incumbent_complete_dfa.has_accelerator
+                && report.incumbent_start_accelerator
+                    != fre_aot_regex::StartAccelerator::None))
+        && report.performance_admission_bypassed
+            == (selection_basis == Basis::ForcedStructuralEligibility)
+        && report.tail_enters_exact_incumbent
+        && report.route_binding_sha256 != [0; 32]
+}
+
+/// Copy and authenticate the V2 supplement before `into_compiled` consumes
+/// it for the stable loader API. Automatic supplements bind back to the
+/// stable V1 report; forced supplements bind to the separately installed V2
+/// module report and must never populate the stable V1 field.
+fn copy_authenticated_exact_finite_selected_end_teddy_v2(
+    compiled: &fre_aot_regex::CompiledRegexV2,
+    requested_policy: fre_aot_regex::ExactFiniteSelectedEndTeddyPolicyV2,
+) -> Result<fre_aot_regex::CompileReceiptV2, &'static str> {
+    use fre_aot_regex::{
+        ExactFiniteSelectedEndTeddyPolicyV2 as Policy,
+        ExactFiniteSelectedEndTeddySelectionBasisV2 as Basis,
+    };
+
+    let receipt_v2 = *compiled.receipt_v2();
+    if receipt_v2.schema_version
+        != fre_aot_regex::COMPILE_REQUEST_V2_SCHEMA_VERSION
+        || receipt_v2.optimizer_version
+            != fre_aot_regex::EXPERIMENTAL_OPTIMIZER_VERSION_V2
+        || receipt_v2.exact_finite_selected_end_teddy_policy
+            != requested_policy
     {
-        return Err("compiled_teddy_report_authentication_failed");
+        return Err("compiled_teddy_v2_receipt_identity_mismatch");
     }
-    Ok(Some(report))
+    let stable_report = compiled.receipt().exact_finite_selected_end_teddy_aot;
+    let module_v1 = compiled
+        .module()
+        .exact_finite_selected_end_teddy_aot_report()
+        .copied();
+    let module_v2 = compiled
+        .module()
+        .exact_finite_selected_end_teddy_aot_report_v2()
+        .copied();
+    let supplemental = receipt_v2.exact_finite_selected_end_teddy_aot;
+    let valid = match requested_policy {
+        Policy::Disabled => {
+            stable_report.is_none()
+                && module_v1.is_none()
+                && module_v2.is_none()
+                && supplemental.is_none()
+        }
+        Policy::Automatic => {
+            module_v2.is_none()
+                && stable_report == module_v1
+                && match (stable_report, supplemental) {
+                    (None, None) => true,
+                    (Some(stable), Some(report)) => {
+                        report.lowering == stable
+                            && exact_teddy_report_v2_metadata_authenticates(
+                                &report,
+                                requested_policy,
+                                Basis::AutomaticV1,
+                            )
+                            && exact_teddy_report_authenticates(
+                                compiled.compiled(),
+                                &report.lowering,
+                                Basis::AutomaticV1,
+                            )
+                    }
+                    _ => false,
+                }
+        }
+        Policy::ForceStructurallyEligible => {
+            stable_report.is_none()
+                && module_v1.is_none()
+                && supplemental == module_v2
+                && supplemental.is_none_or(|report| {
+                    exact_teddy_report_v2_metadata_authenticates(
+                        &report,
+                        requested_policy,
+                        Basis::ForcedStructuralEligibility,
+                    ) && exact_teddy_report_authenticates(
+                        compiled.compiled(),
+                        &report.lowering,
+                        Basis::ForcedStructuralEligibility,
+                    )
+                })
+        }
+    };
+    if !valid {
+        return Err("compiled_teddy_v2_report_authentication_failed");
+    }
+    Ok(receipt_v2)
 }
 
 /// Identify the actual native entry route. In particular, the semantic DFA
 /// retained behind Teddy's short-input and budget tail edges is never called
 /// the primary route.
+#[cfg(test)]
 fn selected_primary_native_route(
     receipt: &fre_aot_regex::CompileReceipt,
 ) -> &'static str {
-    if receipt.exact_finite_selected_end_teddy_aot.is_some() {
+    selected_primary_native_route_with_v2(receipt, None)
+}
+
+fn selected_primary_native_route_with_v2(
+    receipt: &fre_aot_regex::CompileReceipt,
+    receipt_v2: Option<&fre_aot_regex::CompileReceiptV2>,
+) -> &'static str {
+    if receipt.exact_finite_selected_end_teddy_aot.is_some()
+        || receipt_v2.is_some_and(|supplement| {
+            supplement.exact_finite_selected_end_teddy_aot.is_some()
+        })
+    {
         return "exact_finite_selected_end_teddy";
     }
     if receipt.slow_context_aot.is_some() {
@@ -1963,9 +2337,28 @@ fn selected_primary_native_route(
 /// ordered finite-language machine is reported as its own forward-only
 /// geometry instead of being mislabeled with the semantic DFA geometry. A
 /// direct NFA or another route with no complete-machine receipt is absent.
+#[cfg(test)]
 fn selected_machine_states(
     receipt: &fre_aot_regex::CompileReceipt,
 ) -> (Option<&'static str>, Option<u64>, Option<u64>) {
+    selected_machine_states_with_v2(receipt, None)
+}
+
+fn selected_machine_states_with_v2(
+    receipt: &fre_aot_regex::CompileReceipt,
+    receipt_v2: Option<&fre_aot_regex::CompileReceiptV2>,
+) -> (Option<&'static str>, Option<u64>, Option<u64>) {
+    if let Some(report) = receipt_v2.and_then(|supplement| {
+        supplement.exact_finite_selected_end_teddy_aot.as_ref()
+    }) {
+        return (
+            Some("exact_finite_selected_end_teddy_incumbent"),
+            Some(u64_len(
+                report.lowering.incumbent_complete_dfa.forward_states,
+            )),
+            Some(0),
+        );
+    }
     if let Some(report) = &receipt.exact_finite_selected_end_teddy_aot {
         return (
             Some("exact_finite_selected_end_teddy_incumbent"),
@@ -2122,12 +2515,14 @@ fn compile_native_factory(
     task: CompileTask<'_>,
 ) -> CompileOutcome {
     use fre_aot_regex::{
-        CompileMode, CompileRequest, OutputContract, compile,
+        CompileMode, CompileRequest, CompileRequestV2, OutputContract,
+        compile, compile_v2,
     };
     use fre_aot_regex_loader::{PublicationLimits, publish_selected_end};
 
     let CompileTask {
         target_feature_profile,
+        exact_teddy_policy_v2,
         regex_size_limit,
         dfa_size_limit,
         cancelled,
@@ -2137,8 +2532,10 @@ fn compile_native_factory(
     } = task;
     receipt_classification.lock().unwrap().publication_stage =
         "target_detection";
-    let TargetPlan { classification, target } =
+    let TargetPlan { mut classification, target } =
         target_plan_for_profile(target_feature_profile);
+    classification.exact_finite_selected_end_teddy_policy_v2_request =
+        exact_teddy_policy_v2.name();
     *receipt_classification.lock().unwrap() = classification;
     let target = match target {
         Ok(target) => target,
@@ -2164,7 +2561,14 @@ fn compile_native_factory(
         request = request.dfa_size_limit(limit);
     }
     let compile_started = Instant::now();
-    let compiled = compile(request);
+    let compiled = match exact_teddy_policy_v2.compiler_policy() {
+        None => compile(request).map(CompletedCompilation::Stable),
+        Some(policy) => compile_v2(
+            CompileRequestV2::new(request)
+                .exact_finite_selected_end_teddy(policy),
+        )
+        .map(CompletedCompilation::V2),
+    };
     compile_ns
         .store(duration_ns(compile_started.elapsed()), Ordering::Release);
     let compiled = match compiled {
@@ -2180,6 +2584,31 @@ fn compile_native_factory(
     if cancelled.load(Ordering::SeqCst) {
         return Err("compilation_cancelled".to_owned());
     }
+    let (compiled, compile_receipt_v2) = match compiled {
+        CompletedCompilation::Stable(compiled) => (compiled, None),
+        CompletedCompilation::V2(compiled_v2) => {
+            let requested_policy = exact_teddy_policy_v2
+                .compiler_policy()
+                .expect("V2 compilation has an explicit policy");
+            let receipt_v2 =
+                match copy_authenticated_exact_finite_selected_end_teddy_v2(
+                    &compiled_v2,
+                    requested_policy,
+                ) {
+                    Ok(receipt) => receipt,
+                    Err(refusal_class) => {
+                        let mut classification =
+                            receipt_classification.lock().unwrap();
+                        classification.publication_stage =
+                            "artifact_validation";
+                        classification.publication_refusal_class =
+                            Some(refusal_class);
+                        return Err(refusal_class.to_owned());
+                    }
+                };
+            (compiled_v2.into_compiled(), Some(receipt_v2))
+        }
+    };
     let exact_finite_selected_end_teddy_aot =
         match copy_authenticated_exact_finite_selected_end_teddy(&compiled) {
             Ok(report) => report,
@@ -2196,7 +2625,7 @@ fn compile_native_factory(
         compiled_state_source,
         compiled_forward_states,
         compiled_reverse_states,
-    ) = selected_machine_states(receipt);
+    ) = selected_machine_states_with_v2(receipt, compile_receipt_v2.as_ref());
     {
         let mut classification = receipt_classification.lock().unwrap();
         classification.compiler_engine =
@@ -2218,7 +2647,11 @@ fn compile_native_factory(
                 &fre_aot_regex::OptimizationPass::ReverseStartRecovery,
             ));
         classification.compiled_primary_native_route =
-            Some(selected_primary_native_route(receipt));
+            Some(selected_primary_native_route_with_v2(
+                receipt,
+                compile_receipt_v2.as_ref(),
+            ));
+        classification.compile_receipt_v2 = compile_receipt_v2;
         classification.exact_finite_selected_end_teddy_aot =
             exact_finite_selected_end_teddy_aot;
         classification.runtime_helper_required =
@@ -2294,6 +2727,30 @@ mod tests {
         features: fre_aot_regex::FeatureSet,
     ) -> fre_aot_regex::Target {
         fre_aot_regex::Target::aarch64_linux().with_features(features).unwrap()
+    }
+
+    fn scanner_free_exact_teddy_pattern() -> String {
+        let mut pattern = String::from("(?-u:");
+        for (ordinal, byte) in [
+            0x00_u8, 0x12, 0x3f, 0x51, 0x7e, 0x8a, 0x92, 0xa4, 0x0c, 0x18,
+            0x1e, 0x58, 0x5e, 0x8f, 0x98, 0x9e, 0xaa,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            if ordinal != 0 {
+                pattern.push('|');
+            }
+            for _ in 0..6 {
+                use std::fmt::Write as _;
+                write!(&mut pattern, "\\x{byte:02x}").unwrap();
+            }
+            if ordinal == 16 {
+                pattern.push_str("\\xaa");
+            }
+        }
+        pattern.push(')');
+        pattern
     }
 
     #[test]
@@ -2394,6 +2851,29 @@ mod tests {
     }
 
     #[test]
+    fn exact_teddy_policy_v2_parser_is_exact_and_default_is_distinct() {
+        assert_eq!(
+            parse_exact_teddy_policy_v2("disabled"),
+            Some(ExactTeddyPolicyV2Request::Disabled)
+        );
+        assert_eq!(
+            parse_exact_teddy_policy_v2("automatic"),
+            Some(ExactTeddyPolicyV2Request::Automatic)
+        );
+        assert_eq!(
+            parse_exact_teddy_policy_v2("force-structurally-eligible"),
+            Some(ExactTeddyPolicyV2Request::ForceStructurallyEligible)
+        );
+        assert_eq!(parse_exact_teddy_policy_v2("force"), None);
+        assert_eq!(parse_exact_teddy_policy_v2("Automatic"), None);
+        assert_eq!(parse_exact_teddy_policy_v2(""), None);
+        assert_eq!(
+            ExactTeddyPolicyV2Request::NotRequested.compiler_policy(),
+            None
+        );
+    }
+
+    #[test]
     fn initial_profile_classification_defers_host_detection() {
         let classification =
             classification_for_profile(TargetFeatureProfile::Sve2);
@@ -2451,6 +2931,11 @@ mod tests {
         assert_eq!(receipt["compiled_reverse_start_recovery"], false);
         assert_eq!(receipt["compiled_primary_native_route"], "ordered_dfa");
         assert_eq!(
+            receipt["exact_finite_selected_end_teddy_policy_v2_request"],
+            "not_requested"
+        );
+        assert_eq!(receipt["compile_receipt_v2"], serde_json::Value::Null);
+        assert_eq!(
             receipt["exact_finite_selected_end_teddy_aot"],
             serde_json::Value::Null
         );
@@ -2490,26 +2975,7 @@ mod tests {
         let target = Target::aarch64_linux()
             .with_features(FeatureSet::of(CpuFeature::Aarch64Asimd))
             .unwrap();
-        let mut pattern = String::from("(?-u:");
-        for (ordinal, byte) in [
-            0x00_u8, 0x12, 0x3f, 0x51, 0x7e, 0x8a, 0x92, 0xa4, 0x0c, 0x18,
-            0x1e, 0x58, 0x5e, 0x8f, 0x98, 0x9e, 0xaa,
-        ]
-        .into_iter()
-        .enumerate()
-        {
-            if ordinal != 0 {
-                pattern.push('|');
-            }
-            for _ in 0..6 {
-                use std::fmt::Write as _;
-                write!(&mut pattern, "\\x{byte:02x}").unwrap();
-            }
-            if ordinal == 16 {
-                pattern.push_str("\\xaa");
-            }
-        }
-        pattern.push(')');
+        let pattern = scanner_free_exact_teddy_pattern();
         let compiled = compile(
             CompileRequest::new(pattern, target)
                 .mode(CompileMode::Optimizing)
@@ -2613,6 +3079,237 @@ mod tests {
                 compiled.receipt(),
             ));
         }
+    }
+
+    #[test]
+    fn forced_teddy_v2_is_strictly_authenticated_and_kept_out_of_v1() {
+        use fre_aot_regex::{
+            CompileMode, CompileRequest, CompileRequestV2, CpuFeature,
+            ExactFiniteSelectedEndTeddyPolicyV2 as Policy,
+            ExactFiniteSelectedEndTeddySelectionBasisV2 as Basis, FeatureSet,
+            OutputContract, StartAccelerator, Target, compile_v2,
+        };
+
+        let target = Target::aarch64_linux()
+            .with_features(FeatureSet::of(CpuFeature::Aarch64Asimd))
+            .unwrap();
+        let request = || {
+            CompileRequest::new("samwise|samw|frodo|pippin", target)
+                .mode(CompileMode::Optimizing)
+                .output(OutputContract::SelectedEnd)
+        };
+        let forced = compile_v2(
+            CompileRequestV2::new(request()).exact_finite_selected_end_teddy(
+                Policy::ForceStructurallyEligible,
+            ),
+        )
+        .unwrap();
+        assert!(
+            forced.receipt().exact_finite_selected_end_teddy_aot.is_none()
+        );
+        assert!(
+            forced
+                .module()
+                .exact_finite_selected_end_teddy_aot_report()
+                .is_none()
+        );
+
+        let receipt_v2 =
+            copy_authenticated_exact_finite_selected_end_teddy_v2(
+                &forced,
+                Policy::ForceStructurallyEligible,
+            )
+            .unwrap();
+        let report = receipt_v2
+            .exact_finite_selected_end_teddy_aot
+            .expect("the structurally eligible fixture selects forced V2");
+        assert_eq!(report.requested_policy, Policy::ForceStructurallyEligible);
+        assert_eq!(report.selection_basis, Basis::ForcedStructuralEligibility);
+        assert!(report.performance_admission_bypassed);
+        assert!(report.tail_enters_exact_incumbent);
+        assert!(report.lowering.incumbent_complete_dfa.has_accelerator);
+        assert_ne!(report.incumbent_start_accelerator, StartAccelerator::None);
+        assert_eq!(
+            report.incumbent_start_accelerator,
+            report.lowering.incumbent_complete_dfa.scanner
+        );
+        assert_eq!(
+            selected_primary_native_route_with_v2(
+                forced.receipt(),
+                Some(&receipt_v2),
+            ),
+            "exact_finite_selected_end_teddy"
+        );
+        let (source, forward, reverse) = selected_machine_states_with_v2(
+            forced.receipt(),
+            Some(&receipt_v2),
+        );
+        assert_eq!(source, Some("exact_finite_selected_end_teddy_incumbent"));
+        assert_eq!(
+            forward,
+            Some(u64_len(
+                report.lowering.incumbent_complete_dfa.forward_states,
+            ))
+        );
+        assert_eq!(reverse, Some(0));
+
+        let json = compile_receipt_v2_json(&receipt_v2);
+        assert_eq!(json["schema_version"], 2);
+        assert_eq!(json["optimizer_version"], 25);
+        assert_eq!(
+            json["exact_finite_selected_end_teddy_policy"],
+            "force_structurally_eligible"
+        );
+        let report_json = &json["exact_finite_selected_end_teddy_aot_v2"];
+        assert_eq!(report_json["authenticated_compiler_report"], true);
+        assert_eq!(
+            report_json["requested_policy"],
+            "force_structurally_eligible"
+        );
+        assert_eq!(
+            report_json["selection_basis"],
+            "forced_structural_eligibility"
+        );
+        assert_eq!(
+            report_json["incumbent_source"],
+            "ordinary_public_complete_dfa"
+        );
+        assert_ne!(report_json["incumbent_start_accelerator"], "none");
+        assert_eq!(report_json["performance_admission_bypassed"], true);
+        assert_eq!(report_json["tail_enters_exact_incumbent"], true);
+        assert_eq!(
+            report_json["route_binding_sha256"].as_str().map(str::len),
+            Some(64)
+        );
+        assert_eq!(
+            report_json["lowering"]["incumbent"]["has_accelerator"],
+            true
+        );
+
+        let mut classification = classification_for_profile_and_policy(
+            TargetFeatureProfile::Asimd,
+            ExactTeddyPolicyV2Request::ForceStructurallyEligible,
+        );
+        classification.compile_receipt_v2 = Some(receipt_v2);
+        let state = CompileState::empty_with_receipt_options(
+            classification,
+            None,
+            false,
+            0,
+        );
+        let receipt_json = state.receipt_json();
+        assert_eq!(receipt_json["schema"], "ripgrep.fre-aot-background.v6");
+        assert_eq!(
+            receipt_json["exact_finite_selected_end_teddy_policy_v2_request"],
+            "force_structurally_eligible"
+        );
+        assert_eq!(
+            receipt_json["compile_receipt_v2"],
+            compile_receipt_v2_json(&receipt_v2)
+        );
+        assert_eq!(
+            receipt_json["exact_finite_selected_end_teddy_aot"],
+            serde_json::Value::Null
+        );
+
+        let mut changed = report;
+        changed.lowering.incumbent_complete_dfa.has_accelerator = false;
+        changed.lowering.incumbent_complete_dfa.scanner =
+            StartAccelerator::None;
+        changed.incumbent_start_accelerator = StartAccelerator::None;
+        assert!(!exact_teddy_report_v2_metadata_authenticates(
+            &changed,
+            Policy::ForceStructurallyEligible,
+            Basis::ForcedStructuralEligibility,
+        ));
+        assert!(!exact_teddy_report_authenticates(
+            forced.compiled(),
+            &changed.lowering,
+            Basis::ForcedStructuralEligibility,
+        ));
+
+        let stable = forced.into_compiled();
+        assert_eq!(
+            copy_authenticated_exact_finite_selected_end_teddy(&stable)
+                .unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn explicit_automatic_and_disabled_do_not_enable_forced_teddy_v2() {
+        use fre_aot_regex::{
+            CompileMode, CompileRequest, CompileRequestV2, CpuFeature,
+            ExactFiniteSelectedEndTeddyPolicyV2 as Policy, FeatureSet,
+            OutputContract, Target, compile_v2,
+        };
+
+        let target = Target::aarch64_linux()
+            .with_features(FeatureSet::of(CpuFeature::Aarch64Asimd))
+            .unwrap();
+        for policy in [Policy::Automatic, Policy::Disabled] {
+            let compiled = compile_v2(
+                CompileRequestV2::new(
+                    CompileRequest::new("samwise|samw|frodo|pippin", target)
+                        .mode(CompileMode::Optimizing)
+                        .output(OutputContract::SelectedEnd),
+                )
+                .exact_finite_selected_end_teddy(policy),
+            )
+            .unwrap();
+            let receipt_v2 =
+                copy_authenticated_exact_finite_selected_end_teddy_v2(
+                    &compiled, policy,
+                )
+                .unwrap();
+            assert_eq!(
+                receipt_v2.exact_finite_selected_end_teddy_policy,
+                policy
+            );
+            assert!(
+                receipt_v2.exact_finite_selected_end_teddy_aot.is_none(),
+                "{policy:?} must not enable the accelerated-incumbent route",
+            );
+            assert!(
+                compiled
+                    .receipt()
+                    .exact_finite_selected_end_teddy_aot
+                    .is_none()
+            );
+            assert_ne!(
+                selected_primary_native_route_with_v2(
+                    compiled.receipt(),
+                    Some(&receipt_v2),
+                ),
+                "exact_finite_selected_end_teddy"
+            );
+        }
+
+        let automatic = compile_v2(CompileRequestV2::new(
+            CompileRequest::new(scanner_free_exact_teddy_pattern(), target)
+                .mode(CompileMode::Optimizing)
+                .output(OutputContract::SelectedEnd),
+        ))
+        .unwrap();
+        let receipt_v2 =
+            copy_authenticated_exact_finite_selected_end_teddy_v2(
+                &automatic,
+                Policy::Automatic,
+            )
+            .unwrap();
+        let stable = automatic
+            .receipt()
+            .exact_finite_selected_end_teddy_aot
+            .expect("automatic fixture selects the stable V1 route");
+        let supplemental = receipt_v2
+            .exact_finite_selected_end_teddy_aot
+            .expect("automatic V2 supplements the stable V1 route");
+        assert_eq!(supplemental.lowering, stable);
+        assert_eq!(
+            supplemental.selection_basis,
+            fre_aot_regex::ExactFiniteSelectedEndTeddySelectionBasisV2::AutomaticV1
+        );
+        assert!(!supplemental.performance_admission_bypassed);
     }
 
     #[test]
