@@ -165,6 +165,7 @@ checksum = "5baebc0774151f905a1a2cc41989300b1e6fbb29aff0ceffa1064fdd3088d582"
 [[package]]
 name = "fre-aot-regex"
 version = "0.1.0"
+source = "git+https://github.com/danluu/fre.git?rev=6f961465d00ff50f2096cfb05520c0653a87d2cd#6f961465d00ff50f2096cfb05520c0653a87d2cd"
 dependencies = [
  "fre-automata",
  "fre-capture-lab",
@@ -178,8 +179,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "fre-aot-regex-loader"
+version = "0.1.0"
+source = "git+https://github.com/danluu/fre.git?rev=6f961465d00ff50f2096cfb05520c0653a87d2cd#6f961465d00ff50f2096cfb05520c0653a87d2cd"
+dependencies = [
+ "fre-aot-regex",
+ "fre-target-features",
+ "libc",
+]
+
+[[package]]
 name = "fre-aot-regex-runtime"
 version = "0.1.0"
+source = "git+https://github.com/danluu/fre.git?rev=6f961465d00ff50f2096cfb05520c0653a87d2cd#6f961465d00ff50f2096cfb05520c0653a87d2cd"
 dependencies = [
  "fre-aot-regex",
  "fre-capture-lab",
@@ -189,6 +201,7 @@ dependencies = [
 [[package]]
 name = "fre-automata"
 version = "0.1.0"
+source = "git+https://github.com/danluu/fre.git?rev=6f961465d00ff50f2096cfb05520c0653a87d2cd#6f961465d00ff50f2096cfb05520c0653a87d2cd"
 dependencies = [
  "fre-exact-alloc",
  "fre-simd-kernels",
@@ -199,6 +212,7 @@ dependencies = [
 [[package]]
 name = "fre-capture-lab"
 version = "0.1.0"
+source = "git+https://github.com/danluu/fre.git?rev=6f961465d00ff50f2096cfb05520c0653a87d2cd#6f961465d00ff50f2096cfb05520c0653a87d2cd"
 dependencies = [
  "fre-exact-alloc",
  "memchr",
@@ -209,10 +223,12 @@ dependencies = [
 [[package]]
 name = "fre-exact-alloc"
 version = "0.1.0"
+source = "git+https://github.com/danluu/fre.git?rev=6f961465d00ff50f2096cfb05520c0653a87d2cd#6f961465d00ff50f2096cfb05520c0653a87d2cd"
 
 [[package]]
 name = "fre-kernel-ir"
 version = "0.1.0"
+source = "git+https://github.com/danluu/fre.git?rev=6f961465d00ff50f2096cfb05520c0653a87d2cd#6f961465d00ff50f2096cfb05520c0653a87d2cd"
 dependencies = [
  "sha2",
 ]
@@ -220,6 +236,7 @@ dependencies = [
 [[package]]
 name = "fre-kernels"
 version = "0.1.0"
+source = "git+https://github.com/danluu/fre.git?rev=6f961465d00ff50f2096cfb05520c0653a87d2cd#6f961465d00ff50f2096cfb05520c0653a87d2cd"
 dependencies = [
  "aho-corasick",
  "fre-exact-alloc",
@@ -231,6 +248,7 @@ dependencies = [
 [[package]]
 name = "fre-lower"
 version = "0.1.0"
+source = "git+https://github.com/danluu/fre.git?rev=6f961465d00ff50f2096cfb05520c0653a87d2cd#6f961465d00ff50f2096cfb05520c0653a87d2cd"
 dependencies = [
  "fre-automata",
  "fre-syntax",
@@ -240,10 +258,12 @@ dependencies = [
 [[package]]
 name = "fre-re2-syntax"
 version = "0.1.0"
+source = "git+https://github.com/danluu/fre.git?rev=6f961465d00ff50f2096cfb05520c0653a87d2cd#6f961465d00ff50f2096cfb05520c0653a87d2cd"
 
 [[package]]
 name = "fre-ripgrep-aot-thin"
 version = "0.1.0"
+source = "git+https://github.com/danluu/fre.git?rev=6f961465d00ff50f2096cfb05520c0653a87d2cd#6f961465d00ff50f2096cfb05520c0653a87d2cd"
 dependencies = [
  "fre-aot-regex",
  "fre-aot-regex-runtime",
@@ -253,6 +273,7 @@ dependencies = [
 [[package]]
 name = "fre-simd-kernels"
 version = "0.1.0"
+source = "git+https://github.com/danluu/fre.git?rev=6f961465d00ff50f2096cfb05520c0653a87d2cd#6f961465d00ff50f2096cfb05520c0653a87d2cd"
 dependencies = [
  "fre-target-features",
 ]
@@ -260,6 +281,7 @@ dependencies = [
 [[package]]
 name = "fre-syntax"
 version = "0.1.0"
+source = "git+https://github.com/danluu/fre.git?rev=6f961465d00ff50f2096cfb05520c0653a87d2cd#6f961465d00ff50f2096cfb05520c0653a87d2cd"
 dependencies = [
  "fre-re2-syntax",
  "regex-syntax",
@@ -268,6 +290,7 @@ dependencies = [
 [[package]]
 name = "fre-target-features"
 version = "0.1.0"
+source = "git+https://github.com/danluu/fre.git?rev=6f961465d00ff50f2096cfb05520c0653a87d2cd#6f961465d00ff50f2096cfb05520c0653a87d2cd"
 dependencies = [
  "libc",
 ]
@@ -576,14 +599,13 @@ dependencies = [
  "anyhow",
  "bstr",
  "fre-aot-regex",
- "fre-aot-regex-runtime",
+ "fre-aot-regex-loader",
  "fre-ripgrep-aot-thin",
  "fre-syntax",
  "grep",
  "grep-index",
  "ignore",
  "lexopt",
- "libc",
  "log",
  "serde",
  "serde_derive",

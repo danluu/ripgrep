@@ -1894,12 +1894,15 @@ impl Flag for FreAotBackground {
         r"
 Start searching immediately with ripgrep's default regex engine while an
 eligible equivalent FRE optimizing-AOT matcher is compiled in a background
-thread. Once compilation and native loading finish, each search worker changes
-its group-zero matching route before its next file. That route remains fixed
-for the complete file; capture extraction continues to use ripgrep's default
-regex engine.
+thread. Once in-process native publication finishes, each search worker may
+change its group-zero matching route between complete matcher calls or after a
+fully searched, newline-terminated scan window. A large line-oriented file can
+therefore change routes during its scan without splitting a line. Capture
+extraction continues to use ripgrep's default regex engine. A single giant line
+and a regex with absolute haystack anchors remain indivisible while publication
+is pending.
 .sp
-Compilation or loading failure leaves the default regex engine in use. This
+Compilation or publication failure leaves the default regex engine in use. This
 experimental flag requires \fB\-\-engine=default\fP and is separate from
 \fB\-\-engine=fre\fP, which selects only the fixed build-time AOT registry.
 "

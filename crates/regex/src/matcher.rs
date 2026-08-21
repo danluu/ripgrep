@@ -434,6 +434,36 @@ impl RegexMatcher {
     pub fn new_line_matcher(pattern: &str) -> Result<RegexMatcher, Error> {
         RegexMatcherBuilder::new().line_terminator(Some(b'\n')).build(pattern)
     }
+
+    /// Find a confirmed or candidate matching line inside `start..end`.
+    ///
+    /// This is the bounded counterpart of [`Matcher::find_candidate_line`].
+    /// The full haystack remains available for look-around context, but a
+    /// non-zero span start can satisfy an absolute start anchor in the meta
+    /// matcher. Callers may therefore use adjacent windows only when they know
+    /// that a match cannot cross a window boundary and the matcher has no
+    /// haystack anchors. A configured line terminator provides both
+    /// guarantees: `ConfiguredHIR::line_terminator` is disabled for text
+    /// anchors.
+    #[inline]
+    pub fn find_candidate_line_in(
+        &self,
+        haystack: &[u8],
+        start: usize,
+        end: usize,
+    ) -> Option<LineMatchKind> {
+        assert!(start <= end && end <= haystack.len());
+        let input = Input::new(haystack).span(start..end);
+        match self.fast_line_regex {
+            Some(ref regex) => regex
+                .search_half(&input)
+                .map(|hm| LineMatchKind::Candidate(hm.offset())),
+            None => self
+                .regex
+                .search_half(&input)
+                .map(|hm| LineMatchKind::Confirmed(hm.offset())),
+        }
+    }
 }
 
 // This implementation just dispatches on the internal matcher impl except
@@ -525,17 +555,7 @@ impl Matcher for RegexMatcher {
         &self,
         haystack: &[u8],
     ) -> Result<Option<LineMatchKind>, NoError> {
-        Ok(match self.fast_line_regex {
-            Some(ref regex) => {
-                let input = Input::new(haystack);
-                regex
-                    .search_half(&input)
-                    .map(|hm| LineMatchKind::Candidate(hm.offset()))
-            }
-            None => {
-                self.shortest_match(haystack)?.map(LineMatchKind::Confirmed)
-            }
-        })
+        Ok(self.find_candidate_line_in(haystack, 0, haystack.len()))
     }
 }
 
@@ -630,6 +650,43 @@ mod tests {
             );
         }
         assert!(!rendered.is_match(b"abc\nxyz").unwrap());
+    }
+
+    #[test]
+    fn bounded_candidate_line_search_requires_line_safe_matcher() {
+        let absolute_start = RegexMatcherBuilder::new()
+            .line_terminator(Some(b'\n'))
+            .build(r"\Afoo")
+            .unwrap();
+        let haystack = b"bar\nfoo\n";
+        assert_eq!(absolute_start.line_terminator(), None);
+        assert!(
+            absolute_start
+                .find_candidate_line_in(haystack, 4, haystack.len())
+                .is_some(),
+            "bounded span start acts as a text start, so anchors disable windows"
+        );
+
+        let absolute_end = RegexMatcherBuilder::new()
+            .line_terminator(Some(b'\n'))
+            .build(r"foo\z")
+            .unwrap();
+        assert_eq!(absolute_end.line_terminator(), None);
+        assert!(
+            absolute_end.find_candidate_line_in(b"foo\nbar\n", 0, 3).is_none(),
+            "the full haystack remains visible to the absolute end anchor"
+        );
+
+        let ordinary = RegexMatcherBuilder::new()
+            .line_terminator(Some(b'\n'))
+            .build("foo")
+            .unwrap();
+        assert!(ordinary.find_candidate_line_in(haystack, 0, 4).is_none());
+        assert!(
+            ordinary
+                .find_candidate_line_in(haystack, 4, haystack.len())
+                .is_some()
+        );
     }
 
     // Ensure that the builder returns an error if a line terminator is set

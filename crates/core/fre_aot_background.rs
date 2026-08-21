@@ -1,10 +1,11 @@
-//! Background FRE optimizing-AOT compilation with file-boundary promotion.
+//! Background FRE optimizing-AOT compilation with mid-scan promotion.
 //!
 //! The stock matcher is constructed before this module starts any work. One
 //! compiler thread publishes an immutable direct-native entry through a
-//! `OnceLock`. Every ripgrep search worker keeps using its stock matcher until
-//! `SearchWorker` calls `begin_file`; at that boundary it may snapshot the
-//! published entry and then keeps the same engine for the complete file.
+//! `OnceLock`. While publication is pending, line-oriented scans advance in
+//! bounded windows ending at a line boundary. Each completed window is a safe
+//! promotion point: the next window may use FRE without changing which match
+//! wins or allowing a match to cross an artificial boundary.
 
 use std::{
     ffi::OsString,
@@ -19,6 +20,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+use bstr::ByteSlice;
 use grep::{
     matcher::{
         ByteSet, LineMatchKind, LineTerminator, Match, Matcher, NoError,
@@ -27,27 +29,18 @@ use grep::{
 };
 
 const RECEIPT_ENV: &str = "RG_FRE_AOT_BACKGROUND_RECEIPT";
-const RECEIPT_SCHEMA: &str = "ripgrep.fre-aot-background.v1";
+const TEST_MIN_STOCK_BYTES_ENV: &str =
+    "RG_FRE_AOT_BACKGROUND_TEST_MIN_STOCK_BYTES";
+const RECEIPT_SCHEMA: &str = "ripgrep.fre-aot-background.v2";
+const PENDING_SCAN_QUANTUM: usize = 1 << 20;
 static RECEIPT_NONCE: AtomicU64 = AtomicU64::new(0);
 
-type AbiResult = fre_aot_regex_runtime::FreAotRegexResultV1;
-
-type NativeSearch = unsafe extern "C" fn(
-    *const u8,
-    usize,
-    usize,
-    usize,
-    *mut AbiResult,
-) -> u32;
-
-/// A loaded, reentrant direct-native Span entry. The optional dynamic-library
-/// owner keeps `search` and all of its read-only data mapped until the last
-/// worker and the publication state release the factory.
+/// A published, reentrant direct-native Span entry. `PublishedSpan` owns the
+/// strict-W^X mapping until the last worker and publication-state reference is
+/// released.
 struct NativeAotFactory {
-    search: NativeSearch,
+    published: fre_aot_regex_loader::PublishedSpan,
     description: String,
-    #[cfg(target_os = "macos")]
-    _library: Option<DynamicLibrary>,
 }
 
 impl std::fmt::Debug for NativeAotFactory {
@@ -70,51 +63,26 @@ impl NativeAotMatcher {
         haystack: &[u8],
         at: usize,
     ) -> Result<Option<Match>, String> {
-        if at > haystack.len() {
-            return Err(format!(
-                "FRE AOT search start {at} exceeds haystack length {}",
-                haystack.len()
-            ));
-        }
-        let mut result = std::mem::MaybeUninit::<AbiResult>::uninit();
-        // SAFETY: the factory owns the loaded bundle containing this exact C
-        // ABI entry. `haystack` is readable for its declared length, the
-        // window is checked and contained, and the result slot is aligned,
-        // writable and disjoint. The compiler contract initializes it only
-        // when status 1 is returned and retains no argument.
-        let status = unsafe {
-            (self.factory.search)(
-                haystack.as_ptr(),
-                haystack.len(),
-                at,
-                haystack.len(),
-                result.as_mut_ptr(),
-            )
-        };
-        match status {
-            0 => Ok(None),
-            1 => {
-                // SAFETY: status 1 is the compiler-produced Span ABI's
-                // initialized-result status.
-                let result = unsafe { result.assume_init() };
-                if at <= result.start
-                    && result.start <= result.end
-                    && result.end <= haystack.len()
-                {
-                    Ok(Some(Match::new(result.start, result.end)))
-                } else {
-                    Err(format!(
-                        "FRE AOT returned invalid span {}..{} for window {at}..{}",
-                        result.start,
-                        result.end,
-                        haystack.len()
-                    ))
-                }
-            }
-            other => Err(format!(
-                "FRE AOT native Span entry failed with status {other}"
-            )),
-        }
+        self.factory
+            .published
+            .find_at(haystack, at)
+            .map(|found| found.map(|m| Match::new(m.start(), m.end())))
+            .map_err(|error| format!("FRE AOT native Span call: {error}"))
+    }
+
+    fn find_in(
+        &self,
+        haystack: &[u8],
+        start: usize,
+        end: usize,
+    ) -> Result<Option<Match>, String> {
+        use fre_aot_regex::SearchWindow;
+
+        self.factory
+            .published
+            .search(haystack, SearchWindow::new(start, end))
+            .map(|found| found.map(|m| Match::new(m.start(), m.end())))
+            .map_err(|error| format!("FRE AOT native Span call: {error}"))
     }
 
     fn try_find_iter<F, E>(
@@ -158,6 +126,7 @@ type CompileOutcome = Result<Arc<NativeAotFactory>, String>;
 struct Cutover {
     file_ordinal: u64,
     elapsed_ns: u64,
+    stock_committed_bytes_before_cutover: u64,
 }
 
 /// Shared publication, lifecycle and optional benchmark receipt state.
@@ -166,14 +135,26 @@ struct CompileState {
     outcome: OnceLock<CompileOutcome>,
     join: Mutex<Option<JoinHandle<()>>>,
     cancelled: Arc<AtomicBool>,
-    filesystem_phase: Arc<AtomicBool>,
     compile_ns: Arc<AtomicU64>,
+    publish_ns: Arc<AtomicU64>,
     prepare_ns: Arc<AtomicU64>,
     ready_ns: AtomicU64,
     stock_files: AtomicU64,
     aot_files: AtomicU64,
+    mixed_files: AtomicU64,
     total_files: AtomicU64,
+    stock_windows: AtomicU64,
+    aot_windows: AtomicU64,
+    stock_window_bytes: AtomicU64,
+    stock_committed_bytes: AtomicU64,
+    aot_window_bytes: AtomicU64,
+    native_disabled: AtomicBool,
+    native_call_failures: AtomicU64,
     first_cutover: Mutex<Option<Cutover>>,
+    test_min_stock_bytes: u64,
+    #[cfg(test)]
+    test_publish_after_stock_commit:
+        Mutex<Option<(u64, Arc<NativeAotFactory>)>>,
     receipt_path: Option<PathBuf>,
 }
 
@@ -194,14 +175,28 @@ impl CompileState {
             outcome: OnceLock::new(),
             join: Mutex::new(None),
             cancelled: Arc::new(AtomicBool::new(false)),
-            filesystem_phase: Arc::new(AtomicBool::new(false)),
             compile_ns: Arc::new(AtomicU64::new(0)),
+            publish_ns: Arc::new(AtomicU64::new(0)),
             prepare_ns: Arc::new(AtomicU64::new(0)),
             ready_ns: AtomicU64::new(0),
             stock_files: AtomicU64::new(0),
             aot_files: AtomicU64::new(0),
+            mixed_files: AtomicU64::new(0),
             total_files: AtomicU64::new(0),
+            stock_windows: AtomicU64::new(0),
+            aot_windows: AtomicU64::new(0),
+            stock_window_bytes: AtomicU64::new(0),
+            stock_committed_bytes: AtomicU64::new(0),
+            aot_window_bytes: AtomicU64::new(0),
+            native_disabled: AtomicBool::new(false),
+            native_call_failures: AtomicU64::new(0),
             first_cutover: Mutex::new(None),
+            test_min_stock_bytes: std::env::var(TEST_MIN_STOCK_BYTES_ENV)
+                .ok()
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(0),
+            #[cfg(test)]
+            test_publish_after_stock_commit: Mutex::new(None),
             receipt_path: std::env::var_os(RECEIPT_ENV).map(PathBuf::from),
         })
     }
@@ -224,8 +219,8 @@ impl CompileState {
         let state = Self::empty();
         let weak = Arc::downgrade(&state);
         let cancelled = Arc::clone(&state.cancelled);
-        let filesystem_phase = Arc::clone(&state.filesystem_phase);
         let compile_ns = Arc::clone(&state.compile_ns);
+        let publish_ns = Arc::clone(&state.publish_ns);
         let prepare_ns = Arc::clone(&state.prepare_ns);
         log::debug!("FRE AOT background compilation started");
         let spawn = std::thread::Builder::new()
@@ -237,13 +232,37 @@ impl CompileState {
                     regex_size_limit,
                     dfa_size_limit,
                     &cancelled,
-                    &filesystem_phase,
                     &compile_ns,
+                    &publish_ns,
                 );
                 let elapsed_prepare_ns = duration_ns(prepare_started.elapsed());
                 prepare_ns.store(elapsed_prepare_ns, Ordering::Release);
                 if cancelled.load(Ordering::SeqCst) {
                     return;
+                }
+                // This private experiment hook makes same-file promotion
+                // deterministic in correctness tests. It is deliberately
+                // outside `prepare_ns`, and benchmark runners must reject it.
+                // Poll only transient strong references so an early search
+                // can still drop the state and detach this pure-memory task.
+                if outcome.is_ok() {
+                    loop {
+                        let Some(snapshot) = Weak::upgrade(&weak) else {
+                            return;
+                        };
+                        let threshold = snapshot.test_min_stock_bytes;
+                        let committed = snapshot
+                            .stock_committed_bytes
+                            .load(Ordering::Acquire);
+                        drop(snapshot);
+                        if threshold == 0 || committed >= threshold {
+                            break;
+                        }
+                        if cancelled.load(Ordering::SeqCst) {
+                            return;
+                        }
+                        std::thread::yield_now();
+                    }
                 }
                 let Some(state) = Weak::upgrade(&weak) else { return };
                 let ready_ns = duration_ns(state.started.elapsed());
@@ -283,19 +302,21 @@ impl CompileState {
         self.total_files.fetch_add(1, Ordering::Relaxed) + 1
     }
 
-    fn record_stock_file(&self) {
-        self.stock_files.fetch_add(1, Ordering::Relaxed);
-    }
-
-    fn record_aot_file(&self, file_ordinal: u64) {
-        self.aot_files.fetch_add(1, Ordering::Relaxed);
+    fn record_first_cutover(
+        &self,
+        file_ordinal: u64,
+        stock_committed_bytes_before_cutover: u64,
+    ) {
         let candidate = Cutover {
             file_ordinal,
             elapsed_ns: duration_ns(self.started.elapsed()),
+            stock_committed_bytes_before_cutover,
         };
         let mut first = self.first_cutover.lock().unwrap();
         if first.is_none_or(|current| {
-            candidate.file_ordinal < current.file_ordinal
+            candidate.elapsed_ns < current.elapsed_ns
+                || (candidate.elapsed_ns == current.elapsed_ns
+                    && candidate.file_ordinal < current.file_ordinal)
         }) {
             *first = Some(candidate);
         }
@@ -320,17 +341,29 @@ impl CompileState {
             "schema": RECEIPT_SCHEMA,
             "outcome": outcome,
             "decline_reason": decline_reason,
-            // `compile_ns` is only FRE's compile(request). `prepare_ns` is the
-            // full transaction through object emission, linking and loading.
+            // `compile_ns` is FRE's compile(request), which still emits the
+            // deterministic object. `publish_ns` is direct in-process
+            // relocation/mapping/protection. `prepare_ns` covers both.
             "compile_ns": self.compile_ns.load(Ordering::Acquire),
+            "publish_ns": self.publish_ns.load(Ordering::Acquire),
             "prepare_ns": self.prepare_ns.load(Ordering::Acquire),
             "ready_ns_since_start": ready_ns,
             "stock_files": self.stock_files.load(Ordering::Relaxed),
             "fre_aot_files": self.aot_files.load(Ordering::Relaxed),
+            "mixed_engine_files": self.mixed_files.load(Ordering::Relaxed),
             "total_file_attempts": self.total_files.load(Ordering::Relaxed),
+            "stock_windows": self.stock_windows.load(Ordering::Relaxed),
+            "fre_aot_windows": self.aot_windows.load(Ordering::Relaxed),
+            "stock_window_bytes": self.stock_window_bytes.load(Ordering::Relaxed),
+            "stock_committed_bytes": self.stock_committed_bytes.load(Ordering::Acquire),
+            "fre_aot_window_bytes": self.aot_window_bytes.load(Ordering::Relaxed),
+            "native_call_failures": self.native_call_failures.load(Ordering::Relaxed),
             "first_cutover_file_ordinal": first.map(|value| value.file_ordinal),
             "first_cutover_ns_since_start": first.map(|value| value.elapsed_ns),
+            "first_cutover_stock_committed_bytes": first.map(|value| value.stock_committed_bytes_before_cutover),
+            "external_linker_invocations": 0,
             "direct_native_only": true,
+            "test_min_stock_bytes": self.test_min_stock_bytes,
         });
         let mut bytes = serde_json::to_vec(&receipt)
             .map_err(|error| format!("serialize FRE AOT receipt: {error}"))?;
@@ -344,16 +377,12 @@ impl Drop for CompileState {
         self.cancelled.store(true, Ordering::SeqCst);
         let join = self.join.get_mut().unwrap().take();
         if let Some(join) = join {
-            // Compilation has explicit work/resource limits but no cooperative
-            // interrupt inside its longest transaction. Core compilation can
-            // be detached safely: cancellation is checked before any file is
-            // created. Once object/link/load work starts, wait for the short
-            // resource-owning phase so an early process exit cannot strand a
-            // temporary object or bundle. The phase protocol rechecks
-            // cancellation after publication to close the hand-off race.
-            if join.is_finished()
-                || self.filesystem_phase.load(Ordering::SeqCst)
-            {
+            // The compiler owns all of its inputs and direct publication uses
+            // only anonymous process memory. An early search may therefore
+            // detach safely instead of waiting for background work; unlike
+            // the old external-linker path, there is no child or temporary
+            // artifact to reap.
+            if join.is_finished() {
                 let _ = join.join();
             }
         }
@@ -363,12 +392,16 @@ impl Drop for CompileState {
     }
 }
 
-/// Stock-first matcher whose active engine changes only through `begin_file`.
+/// Stock-first matcher that may promote between completed line-aligned scan
+/// windows. Captures and metadata always remain owned by `stock`.
 pub(crate) struct BackgroundFreMatcher {
     stock: RegexMatcher,
     shared: Arc<CompileState>,
-    active: Option<NativeAotMatcher>,
-    terminal_decline: bool,
+    current_file_ordinal: AtomicU64,
+    file_saw_stock: AtomicBool,
+    file_saw_aot: AtomicBool,
+    file_mixed_recorded: AtomicBool,
+    file_stock_committed_bytes: AtomicU64,
 }
 
 impl BackgroundFreMatcher {
@@ -385,8 +418,11 @@ impl BackgroundFreMatcher {
                 regex_size_limit,
                 dfa_size_limit,
             ),
-            active: None,
-            terminal_decline: false,
+            current_file_ordinal: AtomicU64::new(0),
+            file_saw_stock: AtomicBool::new(false),
+            file_saw_aot: AtomicBool::new(false),
+            file_mixed_recorded: AtomicBool::new(false),
+            file_stock_committed_bytes: AtomicU64::new(0),
         }
     }
 
@@ -397,36 +433,141 @@ impl BackgroundFreMatcher {
         Self {
             stock,
             shared: CompileState::declined(reason),
-            active: None,
-            terminal_decline: true,
+            current_file_ordinal: AtomicU64::new(0),
+            file_saw_stock: AtomicBool::new(false),
+            file_saw_aot: AtomicBool::new(false),
+            file_mixed_recorded: AtomicBool::new(false),
+            file_stock_committed_bytes: AtomicU64::new(0),
         }
     }
 
-    /// Snapshot publication and account for the route of the next complete
-    /// file. This is the only method that changes `active`.
+    /// Start accounting for a new file. Engine selection remains live and is
+    /// polled at safe scan-window boundaries inside the matcher.
     pub(crate) fn begin_file(&mut self) {
         let file_ordinal = self.shared.next_file_ordinal();
-        if self.active.is_none() && !self.terminal_decline {
-            match self.shared.outcome.get() {
-                Some(Ok(factory)) => {
-                    self.active = Some(NativeAotMatcher {
-                        factory: Arc::clone(factory),
-                    });
+        self.current_file_ordinal.store(file_ordinal, Ordering::Relaxed);
+        self.file_saw_stock.store(false, Ordering::Relaxed);
+        self.file_saw_aot.store(false, Ordering::Relaxed);
+        self.file_mixed_recorded.store(false, Ordering::Relaxed);
+        self.file_stock_committed_bytes.store(0, Ordering::Relaxed);
+    }
+
+    fn native(&self) -> Option<NativeAotMatcher> {
+        if self.shared.native_disabled.load(Ordering::Acquire) {
+            return None;
+        }
+        match self.shared.outcome.get() {
+            Some(Ok(factory)) => {
+                Some(NativeAotMatcher { factory: Arc::clone(factory) })
+            }
+            Some(Err(_)) | None => None,
+        }
+    }
+
+    fn publication_pending(&self) -> bool {
+        self.shared.outcome.get().is_none()
+    }
+
+    fn disable_native(&self, error: &str) {
+        self.shared.native_call_failures.fetch_add(1, Ordering::Relaxed);
+        self.shared.native_disabled.store(true, Ordering::Release);
+        log::debug!(
+            "FRE AOT background native call failed; reverting to stock: \
+             {error}"
+        );
+    }
+
+    fn record_stock_window(&self, bytes: usize) {
+        self.shared.stock_windows.fetch_add(1, Ordering::Relaxed);
+        self.shared
+            .stock_window_bytes
+            .fetch_add(u64_len(bytes), Ordering::Relaxed);
+        if !self.file_saw_stock.swap(true, Ordering::Relaxed) {
+            self.shared.stock_files.fetch_add(1, Ordering::Relaxed);
+        }
+        self.record_mixed_if_needed();
+    }
+
+    fn record_aot_window(&self, bytes: usize) {
+        self.shared.aot_windows.fetch_add(1, Ordering::Relaxed);
+        self.shared
+            .aot_window_bytes
+            .fetch_add(u64_len(bytes), Ordering::Relaxed);
+        if !self.file_saw_aot.swap(true, Ordering::Relaxed) {
+            self.shared.aot_files.fetch_add(1, Ordering::Relaxed);
+            if self.file_saw_stock.load(Ordering::Relaxed) {
+                let ordinal =
+                    self.current_file_ordinal.load(Ordering::Relaxed);
+                let stock_bytes =
+                    self.file_stock_committed_bytes.load(Ordering::Acquire);
+                self.shared.record_first_cutover(ordinal, stock_bytes);
+                if let Some(Ok(factory)) = self.shared.outcome.get() {
                     log::debug!(
-                        "FRE AOT background cutover at file ordinal \
-                         {file_ordinal}: {}",
+                        "FRE AOT background mid-scan cutover in file ordinal \
+                         {ordinal} after {stock_bytes} committed stock bytes: {}",
                         factory.description
                     );
                 }
-                Some(Err(_)) => self.terminal_decline = true,
-                None => {}
             }
         }
-        if self.active.is_some() {
-            self.shared.record_aot_file(file_ordinal);
-        } else {
-            self.shared.record_stock_file();
+        self.record_mixed_if_needed();
+    }
+
+    fn record_stock_commit(&self, bytes: usize) {
+        let bytes = u64_len(bytes);
+        self.file_stock_committed_bytes.fetch_add(bytes, Ordering::Release);
+        let previous = self
+            .shared
+            .stock_committed_bytes
+            .fetch_add(bytes, Ordering::Release);
+        #[cfg(test)]
+        {
+            let committed = previous.saturating_add(bytes);
+            let factory = {
+                let mut hook = self
+                    .shared
+                    .test_publish_after_stock_commit
+                    .lock()
+                    .unwrap();
+                match hook.as_ref() {
+                    Some((threshold, _)) if committed >= *threshold => {
+                        hook.take().map(|(_, factory)| factory)
+                    }
+                    _ => None,
+                }
+            };
+            if let Some(factory) = factory {
+                self.shared.outcome.set(Ok(factory)).unwrap();
+            }
         }
+        #[cfg(not(test))]
+        let _ = previous;
+    }
+
+    fn record_mixed_if_needed(&self) {
+        if self.file_saw_stock.load(Ordering::Relaxed)
+            && self.file_saw_aot.load(Ordering::Relaxed)
+            && !self.file_mixed_recorded.swap(true, Ordering::Relaxed)
+        {
+            self.shared.mixed_files.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    fn pending_window_end(&self, haystack: &[u8], start: usize) -> usize {
+        let target =
+            start.saturating_add(PENDING_SCAN_QUANTUM).min(haystack.len());
+        if target == haystack.len() {
+            return target;
+        }
+        let Some(terminator) = self.stock.line_terminator() else {
+            // Without a configured line terminator there is no generally
+            // sound boundary at which to commit a partial negative scan.
+            return haystack.len();
+        };
+        let terminator = terminator.as_byte();
+        haystack[target..]
+            .find_byte(terminator)
+            .map_or(haystack.len(), |relative| target + relative + 1)
     }
 
     fn stock_result<T>(result: Result<T, NoError>) -> T {
@@ -442,8 +583,11 @@ impl Clone for BackgroundFreMatcher {
         Self {
             stock: self.stock.clone(),
             shared: Arc::clone(&self.shared),
-            active: self.active.clone(),
-            terminal_decline: self.terminal_decline,
+            current_file_ordinal: AtomicU64::new(0),
+            file_saw_stock: AtomicBool::new(false),
+            file_saw_aot: AtomicBool::new(false),
+            file_mixed_recorded: AtomicBool::new(false),
+            file_stock_committed_bytes: AtomicU64::new(0),
         }
     }
 }
@@ -452,8 +596,11 @@ impl std::fmt::Debug for BackgroundFreMatcher {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("BackgroundFreMatcher")
             .field("shared", &self.shared)
-            .field("active", &self.active.is_some())
-            .field("terminal_decline", &self.terminal_decline)
+            .field("native_ready", &self.native().is_some())
+            .field(
+                "current_file_ordinal",
+                &self.current_file_ordinal.load(Ordering::Relaxed),
+            )
             .finish_non_exhaustive()
     }
 }
@@ -468,10 +615,17 @@ impl Matcher for BackgroundFreMatcher {
         haystack: &[u8],
         at: usize,
     ) -> Result<Option<Match>, String> {
-        match &self.active {
-            Some(native) => native.find_at(haystack, at),
-            None => Ok(Self::stock_result(self.stock.find_at(haystack, at))),
+        if let Some(native) = self.native() {
+            match native.find_at(haystack, at) {
+                Ok(found) => {
+                    self.record_aot_window(haystack.len().saturating_sub(at));
+                    return Ok(found);
+                }
+                Err(error) => self.disable_native(&error),
+            }
         }
+        self.record_stock_window(haystack.len().saturating_sub(at));
+        Ok(Self::stock_result(self.stock.find_at(haystack, at)))
     }
 
     #[inline]
@@ -508,12 +662,23 @@ impl Matcher for BackgroundFreMatcher {
     where
         F: FnMut(Match) -> Result<bool, E>,
     {
-        match &self.active {
-            Some(native) => native.try_find_iter(haystack, matched),
-            None => Ok(Self::stock_result(
-                self.stock.try_find_iter(haystack, matched),
-            )),
+        if let Some(native) = self.native() {
+            return match native.try_find_iter(haystack, matched) {
+                Ok(result) => {
+                    self.record_aot_window(haystack.len());
+                    Ok(result)
+                }
+                Err(error) => {
+                    // The callback may already have observed matches, so this
+                    // iterator cannot be replayed safely with stock. Disable
+                    // native publication for later calls and fail this one.
+                    self.disable_native(&error);
+                    Err(error)
+                }
+            };
         }
+        self.record_stock_window(haystack.len());
+        Ok(Self::stock_result(self.stock.try_find_iter(haystack, matched)))
     }
 
     #[inline]
@@ -522,14 +687,17 @@ impl Matcher for BackgroundFreMatcher {
         haystack: &[u8],
         at: usize,
     ) -> Result<Option<usize>, String> {
-        match &self.active {
-            Some(native) => {
-                Ok(native.find_at(haystack, at)?.map(|found| found.end()))
+        if let Some(native) = self.native() {
+            match native.find_at(haystack, at) {
+                Ok(found) => {
+                    self.record_aot_window(haystack.len().saturating_sub(at));
+                    return Ok(found.map(|found| found.end()));
+                }
+                Err(error) => self.disable_native(&error),
             }
-            None => Ok(Self::stock_result(
-                self.stock.shortest_match_at(haystack, at),
-            )),
         }
+        self.record_stock_window(haystack.len().saturating_sub(at));
+        Ok(Self::stock_result(self.stock.shortest_match_at(haystack, at)))
     }
 
     #[inline]
@@ -537,19 +705,59 @@ impl Matcher for BackgroundFreMatcher {
         &self,
         haystack: &[u8],
     ) -> Result<Option<LineMatchKind>, String> {
-        match &self.active {
-            // Once a file has cut over, use FRE for line discovery too. Its
-            // returned endpoint is inside the known matching line, so it is a
-            // confirmed line match under the Matcher contract.
-            Some(native) => Ok(native
-                .find_at(haystack, 0)?
-                .map(|found| LineMatchKind::Confirmed(found.end()))),
-            // Preserve RegexMatcher's fast-line candidate accelerator exactly
-            // during the stock phase.
-            None => Ok(Self::stock_result(
-                self.stock.find_candidate_line(haystack),
-            )),
+        if haystack.is_empty() {
+            if let Some(native) = self.native() {
+                match native.find_in(haystack, 0, 0) {
+                    Ok(found) => {
+                        self.record_aot_window(0);
+                        return Ok(found.map(|found| {
+                            LineMatchKind::Confirmed(found.end())
+                        }));
+                    }
+                    Err(error) => self.disable_native(&error),
+                }
+            }
+            self.record_stock_window(0);
+            return Ok(self.stock.find_candidate_line_in(haystack, 0, 0));
         }
+        let mut start = 0;
+        while start < haystack.len() {
+            if let Some(native) = self.native() {
+                match native.find_in(haystack, start, haystack.len()) {
+                    Ok(found) => {
+                        self.record_aot_window(haystack.len() - start);
+                        return Ok(found.map(|found| {
+                            LineMatchKind::Confirmed(found.end())
+                        }));
+                    }
+                    Err(error) => self.disable_native(&error),
+                }
+            }
+
+            // While compilation is live, commit at most one bounded prefix
+            // with stock. The end is advanced through a complete line, so a
+            // regex that cannot consume the configured line terminator cannot
+            // cross the artificial boundary. Text-anchored configured HIRs
+            // expose no line terminator, so `pending_window_end` keeps those
+            // searches indivisible instead of changing anchor semantics.
+            let end = if self.publication_pending() {
+                self.pending_window_end(haystack, start)
+            } else {
+                haystack.len()
+            };
+            self.record_stock_window(end - start);
+            if let Some(found) =
+                self.stock.find_candidate_line_in(haystack, start, end)
+            {
+                return Ok(Some(found));
+            }
+            self.record_stock_commit(end - start);
+            if end == haystack.len() {
+                return Ok(None);
+            }
+            start = end;
+        }
+        Ok(None)
     }
 
     #[inline]
@@ -565,6 +773,10 @@ impl Matcher for BackgroundFreMatcher {
 
 fn duration_ns(duration: Duration) -> u64 {
     u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX)
+}
+
+fn u64_len(bytes: usize) -> u64 {
+    u64::try_from(bytes).unwrap_or(u64::MAX)
 }
 
 /// Publish a complete receipt without ever exposing a partially written
@@ -647,35 +859,22 @@ impl Drop for TemporaryReceipt {
     }
 }
 
-#[cfg(target_os = "macos")]
 fn compile_native_factory(
     pattern: String,
     regex_size_limit: Option<usize>,
     dfa_size_limit: Option<usize>,
     cancelled: &AtomicBool,
-    filesystem_phase: &AtomicBool,
     compile_ns: &AtomicU64,
+    publish_ns: &AtomicU64,
 ) -> CompileOutcome {
     use fre_aot_regex::{
-        CompileMode, CompileRequest, CpuFeature, FeatureSet, OutputContract,
-        Target, compile,
+        CompileMode, CompileRequest, OutputContract, compile,
     };
+    use fre_aot_regex_loader::{PublicationLimits, host_target, publish_span};
 
-    let target = if cfg!(target_arch = "aarch64") {
-        Target::aarch64_macos()
-            .with_features(FeatureSet::of(CpuFeature::Aarch64Asimd))
-            .map_err(|error| {
-                format!("construct AArch64 AOT target: {error}")
-            })?
-    } else if cfg!(target_arch = "x86_64") {
-        Target::x86_64_macos()
-            .with_features(FeatureSet::of(CpuFeature::X86Sse2))
-            .map_err(|error| format!("construct x86-64 AOT target: {error}"))?
-    } else {
-        return Err(
-            "FRE AOT background supports macOS AArch64/x86-64 only".to_owned()
-        );
-    };
+    let target = host_target().map_err(|error| {
+        format!("detect FRE AOT publication target: {error}")
+    })?;
     let mut profile = fre_syntax::RustProfile::default();
     profile.options.line_terminator = b'\n';
     // The configured-HIR rendering carries its exact Look/flag semantics
@@ -700,24 +899,10 @@ fn compile_native_factory(
     if cancelled.load(Ordering::SeqCst) {
         return Err("FRE AOT compilation cancelled after compile".to_owned());
     }
-    let required =
-        compiled.module().required_runtime_symbols().collect::<Vec<_>>();
-    if !required.is_empty() {
-        return Err(format!(
-            "compiled artifact is not direct-native (runtime symbols: {})",
-            required.join(",")
-        ));
-    }
-    let filesystem_guard = FilesystemPhase::begin(filesystem_phase);
-    if cancelled.load(Ordering::SeqCst) {
-        return Err(
-            "FRE AOT compilation cancelled before object emission".to_owned()
-        );
-    }
-    let entry_symbol = compiled.module().entry_symbol().to_owned();
     let receipt = compiled.receipt();
     let description = format!(
-        "mode=optimizing,route=direct-native,engine={:?},reason={:?},\
+        "mode=optimizing,publication=in-process,route=direct-native,\
+         engine={:?},reason={:?},\
          accelerator={:?},target={:?},features={:#x},states={},dfa_states={}",
         receipt.engine,
         receipt.engine_selection_reason,
@@ -730,230 +915,18 @@ fn compile_native_factory(
             |stats| { stats.forward_states.to_string() }
         ),
     );
-    let temporary = TemporaryBundleDirectory::new()?;
-    let object_path = temporary.path.join("matcher.o");
-    let bundle_path = temporary.path.join("matcher.bundle");
-    {
-        let mut object = OpenOptions::new()
-            .create_new(true)
-            .write(true)
-            .open(&object_path)
-            .map_err(|error| format!("create AOT object: {error}"))?;
-        object
-            .write_all(compiled.object())
-            .map_err(|error| format!("write AOT object: {error}"))?;
-    }
+    let publish_started = Instant::now();
+    let published = publish_span(compiled, PublicationLimits::default());
+    publish_ns
+        .store(duration_ns(publish_started.elapsed()), Ordering::Release);
+    let published = published
+        .map_err(|error| format!("publish FRE AOT in process: {error}"))?;
     if cancelled.load(Ordering::SeqCst) {
-        return Err("FRE AOT compilation cancelled before link".to_owned());
+        return Err(
+            "FRE AOT compilation cancelled after publication".to_owned()
+        );
     }
-    // Let the platform compiler driver supply the active SDK, platform
-    // version and libSystem. Calling ld directly without those facts creates
-    // an unloadable bundle on current macOS. This discovery/link step remains
-    // inside the measured background compilation transaction.
-    let linked = std::process::Command::new("/usr/bin/clang")
-        .arg("-bundle")
-        .arg(&object_path)
-        .arg("-o")
-        .arg(&bundle_path)
-        .output()
-        .map_err(|error| {
-            format!("run /usr/bin/clang for AOT bundle: {error}")
-        })?;
-    if !linked.status.success() {
-        return Err(format!(
-            "link FRE AOT bundle: status={} stderr={}",
-            linked.status,
-            String::from_utf8_lossy(&linked.stderr).trim()
-        ));
-    }
-    if cancelled.load(Ordering::SeqCst) {
-        return Err("FRE AOT compilation cancelled before load".to_owned());
-    }
-    let library = DynamicLibrary::open(&bundle_path)?;
-    let symbol = library.symbol(&entry_symbol)?;
-    // SAFETY: `dlsym` returned the named compiler-produced C Span entry from
-    // `library`. The compiler and this adapter share the exact five-argument
-    // ABI, and the library is retained beside the function pointer.
-    let search = unsafe {
-        std::mem::transmute::<*mut libc::c_void, NativeSearch>(symbol)
-    };
-    let factory = Arc::new(NativeAotFactory {
-        search,
-        description,
-        _library: Some(library),
-    });
-    // The mapped bundle remains live through `_library`; its pathname and the
-    // now-unused object can be removed before publication.
-    drop(temporary);
-    drop(filesystem_guard);
-    Ok(factory)
-}
-
-#[cfg(not(target_os = "macos"))]
-fn compile_native_factory(
-    _pattern: String,
-    _regex_size_limit: Option<usize>,
-    _dfa_size_limit: Option<usize>,
-    _cancelled: &AtomicBool,
-    _filesystem_phase: &AtomicBool,
-    _compile_ns: &AtomicU64,
-) -> CompileOutcome {
-    Err("FRE AOT background native loading is currently macOS-only".to_owned())
-}
-
-#[cfg(target_os = "macos")]
-struct FilesystemPhase<'a>(&'a AtomicBool);
-
-#[cfg(target_os = "macos")]
-impl<'a> FilesystemPhase<'a> {
-    fn begin(active: &'a AtomicBool) -> Self {
-        active.store(true, Ordering::SeqCst);
-        Self(active)
-    }
-}
-
-#[cfg(target_os = "macos")]
-impl Drop for FilesystemPhase<'_> {
-    fn drop(&mut self) {
-        self.0.store(false, Ordering::SeqCst);
-    }
-}
-
-#[cfg(target_os = "macos")]
-static TEMPORARY_NONCE: AtomicU64 = AtomicU64::new(0);
-
-#[cfg(target_os = "macos")]
-struct TemporaryBundleDirectory {
-    path: PathBuf,
-}
-
-#[cfg(target_os = "macos")]
-impl TemporaryBundleDirectory {
-    fn new() -> Result<Self, String> {
-        use std::os::unix::fs::DirBuilderExt as _;
-
-        let root = std::env::temp_dir();
-        for _ in 0..128 {
-            let nonce = TEMPORARY_NONCE.fetch_add(1, Ordering::Relaxed);
-            let path = root
-                .join(format!("rg-fre-aot-{}-{nonce}", std::process::id()));
-            let mut builder = std::fs::DirBuilder::new();
-            builder.mode(0o700);
-            match builder.create(&path) {
-                Ok(()) => return Ok(Self { path }),
-                Err(error)
-                    if error.kind() == std::io::ErrorKind::AlreadyExists => {}
-                Err(error) => {
-                    return Err(format!(
-                        "create temporary AOT directory {}: {error}",
-                        path.display()
-                    ));
-                }
-            }
-        }
-        Err("could not reserve a unique temporary AOT directory".to_owned())
-    }
-}
-
-#[cfg(target_os = "macos")]
-impl Drop for TemporaryBundleDirectory {
-    fn drop(&mut self) {
-        if let Err(error) = std::fs::remove_dir_all(&self.path) {
-            log::debug!(
-                "could not remove temporary FRE AOT directory {}: {error}",
-                self.path.display()
-            );
-        }
-    }
-}
-
-#[cfg(target_os = "macos")]
-struct DynamicLibrary {
-    handle: *mut libc::c_void,
-}
-
-// SAFETY: the handle is immutable after `dlopen`, Darwin's loader permits
-// concurrent `dlsym`/calls, and Drop cannot run until all Arc-held factories
-// and active calls release their shared owner.
-#[cfg(target_os = "macos")]
-unsafe impl Send for DynamicLibrary {}
-// SAFETY: same argument as `Send`; direct-native entries and their data are
-// reentrant and immutable.
-#[cfg(target_os = "macos")]
-unsafe impl Sync for DynamicLibrary {}
-
-#[cfg(target_os = "macos")]
-impl DynamicLibrary {
-    fn open(path: &std::path::Path) -> Result<Self, String> {
-        use std::os::unix::ffi::OsStrExt as _;
-
-        let path_c = std::ffi::CString::new(path.as_os_str().as_bytes())
-            .map_err(|_| "AOT bundle path contains NUL".to_owned())?;
-        // SAFETY: `path_c` is a live NUL-terminated path. RTLD_LOCAL keeps the
-        // generated symbol out of the process-global lookup namespace.
-        let handle = unsafe {
-            libc::dlerror();
-            libc::dlopen(path_c.as_ptr(), libc::RTLD_NOW | libc::RTLD_LOCAL)
-        };
-        if handle.is_null() {
-            return Err(format!("dlopen FRE AOT bundle: {}", dlerror_text()));
-        }
-        Ok(Self { handle })
-    }
-
-    fn symbol(&self, name: &str) -> Result<*mut libc::c_void, String> {
-        let name_c = std::ffi::CString::new(name)
-            .map_err(|_| "AOT entry symbol contains NUL".to_owned())?;
-        // SAFETY: `self.handle` remains live and `name_c` is NUL terminated.
-        // `dlerror` is cleared first so a null symbol and an actual failure
-        // can be distinguished according to the loader API.
-        let (symbol, error) = unsafe {
-            libc::dlerror();
-            let symbol = libc::dlsym(self.handle, name_c.as_ptr());
-            let error = libc::dlerror();
-            (symbol, error)
-        };
-        if !error.is_null() {
-            return Err(format!(
-                "dlsym FRE AOT entry {name:?}: {}",
-                // SAFETY: `error` is the non-null thread-local string just
-                // returned by `dlerror`, before any intervening loader call.
-                unsafe { dlerror_from(error) }
-            ));
-        }
-        if symbol.is_null() {
-            return Err(format!("dlsym FRE AOT entry {name:?} returned null"));
-        }
-        Ok(symbol)
-    }
-}
-
-#[cfg(target_os = "macos")]
-impl Drop for DynamicLibrary {
-    fn drop(&mut self) {
-        // SAFETY: this owner closes its one live handle exactly once, after
-        // all native entry references owned by its factory have gone away.
-        let status = unsafe { libc::dlclose(self.handle) };
-        if status != 0 {
-            log::debug!("dlclose FRE AOT bundle failed: {}", dlerror_text());
-        }
-    }
-}
-
-#[cfg(target_os = "macos")]
-fn dlerror_text() -> String {
-    // SAFETY: `dlerror` returns either null or a thread-local NUL-terminated
-    // loader-owned string that remains valid until the next loader call.
-    unsafe { dlerror_from(libc::dlerror()) }
-}
-
-#[cfg(target_os = "macos")]
-unsafe fn dlerror_from(error: *const libc::c_char) -> String {
-    if error.is_null() {
-        return "unknown dynamic-loader error".to_owned();
-    }
-    // SAFETY: upheld by this helper's caller from Darwin's dlerror contract.
-    unsafe { std::ffi::CStr::from_ptr(error) }.to_string_lossy().into_owned()
+    Ok(Arc::new(NativeAotFactory { published, description }))
 }
 
 #[cfg(test)]
@@ -962,64 +935,62 @@ mod tests {
 
     use super::*;
 
-    unsafe extern "C" fn first_byte(
-        _haystack: *const u8,
-        haystack_len: usize,
-        window_start: usize,
-        window_end: usize,
-        result: *mut AbiResult,
-    ) -> u32 {
-        if window_start >= window_end || window_start >= haystack_len {
-            return 0;
-        }
-        // SAFETY: the test caller supplies the writable ABI result slot.
-        unsafe {
-            result.write(AbiResult {
-                start: window_start,
-                end: window_start + 1,
-            });
-        }
-        1
+    fn test_factory(pattern: &str) -> Arc<NativeAotFactory> {
+        use fre_aot_regex::{
+            CompileMode, CompileRequest, OutputContract, compile,
+        };
+        use fre_aot_regex_loader::{
+            PublicationLimits, host_target, publish_span,
+        };
+
+        let compiled = compile(
+            CompileRequest::new(pattern, host_target().unwrap())
+                .mode(CompileMode::Optimizing)
+                .output(OutputContract::Span),
+        )
+        .unwrap();
+        let published =
+            publish_span(compiled, PublicationLimits::default()).unwrap();
+        Arc::new(NativeAotFactory {
+            published,
+            description: "test-direct-native".to_owned(),
+        })
     }
 
-    fn test_factory() -> Arc<NativeAotFactory> {
-        Arc::new(NativeAotFactory {
-            search: first_byte,
-            description: "test-direct-native".to_owned(),
-            #[cfg(target_os = "macos")]
-            _library: None,
-        })
+    fn matcher_with(
+        stock: RegexMatcher,
+        shared: Arc<CompileState>,
+    ) -> BackgroundFreMatcher {
+        BackgroundFreMatcher {
+            stock,
+            shared,
+            current_file_ordinal: AtomicU64::new(0),
+            file_saw_stock: AtomicBool::new(false),
+            file_saw_aot: AtomicBool::new(false),
+            file_mixed_recorded: AtomicBool::new(false),
+            file_stock_committed_bytes: AtomicU64::new(0),
+        }
     }
 
     fn pending_matcher() -> (BackgroundFreMatcher, Arc<CompileState>) {
         let stock =
             grep::regex::RegexMatcherBuilder::new().build("a").unwrap();
         let shared = CompileState::empty();
-        (
-            BackgroundFreMatcher {
-                stock,
-                shared: Arc::clone(&shared),
-                active: None,
-                terminal_decline: false,
-            },
-            shared,
-        )
+        (matcher_with(stock, Arc::clone(&shared)), shared)
     }
 
     #[test]
-    fn publication_is_observed_only_at_a_file_boundary() {
+    fn publication_is_observed_without_a_file_boundary() {
         let (mut matcher, shared) = pending_matcher();
         matcher.begin_file();
         assert_eq!(matcher.find(b"ba").unwrap(), Some(Match::new(1, 2)));
 
-        shared.outcome.set(Ok(test_factory())).unwrap();
-        assert_eq!(matcher.find(b"ba").unwrap(), Some(Match::new(1, 2)));
-
-        matcher.begin_file();
+        shared.outcome.set(Ok(test_factory("."))).unwrap();
         assert_eq!(matcher.find(b"ba").unwrap(), Some(Match::new(0, 1)));
         assert_eq!(shared.stock_files.load(Ordering::Relaxed), 1);
         assert_eq!(shared.aot_files.load(Ordering::Relaxed), 1);
-        assert_eq!(shared.total_files.load(Ordering::Relaxed), 2);
+        assert_eq!(shared.mixed_files.load(Ordering::Relaxed), 1);
+        assert_eq!(shared.total_files.load(Ordering::Relaxed), 1);
     }
 
     #[test]
@@ -1031,19 +1002,105 @@ mod tests {
     }
 
     #[test]
+    fn pending_windows_end_after_complete_lines() {
+        let stock = grep::regex::RegexMatcherBuilder::new()
+            .line_terminator(Some(b'\n'))
+            .build("z")
+            .unwrap();
+        let shared = CompileState::empty();
+        let matcher = matcher_with(stock, shared);
+
+        let mut lines = vec![b'a'; PENDING_SCAN_QUANTUM + 19];
+        lines[PENDING_SCAN_QUANTUM + 7] = b'\n';
+        assert_eq!(
+            matcher.pending_window_end(&lines, 0),
+            PENDING_SCAN_QUANTUM + 8
+        );
+
+        let giant_line = vec![b'a'; PENDING_SCAN_QUANTUM + 19];
+        assert_eq!(
+            matcher.pending_window_end(&giant_line, 0),
+            giant_line.len()
+        );
+
+        let anchored_stock = grep::regex::RegexMatcherBuilder::new()
+            .line_terminator(Some(b'\n'))
+            .build(r"\Afoo")
+            .unwrap();
+        assert_eq!(anchored_stock.line_terminator(), None);
+        let anchored = matcher_with(anchored_stock, CompileState::empty());
+        let lines = vec![b'\n'; PENDING_SCAN_QUANTUM + 19];
+        assert_eq!(anchored.pending_window_end(&lines, 0), lines.len());
+    }
+
+    #[test]
+    fn line_scan_promotes_inside_one_matcher_call() {
+        let stock = grep::regex::RegexMatcherBuilder::new()
+            .line_terminator(Some(b'\n'))
+            .build("z")
+            .unwrap();
+        let shared = CompileState::empty();
+        let mut matcher = matcher_with(stock, Arc::clone(&shared));
+        matcher.begin_file();
+
+        *shared.test_publish_after_stock_commit.lock().unwrap() =
+            Some((u64_len(PENDING_SCAN_QUANTUM), test_factory("z")));
+        let mut haystack = vec![b'a'; PENDING_SCAN_QUANTUM * 8];
+        for end in (79..haystack.len()).step_by(80) {
+            haystack[end] = b'\n';
+        }
+        assert!(matcher.find_candidate_line(&haystack).unwrap().is_none());
+        assert_eq!(shared.total_files.load(Ordering::Relaxed), 1);
+        assert_eq!(shared.mixed_files.load(Ordering::Relaxed), 1);
+        assert!(shared.stock_windows.load(Ordering::Relaxed) > 0);
+        assert!(shared.aot_windows.load(Ordering::Relaxed) > 0);
+        let cutover = shared.first_cutover.lock().unwrap().unwrap();
+        assert_eq!(cutover.file_ordinal, 1);
+        assert!(cutover.stock_committed_bytes_before_cutover > 0);
+    }
+
+    #[test]
+    fn line_scan_finds_native_match_after_committed_stock_prefix() {
+        let stock = grep::regex::RegexMatcherBuilder::new()
+            .line_terminator(Some(b'\n'))
+            .build("z")
+            .unwrap();
+        let shared = CompileState::empty();
+        let mut matcher = matcher_with(stock, Arc::clone(&shared));
+        matcher.begin_file();
+        *shared.test_publish_after_stock_commit.lock().unwrap() =
+            Some((u64_len(PENDING_SCAN_QUANTUM), test_factory("z")));
+
+        let mut haystack = vec![b'a'; PENDING_SCAN_QUANTUM * 2];
+        for end in (79..haystack.len()).step_by(80) {
+            haystack[end] = b'\n';
+        }
+        let first_window_end = matcher.pending_window_end(&haystack, 0);
+        let native_match_start = first_window_end + 20;
+        haystack[native_match_start] = b'z';
+        match matcher.find_candidate_line(&haystack).unwrap() {
+            Some(LineMatchKind::Confirmed(end)) => {
+                assert_eq!(end, native_match_start + 1);
+            }
+            other => panic!("expected confirmed native match, got {other:?}"),
+        }
+        assert_eq!(shared.mixed_files.load(Ordering::Relaxed), 1);
+        assert!(
+            shared.stock_committed_bytes.load(Ordering::Acquire)
+                >= u64_len(PENDING_SCAN_QUANTUM)
+        );
+        assert!(shared.aot_windows.load(Ordering::Relaxed) > 0);
+    }
+
+    #[test]
     fn captures_and_metadata_always_come_from_stock_matcher() {
         let stock = grep::regex::RegexMatcherBuilder::new()
             .line_terminator(Some(b'\n'))
             .build("(?P<letter>a)")
             .unwrap();
         let shared = CompileState::empty();
-        shared.outcome.set(Ok(test_factory())).unwrap();
-        let mut matcher = BackgroundFreMatcher {
-            stock,
-            shared,
-            active: None,
-            terminal_decline: false,
-        };
+        shared.outcome.set(Ok(test_factory("a"))).unwrap();
+        let mut matcher = matcher_with(stock, shared);
         matcher.begin_file();
         assert_eq!(matcher.capture_index("letter"), Some(1));
         assert_eq!(matcher.capture_count(), 2);
@@ -1057,63 +1114,14 @@ mod tests {
     }
 
     #[test]
-    fn invalid_native_span_fails_closed() {
-        unsafe extern "C" fn invalid(
-            _haystack: *const u8,
-            haystack_len: usize,
-            _window_start: usize,
-            _window_end: usize,
-            result: *mut AbiResult,
-        ) -> u32 {
-            // SAFETY: the test caller supplies the writable ABI result slot.
-            unsafe {
-                result.write(AbiResult {
-                    start: haystack_len + 1,
-                    end: haystack_len + 2,
-                });
-            }
-            1
-        }
-        let matcher = NativeAotMatcher {
-            factory: Arc::new(NativeAotFactory {
-                search: invalid,
-                description: "invalid-test".to_owned(),
-                #[cfg(target_os = "macos")]
-                _library: None,
-            }),
-        };
-        assert!(matcher.find_at(b"abc", 0).is_err());
+    fn invalid_native_window_fails_closed() {
+        let matcher = NativeAotMatcher { factory: test_factory("a") };
+        assert!(matcher.find_at(b"abc", 4).is_err());
     }
 
     #[test]
     fn native_empty_match_iteration_makes_bytewise_progress() {
-        unsafe extern "C" fn empty_at_start(
-            _haystack: *const u8,
-            _haystack_len: usize,
-            window_start: usize,
-            window_end: usize,
-            result: *mut AbiResult,
-        ) -> u32 {
-            if window_start > window_end {
-                return 0;
-            }
-            // SAFETY: the test caller supplies the writable ABI result slot.
-            unsafe {
-                result.write(AbiResult {
-                    start: window_start,
-                    end: window_start,
-                });
-            }
-            1
-        }
-        let matcher = NativeAotMatcher {
-            factory: Arc::new(NativeAotFactory {
-                search: empty_at_start,
-                description: "empty-test".to_owned(),
-                #[cfg(target_os = "macos")]
-                _library: None,
-            }),
-        };
+        let matcher = NativeAotMatcher { factory: test_factory("a*") };
         let mut matches = vec![];
         matcher
             .try_find_iter(b"ab", |found| {
@@ -1122,9 +1130,14 @@ mod tests {
             })
             .unwrap()
             .unwrap();
-        assert_eq!(
-            matches,
-            vec![Match::new(0, 0), Match::new(1, 1), Match::new(2, 2)]
-        );
+        let stock = RegexMatcher::new("a*").unwrap();
+        let mut expected = vec![];
+        stock
+            .find_iter(b"ab", |found| {
+                expected.push(found);
+                true
+            })
+            .unwrap();
+        assert_eq!(matches, expected);
     }
 }

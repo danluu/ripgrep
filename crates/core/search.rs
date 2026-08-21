@@ -199,9 +199,9 @@ pub(crate) enum PatternMatcher {
 }
 
 impl PatternMatcher {
-    /// Poll background compilation and select the matcher for one complete
-    /// file. This is called before a searcher or printer sink borrows us, so
-    /// the engine cannot change in the middle of a file.
+    /// Reset per-file accounting. Background publication is polled at safe
+    /// matcher-call and complete-line scan-window boundaries, so one large
+    /// file may promote after its already-searched prefix.
     fn begin_file(&mut self) {
         if let PatternMatcher::FreAotBackground(matcher) = self {
             matcher.begin_file();
