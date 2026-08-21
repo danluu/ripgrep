@@ -1,8 +1,9 @@
 # Normal ripgrep with background FRE AOT cutover
 
-> Status: implementation and correctness gate complete. One high-load,
-> one-pair-per-cell pilot has been retained as a harness diagnostic; the full
-> paired benchmark has not yet been run.
+> Status: experiment complete. The committed-HEAD binary passed all 17
+> correctness cases and the final 18-cell, 31-pair run completed without an
+> output/status mismatch. The hybrid wins for selected long sequential scans,
+> but loses through 1 GiB when ripgrep uses its default parallel workers.
 
 ## Question
 
@@ -160,8 +161,9 @@ performance endpoint is complete child wall time.
 An “FRE file” means FRE performs group-zero span and matching-line discovery
 for that file. Ripgrep's stock matcher still owns capture extraction and matcher
 metadata, so replacement and capture output remain governed by stock semantics.
-After promotion, an invalid native status or span fails closed for that call;
-the implementation never swaps routes in the middle of a file.
+After promotion, an invalid native status or span becomes a search error rather
+than accepted data; the implementation never swaps routes in the middle of a
+file.
 
 There is no persistent compiled-query cache. Every flagged sample starts a new
 process and recompiles. Each invocation gets a unique `TMPDIR`; any file or
@@ -225,7 +227,7 @@ python3 experiments/background-aot/verify_correctness.py \
   --binary target/release/rg \
   --stock-binary /Users/danluu/dev/ripgrep-fre-aot-20260820/artifacts/bin/rg-stock-f9c05a9 \
   --manifest experiments/background-aot/data/manifest.json \
-  --output experiments/background-aot/results/correctness.json
+  --output experiments/background-aot/results/correctness-r4.json
 ```
 
 Then run the paired benchmark on an otherwise idle host:
@@ -240,7 +242,7 @@ python3 experiments/background-aot/benchmark.py \
   --stock-pairs 11 \
   --fre-repo /Users/danluu/dev/fre-rg-aot-deps-20260820 \
   --require-clean \
-  --output experiments/background-aot/results/benchmark.json
+  --output experiments/background-aot/results/benchmark-r2.json
 ```
 
 The final artifact records ripgrep and FRE source commits/status, Rust/Cargo,
@@ -252,17 +254,90 @@ completed cell, outside every child timing boundary.
 
 ## Results
 
-The full run is pending. A deliberately non-inferential pilot used one warmup
-and one measured pair per cell while the host load was approximately 21--22.
-It existed to exercise the harness and is retained as
-`results/benchmark-pilot.json`; its apparent ratios are not headline results.
+Run 2 is the final artifact. It binds clean ripgrep commit `8a4b97b3be`, clean
+FRE commit `b1dfe2b159`, candidate SHA-256 `7e2a4fa6...1537d3c`, stock SHA-256
+`85245572...add39019`, and corpus-manifest SHA-256
+`9f7a3682...631f6b5`. The matching `correctness-r4.json` uses the same candidate
+and stock hashes and passes 17/17 cases. The raw benchmark SHA-256 is
+`7f2d5dfd...b1a3c5c3`; the correctness artifact is
+`92cc0837...a11d691`. The final full
+`cargo +1.96.0 test --workspace --no-fail-fast -j1` run exited successfully,
+including all 323 CLI integration tests and workspace doctests.
 
-| Cell | Normal median | Background median | Normal/background paired median [95%] | Stock/FRE files | Result |
-|---|---:|---:|---:|---:|---|
-| Primary scaling rows | TBD | TBD | TBD | TBD | TBD |
-| Favorable controls | TBD | TBD | TBD | TBD | TBD |
-| Regression controls | TBD | TBD | TBD | TBD | TBD |
-| Decline control | TBD | TBD | TBD | 8/0 expected | TBD |
+Ratios below are paired `normal/background`; values above 1 favor background
+AOT. “Mixed” counts samples that searched at least one file with stock and a
+later file with FRE. A dagger marks a cell that failed the predeclared 15%
+order/rMAD stability gate.
+
+| Cell | Normal / background median | Paired ratio [descriptive 95%] | Mixed samples; median stock/FRE files |
+|---|---:|---:|---:|
+| tiny fresh process | 2.884 / 6.953 ms | 0.410 [0.394, 0.421] | 0/31; 1/0 |
+| bounded 1×64 MiB | 31.681 / 38.336 ms | 0.824 [0.818, 0.827] | 0/31; 1/0 |
+| bounded 2×64 MiB | 56.009 / 135.290 ms | 0.422 [0.377, 0.450]† | 0/31; 2/0 |
+| bounded 4×64 MiB | 93.296 / 127.362 ms | 0.732 [0.659, 0.752]† | 0/31; 4/0 |
+| bounded 8×64 MiB | 175.710 / 152.160 ms | **1.159 [1.143, 1.173]** | 31/31; 6/2 |
+| bounded 16×64 MiB | 345.313 / 193.120 ms | **1.769 [1.759, 1.807]** | 30/31; 6/10 |
+| bounded default threads, 8×64 MiB | 69.986 / 164.380 ms | 0.447 [0.405, 0.457]† | 0/31; 8/0 |
+| bounded default threads, 16×64 MiB | 119.623 / 180.476 ms | 0.666 [0.653, 0.675] | 0/31; 16/0 |
+| **unregistered** bounded 8×64 MiB | 194.508 / 167.690 ms | **1.156 [1.148, 1.171]** | 31/31; 6/2 |
+| **unregistered** bounded 16×64 MiB | 365.387 / 204.083 ms | **1.789 [1.769, 1.818]** | 30/31; 6/10 |
+| **unregistered** bounded default threads, 16×64 MiB | 117.947 / 176.016 ms | 0.669 [0.654, 0.685] | 0/31; 16/0 |
+| ambiguous negative, 8×64 MiB | 173.837 / 153.166 ms | 1.138 [1.131, 1.170] | 31/31; 6/2 |
+| ambiguous positive, 8×64 MiB | 176.036 / 211.176 ms | 0.834 [0.831, 0.838] | 31/31; 6/2 |
+| overlap mixed logs, 8×64 MiB | 318.812 / 289.161 ms | 1.105 [1.101, 1.118] | 31/31; 4/4 |
+| trace mixed logs, 8×64 MiB | 159.793 / 167.769 ms | 0.953 [0.944, 0.960] | 29/31; 7/1 |
+| bounded ordinary output, 8×64 MiB | 173.388 / 149.146 ms | 1.165 [1.159, 1.167] | 31/31; 6/2 |
+| ignore-case synchronous decline | 208.716 / 218.259 ms | 0.966 [0.944, 0.973] | 0/31; 8/0 |
+| ordered source-shaped, 8×64 MiB | 263.136 / 261.540 ms | 1.004 [1.001, 1.007] | 30/31; 4/4 |
+
+### What the result means
+
+The predeclared discrete sequential break-even is 8×64 MiB, or 512 MiB, for
+the selected negative `a{0,100}b` shape. All 31 samples used both engines and
+the cell was stable. This is a first observed tested point, not a precise
+threshold or a familywise 95% claim. The unregistered `a{0,99}b` query closely
+reproduces it: 1.156× at 512 MiB and 1.789× at 1 GiB. That establishes a real
+fresh-query runtime compile/link/load/cutover result rather than a fixed-registry
+lookup. Since 512 MiB was the smallest unregistered size tested, it is not an
+estimated fresh-query break-even.
+
+FRE core compilation itself was about 2.0--2.2 ms for these bounded queries,
+but full successful preparation was about 123--131 ms. Object emission,
+external linking, loading, and symbol resolution therefore dominate readiness.
+At 512 MiB the median route was six stock files followed by two FRE files; at
+1 GiB it was six stock then ten FRE. Publication is useful only because later
+file boundaries remain after that roughly 125 ms delay. One registered and one
+unregistered 1 GiB sample had an unusually long preparation attempt and never
+published, so larger input does not monotonically guarantee cutover.
+
+Default parallelism reverses the result. Every worker claimed all 8 or 16 files
+before the artifact became ready, so all 31 samples stayed entirely stock while
+also paying concurrent compilation and shutdown/cleanup cost. The registered
+and unregistered 1 GiB controls were respectively 0.666× and 0.669× normal
+ripgrep. Larger file sets might eventually leave a later scheduling wave, but
+there is no observed default-thread break-even through 1 GiB.
+
+Wall latency is not free CPU parallelism. For the unregistered sequential query,
+the reported median user+system sums were about 191/222 ms (normal/background)
+at 512 MiB, but 362/259 ms at 1 GiB once the faster native scan dominated. The
+unregistered default-thread 1 GiB control used about 823/887 ms while also
+losing wall time. Background compilation must therefore be judged on both
+latency and CPU cost at the intended scale.
+
+The matcher is also shape-sensitive. With nearly identical stock/FRE routing,
+the ambiguous negative case won 1.138× while its positive counterpart lost at
+0.834×. The source-shaped gain was only 0.4%, below the level that should drive
+an engineering decision. An eligible compiler route is not evidence that FRE
+will be faster for that query and corpus.
+
+The first full run was superseded because an unrelated test began halfway
+through and drove its ending load average to 37.7. Run 2 recorded per-cell load;
+the one-minute value ranged from 6.4 to 12.4 on this 18-core host and all cells
+except the marked 2-file, 4-file, and default-thread-8 controls passed the
+stability rule. It was a moderate-load paired run, not an idle-host result.
+Nevertheless, the key run-1/run-2 paired ratios reproduced closely: bounded
+512 MiB 1.153/1.159, bounded 1 GiB 1.767/1.769, and default-thread 1 GiB
+0.677/0.666.
 
 ## Threats and interpretation limits
 
