@@ -469,6 +469,16 @@ def validate_provenance(provenance: Mapping[str, Any], activity: str) -> None:
         == provenance["binaries"]["stock"]["sha256"]
     ):
         raise SystemExit("candidate and stock binaries must differ")
+    for binary_name, source_name in (
+        ("candidate", "source"),
+        ("stock", "stock_source"),
+    ):
+        revision = provenance[source_name]["commit"][:10]
+        version = provenance["binaries"][binary_name]["version"]
+        if f"(rev {revision})" not in version:
+            raise SystemExit(
+                f"{binary_name} binary revision does not match {source_name}"
+            )
 
 
 def run_correctness(args: argparse.Namespace) -> None:
