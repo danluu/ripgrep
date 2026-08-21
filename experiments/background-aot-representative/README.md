@@ -88,9 +88,9 @@ benchmark commands, replace `--inventory-root ... --database ...` with:
 The standalone file preserves every case ID, cohort, exact expression,
 retained semantics, suffix, weight, and source class. Its declared counts,
 selection knobs, frozen-source provenance, and canonical manifest digest are
-validated before and after each workload. A `probe.private.json` is also an
-accepted input container, though using the same standalone export for remote
-probe and benchmark gives the clearest transport provenance.
+validated before and after each workload. Only this standalone selection-v1
+envelope is accepted for transport; a probe-private result lacks the frozen
+selection-knob envelope and is deliberately rejected.
 
 ## Formal paired timing
 
@@ -129,7 +129,11 @@ cold-cache first traversal. A
 formal run refuses a probe with missing cases, output mismatches, receipt
 validation failures, changed binaries, changed source, changed corpus trees,
 changed host/toolchain/SVE vector length, a changed raw cohort manifest, or
-changed frozen inventory. Provenance parses the candidate's Cargo manifest and
+changed frozen inventory. The public probe binds the complete private probe by
+SHA-256. The formal gate reconstructs the exact profile/panel/case row matrix,
+recomputes semantic output equality and receipt validation from private
+evidence, and requires its regenerated aggregates to equal the public report.
+Provenance parses the candidate's Cargo manifest and
 lockfile to require its actual FRE git dependency revision to equal the corpus
 commit. It separately requires the local FRE corpus source mirror to be clean,
 and records rustc/cargo, corpus file counts/bytes, and start/end host load

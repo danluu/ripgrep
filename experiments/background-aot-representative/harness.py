@@ -608,6 +608,34 @@ def lf_records(data: bytes) -> list[bytes]:
     return sorted(data.splitlines(keepends=True))
 
 
+def semantic_stdout_sha256(data: bytes, mode: str) -> str:
+    if mode == "literal":
+        return hashlib.sha256(data).hexdigest()
+    if mode != "unordered_lf_records":
+        raise HarnessError("unknown output comparison mode")
+    digest = hashlib.sha256()
+    for record in lf_records(data):
+        digest.update(len(record).to_bytes(8, "big"))
+        digest.update(record)
+    return digest.hexdigest()
+
+
+def comparison_record(result: Mapping[str, Any], mode: str) -> dict[str, Any]:
+    return {
+        "status": result["status"],
+        "stderr_sha256": result["stderr"]["sha256"],
+        "semantic_stdout_sha256": semantic_stdout_sha256(
+            result["stdout_raw"], mode
+        ),
+    }
+
+
+def comparison_records_equal(
+    left: Mapping[str, Any], right: Mapping[str, Any]
+) -> bool:
+    return left == right
+
+
 def outputs_equal(left: Mapping[str, Any], right: Mapping[str, Any], mode: str) -> bool:
     if left["status"] != right["status"] or left["stderr_raw"] != right["stderr_raw"]:
         return False
@@ -979,23 +1007,43 @@ def probe_one(
     )
     exact_normal_background = outputs_equal(normal, background, panel.output_comparison)
     exact_stock_normal = outputs_equal(stock_result, normal, panel.output_comparison)
-    failures = validate_receipt(background["receipt"], cpu_profile)
-    if background["receipt"] is None and normal["status"] not in (0, 1):
-        failures = [failure for failure in failures if failure != "missing_receipt"]
-    if background["receipt_parse_error"]:
-        failures.append("malformed_receipt")
-    if background["unexpected_temporary_artifacts"]:
-        failures.append("unexpected_temporary_artifacts")
+    failures = probe_receipt_failures(normal, background, cpu_profile)
     return {
         "query_argv_after_binary": list(args),
         "normalization": normalization,
         "exact_normal_background": exact_normal_background,
         "exact_stock_normal": exact_stock_normal,
         "receipt_failures": failures,
+        "comparison_records": {
+            "normal": comparison_record(normal, panel.output_comparison),
+            "background": comparison_record(
+                background, panel.output_comparison
+            ),
+            "stock": comparison_record(
+                stock_result, panel.output_comparison
+            ),
+        },
         "normal": compact_private(normal),
         "background": compact_private(background),
         "stock": compact_private(stock_result),
     }
+
+
+def probe_receipt_failures(
+    normal: Mapping[str, Any],
+    background: Mapping[str, Any],
+    cpu_profile: str,
+) -> list[str]:
+    failures = validate_receipt(background.get("receipt"), cpu_profile)
+    if background.get("receipt") is None and normal.get("status") not in (0, 1):
+        failures = [
+            failure for failure in failures if failure != "missing_receipt"
+        ]
+    if background.get("receipt_parse_error"):
+        failures.append("malformed_receipt")
+    if background.get("unexpected_temporary_artifacts"):
+        failures.append("unexpected_temporary_artifacts")
+    return failures
 
 
 def percentile(values: Sequence[float], fraction: float) -> float:
@@ -1533,12 +1581,9 @@ def load_selection_manifest(
 ) -> tuple[list[QueryCase], list[QueryCase]]:
     document = json.loads(path.read_text())
     schema = document.get("schema")
-    if schema not in (
-        f"{RESULT_SCHEMA}.selection.v1",
-        f"{RESULT_SCHEMA}.probe.private.v1",
-    ):
+    if schema != f"{RESULT_SCHEMA}.selection.v1":
         raise HarnessError("unsupported selection manifest schema")
-    if schema == f"{RESULT_SCHEMA}.selection.v1" and (
+    if (
         document.get("oot_end_unix") != OOT_END_UNIX
         or document.get("oot_expected_counts") != EXPECTED_OOT
         or document.get("wider_sample_size") != wider_sample_size
@@ -1777,6 +1822,7 @@ def run_probe(args: argparse.Namespace) -> None:
         "post_run_provenance_verified": True,
     }
     write_new_json(args.private_output, private, 0o600)
+    public["private_result_sha256"] = sha256_file(args.private_output)
     write_new_json(args.public_output, public, 0o644)
 
 
@@ -1829,6 +1875,129 @@ def run_pair(
     }
 
 
+def validate_and_aggregate_private_probe(
+    private_probe: Mapping[str, Any],
+    *,
+    cpu_profiles: Sequence[str],
+    oot: Sequence[QueryCase],
+    wider: Sequence[QueryCase],
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    rows = private_probe.get("rows")
+    if not isinstance(rows, list):
+        raise HarnessError("private probe rows are missing")
+    all_cases = [*oot, *wider]
+    by_id = {case.private_id: case for case in all_cases}
+    expected_keys = set()
+    for profile in cpu_profiles:
+        for panel in PANELS:
+            cases = oot if panel == "ripgrep-default-output" else all_cases
+            expected_keys.update(
+                (profile, panel, case.private_id) for case in cases
+            )
+    observed_keys = set()
+    validated_rows = []
+    output_modes = {
+        "ripgrep-default-output": "unordered_lf_records",
+        "fre-count-default-threads": "unordered_lf_records",
+        "fre-count-thread1": "literal",
+    }
+    identity_fields = (
+        "private_id", "cohort", "pattern", "occurrence_weight", "suffix",
+        "semantics", "target_kind", "extension_class",
+    )
+    for original in rows:
+        if not isinstance(original, Mapping):
+            raise HarnessError("private probe row is not an object")
+        profile = original.get("cpu_profile")
+        panel = original.get("panel")
+        private_id = original.get("private_id")
+        key = (profile, panel, private_id)
+        if key not in expected_keys or key in observed_keys:
+            raise HarnessError("private probe row matrix is invalid")
+        observed_keys.add(key)
+        case = by_id[private_id]
+        expected_identity = case_manifest([case])[0]
+        if any(
+            original.get(field) != expected_identity[field]
+            for field in identity_fields
+        ):
+            raise HarnessError("private probe row does not match selection")
+        normal = original.get("normal")
+        background = original.get("background")
+        stock = original.get("stock")
+        comparisons = original.get("comparison_records")
+        if not all(
+            isinstance(value, Mapping)
+            for value in (normal, background, stock, comparisons)
+        ) or not all(
+            isinstance(comparisons.get(arm), Mapping)
+            for arm in ("normal", "background", "stock")
+        ):
+            raise HarnessError("private probe comparison evidence is missing")
+        mode = output_modes[panel]
+        for arm, result in (
+            ("normal", normal),
+            ("background", background),
+            ("stock", stock),
+        ):
+            comparison = comparisons[arm]
+            stdout = result.get("stdout", {})
+            stderr = result.get("stderr", {})
+            semantic_digest = comparison.get("semantic_stdout_sha256")
+            if (
+                not isinstance(stdout, Mapping)
+                or not isinstance(stderr, Mapping)
+                or comparison.get("status") != result.get("status")
+                or comparison.get("stderr_sha256") != stderr.get("sha256")
+                or not isinstance(semantic_digest, str)
+                or re.fullmatch(r"[0-9a-f]{64}", semantic_digest) is None
+                or mode == "literal"
+                and semantic_digest != stdout.get("sha256")
+            ):
+                raise HarnessError(
+                    "private probe comparison evidence is invalid"
+                )
+        exact_normal_background = comparison_records_equal(
+            comparisons["normal"], comparisons["background"]
+        )
+        exact_stock_normal = comparison_records_equal(
+            comparisons["stock"], comparisons["normal"]
+        )
+        receipt_failures = probe_receipt_failures(
+            normal, background, str(profile)
+        )
+        _, normalization = profile_flags(case)
+        if (
+            original.get("exact_normal_background")
+            != exact_normal_background
+            or original.get("exact_stock_normal") != exact_stock_normal
+            or original.get("receipt_failures") != receipt_failures
+            or original.get("normalization") != normalization
+        ):
+            raise HarnessError("private probe derived fields do not reconcile")
+        row = dict(original)
+        row.update({
+            "exact_normal_background": exact_normal_background,
+            "exact_stock_normal": exact_stock_normal,
+            "receipt_failures": receipt_failures,
+            "normalization": normalization,
+        })
+        validated_rows.append(row)
+    if observed_keys != expected_keys:
+        raise HarnessError("private probe row matrix is incomplete")
+    panels = {}
+    for profile in cpu_profiles:
+        for panel in PANELS:
+            panel_rows = [
+                row for row in validated_rows
+                if row["cpu_profile"] == profile and row["panel"] == panel
+            ]
+            panels[f"{profile}/{panel}"] = aggregate_groups(
+                panel_rows, by_id, aggregate_observations
+            )
+    return panels, target_validation_matrix(validated_rows, cpu_profiles)
+
+
 def validate_probe(
     args: argparse.Namespace,
     prov: Mapping[str, Any],
@@ -1840,12 +2009,19 @@ def validate_probe(
     private_probe = json.loads(args.probe_private.read_text())
     expected_manifest = case_manifest([*oot, *wider])
     method = probe.get("method", {})
-    computed_target_matrix = target_validation_matrix(
-        private_probe.get("rows", []), args.cpu_profile
+    recomputed_panels, computed_target_matrix = (
+        validate_and_aggregate_private_probe(
+            private_probe,
+            cpu_profiles=args.cpu_profile,
+            oot=oot,
+            wider=wider,
+        )
     )
     if (
         probe.get("schema") != f"{RESULT_SCHEMA}.probe.public.v1"
         or probe.get("aggregate_only") is not True
+        or probe.get("private_result_sha256")
+        != sha256_file(args.probe_private)
         or probe.get("binaries") != prov["binaries"]
         or probe.get("candidate_source") != prov["candidate_source"]
         or probe.get("stock_source") != prov["stock_source"]
@@ -1867,6 +2043,7 @@ def validate_probe(
         or private_probe.get("selection_manifest") != expected_manifest
         or private_probe.get("selection_manifest_sha256")
         != manifest_digest(expected_manifest)
+        or probe.get("panels") != recomputed_panels
         or probe.get("target_validation_matrix") != computed_target_matrix
         or private_probe.get("target_validation_matrix")
         != computed_target_matrix

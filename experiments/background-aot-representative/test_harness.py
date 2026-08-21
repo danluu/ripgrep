@@ -35,6 +35,22 @@ class HarnessTests(unittest.TestCase):
         self.assertFalse(
             HARNESS.outputs_equal(base, missing, "unordered_lf_records")
         )
+        self.assertEqual(
+            HARNESS.semantic_stdout_sha256(
+                base["stdout_raw"], "unordered_lf_records"
+            ),
+            HARNESS.semantic_stdout_sha256(
+                reordered["stdout_raw"], "unordered_lf_records"
+            ),
+        )
+        self.assertNotEqual(
+            HARNESS.semantic_stdout_sha256(
+                base["stdout_raw"], "unordered_lf_records"
+            ),
+            HARNESS.semantic_stdout_sha256(
+                missing["stdout_raw"], "unordered_lf_records"
+            ),
+        )
 
     def test_error_exit_is_not_a_timing_sample(self) -> None:
         result = {
@@ -214,6 +230,95 @@ class HarnessTests(unittest.TestCase):
                 HARNESS.load_selection_manifest(
                     path, wider_sample_size=2, wider_sample_seed=7
                 )
+            document["schema"] = (
+                f"{HARNESS.RESULT_SCHEMA}.probe.private.v1"
+            )
+            document["selection_manifest_sha256"] = (
+                HARNESS.manifest_digest(manifest)
+            )
+            path.write_text(json.dumps(document))
+            with self.assertRaises(HARNESS.HarnessError):
+                HARNESS.load_selection_manifest(
+                    path, wider_sample_size=2, wider_sample_seed=7
+                )
+
+    def test_private_probe_matrix_is_recomputed(self) -> None:
+        semantics = {
+            "matcher_mode": "regex",
+            "regex_engine_request": "default",
+            "case": "case_sensitive",
+        }
+        oot = HARNESS.QueryCase(
+            "oot-0001", "frozen-oot-84", "oot", 1, None, semantics
+        )
+        wider = HARNESS.QueryCase(
+            "wider-0001", "frozen-unique-sample-1", "wider", 1,
+            None, semantics,
+        )
+        empty = HARNESS.output_record(b"")
+
+        def result():
+            return {
+                "elapsed_ns": 1,
+                "user_ns": 0,
+                "system_ns": 0,
+                "timed_out": False,
+                "status": 1,
+                "stdout": empty,
+                "stderr": empty,
+                "receipt": None,
+                "receipt_parse_error": False,
+                "unexpected_temporary_artifacts": 0,
+            }
+
+        comparison = {
+            "status": 1,
+            "stderr_sha256": empty["sha256"],
+            "semantic_stdout_sha256": empty["sha256"],
+        }
+        rows = []
+        for panel, cases in (
+            ("ripgrep-default-output", [oot]),
+            ("fre-count-default-threads", [oot, wider]),
+            ("fre-count-thread1", [oot, wider]),
+        ):
+            for case in cases:
+                identity = HARNESS.case_manifest([case])[0]
+                rows.append({
+                    **identity,
+                    "cpu_profile": "auto",
+                    "panel": panel,
+                    "normalization": [],
+                    "exact_normal_background": True,
+                    "exact_stock_normal": True,
+                    "receipt_failures": ["missing_receipt"],
+                    "comparison_records": {
+                        "normal": comparison,
+                        "background": comparison,
+                        "stock": comparison,
+                    },
+                    "normal": result(),
+                    "background": result(),
+                    "stock": result(),
+                })
+        panels, _ = HARNESS.validate_and_aggregate_private_probe(
+            {"rows": rows}, cpu_profiles=["auto"], oot=[oot], wider=[wider]
+        )
+        self.assertEqual(5, sum(
+            panel["all_selected"]["cases"] for panel in panels.values()
+        ))
+        tampered = [dict(row) for row in rows]
+        tampered[0]["exact_stock_normal"] = False
+        with self.assertRaises(HARNESS.HarnessError):
+            HARNESS.validate_and_aggregate_private_probe(
+                {"rows": tampered}, cpu_profiles=["auto"],
+                oot=[oot], wider=[wider],
+            )
+        with self.assertRaises(HARNESS.HarnessError):
+            HARNESS.validate_and_aggregate_private_probe(
+                {"rows": [*rows, rows[0]]}, cpu_profiles=["auto"],
+                oot=[oot], wider=[wider],
+            )
 
     def test_grouped_aggregate_keeps_primary_separate(self) -> None:
         cases = {
