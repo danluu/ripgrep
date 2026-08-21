@@ -72,19 +72,47 @@ the ordered selected-44 case manifest is independently hard-pinned to
 `35b0037122bf2ab9a2c1641a562f23f12b88856ceb66c713ceb9403adb541823`.
 Self-consistent replacement manifests therefore fail before any workload.
 
+The 44 cases remain the primary intention-to-treat (ITT) cohort. An untimed,
+settled, authenticated Force census frozen before any V2 timing supplies two
+secondary compiler-fact strata. Force selected and published Teddy for 34
+cases (11 OOT/23 wider); the 10-case complement is:
+
+```text
+oot-0002 oot-0004 oot-0035 wider-0003 wider-0030 wider-0039
+wider-0052 wider-0058 wider-0075 wider-0121
+```
+
+The ordered selected-34 manifest and sorted-ID set are hard-pinned to
+`b2e2ab1fcdc39d78e60eadb1bb34aeb3075ebf0133ef67532843d8da952cb951`
+and `a1887065aa4765351bc72564a566177334d58f0bc9fc2e119ce8648df647c68c`.
+The complement-10 equivalents are
+`398657722d7192f0b641770e69fc390f808faf249efc02990667c0587a38a795`
+and `6f3c3f59067b4769721b774a7ad8f3585d598680a4d73edc748a95fcb46b1fe2`.
+Nine complement cases settled ready on the ordinary DFA because no one-bank
+three/four-column plan fit the compiler's authenticated candidate envelope;
+`wider-0121` settled as a `compile_object` decline. These compiler facts are
+never used to drop cases from the ITT timing population.
+
 Campaign panel applicability remains faithful to the frozen workloads:
 `ripgrep-default-output` runs only the 14 OOT cases, while
 `fre-count-default-threads` and `fre-count-thread1` each run all 44. The
 campaign manifest still binds all 44 IDs and their exact case-manifest digest.
+Public panel summaries retain that all-44 primary and additionally report the
+selected/complement strata (11/3 on the OOT-only panel and 34/10 on each count
+panel), with the existing OOT/wider separation inside each stratum.
 
 An explicit probe is untimed and waits for compiler settlement. It also runs
 the fixed `samwise|samw|frodo|pippin` three-arm correctness gate for each CPU
 profile, with the policy present only on its background arm. Under Force,
-every fixed case (including every canonical `fre-count-thread1` row) and the
-gate must authenticate a selected, accelerated incumbent: V2 policy
+the synthetic gate and every selected-34 case must authenticate a selected,
+accelerated incumbent: V2 policy
 `force_structurally_eligible`, basis `forced_structural_eligibility`, source
 `ordinary_public_complete_dfa`, performance admission bypassed, tail entry
 enabled, a non-`none` accelerator, and a matching authenticated nested lowering.
+Each complement case must instead authenticate its frozen definitive
+nonselection: nine ready ordinary-DFA receipts and the one `compile_object`
+decline. Missing, unfinished, pre-target, selected-on-the-wrong-case, or other
+dispositions fail the probe.
 Automatic is the matched control and validates its V2 policy receipt without
 requiring the forced route to be selected.
 
@@ -102,7 +130,8 @@ campaign and panel matrices, compares the policy and frozen-manifest digests,
 binds both probe files by SHA-256, and rehashes them after timing. It therefore
 rejects a different policy, an ordinary 212-case probe, or a changed 44-case
 manifest. Timed runs keep the existing three arms; only the background arm
-receives the selected policy.
+receives the selected policy. All 44 cases remain timed and form the primary
+ITT summary; selected-34 and complement-10 summaries are secondary.
 
 ## Fast exact-Teddy census
 
@@ -117,8 +146,11 @@ and do not embed or claim a compiler-selected census. The private result contain
 `profile/cohort/private-id` sets; the public result contains counts and
 tier/ISA/scanner contracts only. This diagnostic does not claim benchmark
 eligibility. Adding an explicit V2 policy restricts the census to the same
-fixed 44. Force additionally requires strict selected-route attestation for
-all 44; Automatic provides the matched control. For example:
+fixed 44. Force requires strict route attestation for selected-34 and exact
+definitive nonselection for complement-10; Automatic provides the matched
+control. A malformed receipt, unexpected disposition, process error, or
+incomplete settlement aborts the census instead of emitting a nominally
+successful result. For example:
 
 ```sh
 python3 experiments/background-aot-representative/harness.py exact-teddy-census \
@@ -287,7 +319,9 @@ statistic is the median paired `normal/background` elapsed-time ratio for each
 pattern, but only when every configured sample for that pattern has valid
 statuses and exact stock/normal/background output. The report also shows NB
 versus BN medians and their order effect. It then computes an
-equal-unique-pattern distribution and geometric mean. Preserved
+equal-unique-pattern distribution and geometric mean over the fixed-44 ITT,
+then repeats the aggregation for the pre-timing selected-34 and complement-10
+compiler-fact strata. Preserved
 `stock/background`, occurrence weighting within each cohort, and stable-only
 results are secondary diagnostics. Occurrence weights are never mixed across
 the OOT and wider cohorts because their windows and inclusion probabilities

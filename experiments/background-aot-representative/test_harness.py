@@ -244,6 +244,42 @@ def forced_exact_teddy_v2_ready_receipt(**overrides):
     return receipt
 
 
+def forced_exact_teddy_v2_nonselected_ready_receipt(**overrides):
+    receipt = ready_receipt(
+        exact_finite_selected_end_teddy_policy_v2_request=(
+            "force_structurally_eligible"
+        ),
+        compile_receipt_v2={
+            "schema_version": HARNESS.EXACT_TEDDY_V2_SCHEMA_VERSION,
+            "optimizer_version": HARNESS.EXACT_TEDDY_V2_OPTIMIZER_VERSION,
+            "exact_finite_selected_end_teddy_policy": (
+                "force_structurally_eligible"
+            ),
+            "exact_finite_selected_end_teddy_aot_v2": None,
+        },
+        wait_requested=True,
+        compiler_settled=True,
+    )
+    receipt.update(overrides)
+    return receipt
+
+
+def forced_exact_teddy_v2_compile_decline_receipt(**overrides):
+    receipt = receipt_fixture(
+        decline_reason="compile_object",
+        publication_stage="compile",
+        publication_refusal_class="compile_object",
+        exact_finite_selected_end_teddy_policy_v2_request=(
+            "force_structurally_eligible"
+        ),
+        compile_receipt_v2=None,
+        wait_requested=True,
+        compiler_settled=True,
+    )
+    receipt.update(overrides)
+    return receipt
+
+
 def synthetic_frozen_exact_teddy_v2_cases():
     semantics = {
         "matcher_mode": "regex",
@@ -707,15 +743,76 @@ class HarnessTests(unittest.TestCase):
                     changed_source
                 )
 
+    def test_force_stratum_id_digests_and_counts_recompute(self) -> None:
+        selected = HARNESS.FROZEN_EXACT_TEDDY_V2_FORCE_SELECTED_PRIVATE_IDS
+        nonselected = (
+            HARNESS.FROZEN_EXACT_TEDDY_V2_FORCE_NONSELECTED_PRIVATE_IDS
+        )
+        self.assertFalse(selected & nonselected)
+        self.assertEqual(
+            HARNESS.FROZEN_EXACT_TEDDY_V2_STRUCTURAL_PRIVATE_IDS,
+            selected | nonselected,
+        )
+        self.assertEqual(
+            HARNESS.FROZEN_EXACT_TEDDY_V2_FORCE_SELECTED_IDS_SHA256,
+            HARNESS.frozen_private_ids_digest(selected),
+        )
+        self.assertEqual(
+            HARNESS.FROZEN_EXACT_TEDDY_V2_FORCE_NONSELECTED_IDS_SHA256,
+            HARNESS.frozen_private_ids_digest(nonselected),
+        )
+        for private_ids, counts in (
+            (
+                selected,
+                HARNESS.FROZEN_EXACT_TEDDY_V2_FORCE_SELECTED_COUNTS,
+            ),
+            (
+                nonselected,
+                HARNESS.FROZEN_EXACT_TEDDY_V2_FORCE_NONSELECTED_COUNTS,
+            ),
+        ):
+            self.assertEqual(counts["total"], len(private_ids))
+            self.assertEqual(
+                counts["oot"],
+                sum(value.startswith("oot-") for value in private_ids),
+            )
+            self.assertEqual(
+                counts["wider"],
+                sum(value.startswith("wider-") for value in private_ids),
+            )
+
     def test_policy_campaign_record_binds_policy_and_exact_frozen_manifest(self) -> None:
         cases = synthetic_frozen_exact_teddy_v2_cases()
         manifest_sha256 = HARNESS.manifest_digest(
             HARNESS.case_manifest(cases)
         )
-        with mock.patch.object(
+        selected_manifest_sha256 = HARNESS.manifest_digest(
+            HARNESS.case_manifest([
+                case for case in cases
+                if case.private_id in (
+                    HARNESS.FROZEN_EXACT_TEDDY_V2_FORCE_SELECTED_PRIVATE_IDS
+                )
+            ])
+        )
+        nonselected_manifest_sha256 = HARNESS.manifest_digest(
+            HARNESS.case_manifest([
+                case for case in cases
+                if case.private_id in (
+                    HARNESS.FROZEN_EXACT_TEDDY_V2_FORCE_NONSELECTED_PRIVATE_IDS
+                )
+            ])
+        )
+        with mock.patch.multiple(
             HARNESS,
-            "FROZEN_EXACT_TEDDY_V2_STRUCTURAL_MANIFEST_SHA256",
-            manifest_sha256,
+            FROZEN_EXACT_TEDDY_V2_STRUCTURAL_MANIFEST_SHA256=(
+                manifest_sha256
+            ),
+            FROZEN_EXACT_TEDDY_V2_FORCE_SELECTED_MANIFEST_SHA256=(
+                selected_manifest_sha256
+            ),
+            FROZEN_EXACT_TEDDY_V2_FORCE_NONSELECTED_MANIFEST_SHA256=(
+                nonselected_manifest_sha256
+            ),
         ):
             automatic = HARNESS.exact_teddy_v2_campaign_record(
                 "automatic", cases
@@ -735,6 +832,23 @@ class HarnessTests(unittest.TestCase):
         self.assertNotEqual(
             automatic["exact_teddy_policy_v2"],
             forced["exact_teddy_policy_v2"],
+        )
+        self.assertEqual(
+            "fixed_44_intention_to_treat", forced["primary_analysis"]
+        )
+        self.assertTrue(forced["result_blind"])
+        self.assertFalse(forced["secondary_strata_result_blind"])
+        self.assertEqual(
+            34,
+            forced["secondary_compiler_fact_strata"]
+            [HARNESS.FROZEN_EXACT_TEDDY_V2_FORCE_SELECTED_COHORT]
+            ["patterns"],
+        )
+        self.assertEqual(
+            10,
+            forced["secondary_compiler_fact_strata"]
+            [HARNESS.FROZEN_EXACT_TEDDY_V2_FORCE_NONSELECTED_COHORT]
+            ["patterns"],
         )
         oot = [case for case in cases if case.private_id.startswith("oot-")]
         wider = [
@@ -1042,6 +1156,85 @@ class HarnessTests(unittest.TestCase):
                     ),
                 )
 
+    def test_v6_force_accepts_only_definitive_expected_nonselection(self) -> None:
+        validation = {
+            "require_current_schema": True,
+            "require_compiler_settlement": True,
+            "expected_exact_teddy_policy_v2": (
+                "force-structurally-eligible"
+            ),
+            "require_forced_exact_teddy_v2_nonselection": True,
+        }
+        for receipt in (
+            forced_exact_teddy_v2_nonselected_ready_receipt(),
+            forced_exact_teddy_v2_compile_decline_receipt(),
+        ):
+            with self.subTest(outcome=receipt["outcome"]):
+                self.assertEqual(
+                    [], HARNESS.validate_receipt(receipt, "auto", **validation)
+                )
+                self.assertTrue(
+                    HARNESS.definitive_forced_exact_teddy_v2_nonselection(
+                        receipt
+                    )
+                )
+
+        selected = forced_exact_teddy_v2_ready_receipt(
+            wait_requested=True, compiler_settled=True,
+        )
+        failures = HARNESS.validate_receipt(
+            selected, "auto", **validation
+        )
+        self.assertIn(
+            "unexpected_forced_exact_teddy_v2_selection", failures
+        )
+        self.assertIn(
+            "forced_exact_teddy_v2_nonselection_not_definitive", failures
+        )
+
+        ambiguous = forced_exact_teddy_v2_compile_decline_receipt(
+            publication_stage="profile_gate",
+            publication_refusal_class="target_profile_unavailable",
+        )
+        self.assertIn(
+            "forced_exact_teddy_v2_nonselection_not_definitive",
+            HARNESS.validate_receipt(ambiguous, "auto", **validation),
+        )
+
+        ready_case = HARNESS.QueryCase(
+            "oot-0002", "frozen-oot-84", "private", 1, None, {}
+        )
+        decline_case = HARNESS.QueryCase(
+            "wider-0121", "frozen-unique-sample-128", "private",
+            1, None, {},
+        )
+        ready = forced_exact_teddy_v2_nonselected_ready_receipt()
+        declined = forced_exact_teddy_v2_compile_decline_receipt()
+        self.assertEqual(
+            [],
+            HARNESS.validate_frozen_forced_exact_teddy_v2_nonselection(
+                ready_case, ready
+            ),
+        )
+        self.assertEqual(
+            [],
+            HARNESS.validate_frozen_forced_exact_teddy_v2_nonselection(
+                decline_case, declined
+            ),
+        )
+        self.assertIn(
+            "forced_exact_teddy_v2_expected_ready_ordered_dfa",
+            HARNESS.validate_frozen_forced_exact_teddy_v2_nonselection(
+                ready_case, declined
+            ),
+        )
+        self.assertIn(
+            "forced_exact_teddy_v2_expected_compile_object_decline",
+            HARNESS.validate_frozen_forced_exact_teddy_v2_nonselection(
+                decline_case, ready
+            ),
+        )
+
     def test_v6_forced_teddy_rejects_v1_leakage_and_binding_changes(self) -> None:
         receipt = forced_exact_teddy_v2_ready_receipt()
         receipt["exact_finite_selected_end_teddy_aot"] = (
@@ -1269,6 +1462,20 @@ class HarnessTests(unittest.TestCase):
         unsettled = unsettled_private["per_profile"]["auto"]
         self.assertEqual(0, unsettled["compiler_selected_exact_teddy"])
         self.assertEqual(1, unsettled["invalid_receipts"])
+
+    def test_exact_teddy_census_aborts_on_validation_failure(self) -> None:
+        HARNESS.require_valid_exact_teddy_census_rows([
+            {"private_id": "q1", "receipt_failures": []},
+        ])
+        with self.assertRaisesRegex(
+            HARNESS.HarnessError, "malformed or unexpected"
+        ):
+            HARNESS.require_valid_exact_teddy_census_rows([
+                {
+                    "private_id": "q1",
+                    "receipt_failures": ["malformed_receipt"],
+                },
+            ])
 
     def test_settlement_receipt_requires_definitive_outcome(self) -> None:
         settled = ready_receipt(
@@ -1760,6 +1967,57 @@ class HarnessTests(unittest.TestCase):
         self.assertEqual(2, result["all_selected"]["count"])
         self.assertEqual({"count": 1}, result["by_cohort"]["primary"])
         self.assertNotIn("raw-one", repr(result))
+
+    def test_v2_aggregate_keeps_fixed44_itt_and_both_strata(self) -> None:
+        cases = synthetic_frozen_exact_teddy_v2_cases()
+        by_id = {case.private_id: case for case in cases}
+
+        def count(rows, ignored):
+            return {"count": len(rows)}
+
+        def aggregate(selected_cases):
+            return HARNESS.aggregate_groups(
+                [
+                    {
+                        "private_id": case.private_id,
+                        "cohort": case.cohort,
+                    }
+                    for case in selected_cases
+                ],
+                by_id,
+                count,
+                include_exact_teddy_v2_force_strata=True,
+            )
+
+        all_rows = aggregate(cases)
+        self.assertEqual(44, all_rows["all_selected"]["count"])
+        strata = all_rows["by_compiler_fact_stratum"]
+        self.assertEqual(
+            34,
+            strata[HARNESS.FROZEN_EXACT_TEDDY_V2_FORCE_SELECTED_COHORT]
+            ["all_selected"]["count"],
+        )
+        self.assertEqual(
+            10,
+            strata[
+                HARNESS.FROZEN_EXACT_TEDDY_V2_FORCE_NONSELECTED_COHORT
+            ]["all_selected"]["count"],
+        )
+
+        oot_rows = aggregate([
+            case for case in cases if case.private_id.startswith("oot-")
+        ])["by_compiler_fact_stratum"]
+        self.assertEqual(
+            11,
+            oot_rows[HARNESS.FROZEN_EXACT_TEDDY_V2_FORCE_SELECTED_COHORT]
+            ["all_selected"]["count"],
+        )
+        self.assertEqual(
+            3,
+            oot_rows[
+                HARNESS.FROZEN_EXACT_TEDDY_V2_FORCE_NONSELECTED_COHORT
+            ]["all_selected"]["count"],
+        )
 
     def test_complete_summary_reports_order_effect_and_stock_ratio(self) -> None:
         def timed(elapsed):

@@ -161,6 +161,58 @@ FROZEN_EXACT_TEDDY_V2_STRUCTURAL_MANIFEST_SHA256 = (
     "35b0037122bf2ab9a2c1641a562f23f12b88856ceb66c713ceb9403adb541823"
 )
 
+# Secondary compiler-fact strata frozen from the untimed, settled,
+# authenticated Force census before any V2 timing. They never replace the
+# result-blind 44-case ITT cohort above. The selected stratum is the exact set
+# that published the forced V2 route on every requested c9g profile; its
+# complement records definitive ordinary-route or compile-decline outcomes.
+FROZEN_EXACT_TEDDY_V2_FORCE_SELECTED_PRIVATE_IDS = frozenset((
+    "oot-0003", "oot-0005", "oot-0008", "oot-0019", "oot-0039",
+    "oot-0043", "oot-0047", "oot-0051", "oot-0052", "oot-0078",
+    "oot-0084", "wider-0001", "wider-0006", "wider-0008",
+    "wider-0010", "wider-0012", "wider-0013", "wider-0014",
+    "wider-0024", "wider-0040", "wider-0042", "wider-0047",
+    "wider-0062", "wider-0064", "wider-0084", "wider-0088",
+    "wider-0092", "wider-0093", "wider-0096", "wider-0108",
+    "wider-0109", "wider-0111", "wider-0113", "wider-0118",
+))
+FROZEN_EXACT_TEDDY_V2_FORCE_NONSELECTED_PRIVATE_IDS = frozenset((
+    "oot-0002", "oot-0004", "oot-0035", "wider-0003",
+    "wider-0030", "wider-0039", "wider-0052", "wider-0058",
+    "wider-0075", "wider-0121",
+))
+FROZEN_EXACT_TEDDY_V2_FORCE_SELECTED_COUNTS = {
+    "total": 34,
+    "oot": 11,
+    "wider": 23,
+}
+FROZEN_EXACT_TEDDY_V2_FORCE_NONSELECTED_COUNTS = {
+    "total": 10,
+    "oot": 3,
+    "wider": 7,
+}
+FROZEN_EXACT_TEDDY_V2_FORCE_SELECTED_COHORT = (
+    "frozen-force-selected-34-v1"
+)
+FROZEN_EXACT_TEDDY_V2_FORCE_NONSELECTED_COHORT = (
+    "frozen-force-nonselected-10-v1"
+)
+FROZEN_EXACT_TEDDY_V2_FORCE_SELECTED_MANIFEST_SHA256 = (
+    "b2e2ab1fcdc39d78e60eadb1bb34aeb3075ebf0133ef67532843d8da952cb951"
+)
+FROZEN_EXACT_TEDDY_V2_FORCE_NONSELECTED_MANIFEST_SHA256 = (
+    "398657722d7192f0b641770e69fc390f808faf249efc02990667c0587a38a795"
+)
+FROZEN_EXACT_TEDDY_V2_FORCE_SELECTED_IDS_SHA256 = (
+    "a1887065aa4765351bc72564a566177334d58f0bc9fc2e119ce8648df647c68c"
+)
+FROZEN_EXACT_TEDDY_V2_FORCE_NONSELECTED_IDS_SHA256 = (
+    "6f3c3f59067b4769721b774a7ad8f3585d598680a4d73edc748a95fcb46b1fe2"
+)
+FROZEN_EXACT_TEDDY_V2_FORCE_COMPILE_DECLINE_PRIVATE_IDS = frozenset((
+    "wider-0121",
+))
+
 EXPECTED_OOT = {
     "window_actions": 161,
     "excluded_threads": 7,
@@ -731,6 +783,125 @@ def frozen_exact_teddy_v2_structural_cohort(
     ]
     validate_frozen_exact_teddy_v2_structural_cohort(frozen)
     return frozen
+
+
+def frozen_private_ids_digest(private_ids: Iterable[str]) -> str:
+    encoded = json.dumps(
+        sorted(private_ids),
+        ensure_ascii=True,
+        separators=(",", ":"),
+    ).encode("ascii")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def validate_frozen_exact_teddy_v2_force_strata(
+    cases: Sequence[QueryCase],
+) -> None:
+    """Authenticate the post-census strata without changing the 44-case ITT.
+
+    The strata are compiler facts frozen before timing, not a new structural
+    selector. Both the public ID sets and the private ordered case manifests
+    are independently pinned so a changed raw expression, weight, semantics,
+    or ordering cannot silently preserve the same labels.
+    """
+    validate_frozen_exact_teddy_v2_structural_cohort(cases)
+    selected_ids = FROZEN_EXACT_TEDDY_V2_FORCE_SELECTED_PRIVATE_IDS
+    nonselected_ids = FROZEN_EXACT_TEDDY_V2_FORCE_NONSELECTED_PRIVATE_IDS
+    if (
+        selected_ids & nonselected_ids
+        or selected_ids | nonselected_ids
+        != FROZEN_EXACT_TEDDY_V2_STRUCTURAL_PRIVATE_IDS
+        or not FROZEN_EXACT_TEDDY_V2_FORCE_COMPILE_DECLINE_PRIVATE_IDS
+        <= nonselected_ids
+        or frozen_private_ids_digest(selected_ids)
+        != FROZEN_EXACT_TEDDY_V2_FORCE_SELECTED_IDS_SHA256
+        or frozen_private_ids_digest(nonselected_ids)
+        != FROZEN_EXACT_TEDDY_V2_FORCE_NONSELECTED_IDS_SHA256
+    ):
+        raise HarnessError("frozen exact Teddy V2 Force stratum IDs changed")
+    strata = (
+        (
+            selected_ids,
+            FROZEN_EXACT_TEDDY_V2_FORCE_SELECTED_COUNTS,
+            FROZEN_EXACT_TEDDY_V2_FORCE_SELECTED_MANIFEST_SHA256,
+        ),
+        (
+            nonselected_ids,
+            FROZEN_EXACT_TEDDY_V2_FORCE_NONSELECTED_COUNTS,
+            FROZEN_EXACT_TEDDY_V2_FORCE_NONSELECTED_MANIFEST_SHA256,
+        ),
+    )
+    for private_ids, counts, expected_manifest_sha256 in strata:
+        stratum = [
+            case for case in cases if case.private_id in private_ids
+        ]
+        if (
+            len(stratum) != counts["total"]
+            or sum(case.private_id.startswith("oot-") for case in stratum)
+            != counts["oot"]
+            or sum(case.private_id.startswith("wider-") for case in stratum)
+            != counts["wider"]
+            or manifest_digest(case_manifest(stratum))
+            != expected_manifest_sha256
+        ):
+            raise HarnessError(
+                "frozen exact Teddy V2 Force stratum manifest changed"
+            )
+
+
+def exact_teddy_v2_force_stratum(private_id: str) -> str:
+    if private_id in FROZEN_EXACT_TEDDY_V2_FORCE_SELECTED_PRIVATE_IDS:
+        return FROZEN_EXACT_TEDDY_V2_FORCE_SELECTED_COHORT
+    if private_id in FROZEN_EXACT_TEDDY_V2_FORCE_NONSELECTED_PRIVATE_IDS:
+        return FROZEN_EXACT_TEDDY_V2_FORCE_NONSELECTED_COHORT
+    raise HarnessError("case is outside the frozen exact Teddy V2 cohort")
+
+
+def forced_exact_teddy_v2_selection_expectation(
+    case: QueryCase,
+    policy: str | None,
+) -> bool | None:
+    if policy != "force-structurally-eligible":
+        return None
+    return (
+        case.private_id
+        in FROZEN_EXACT_TEDDY_V2_FORCE_SELECTED_PRIVATE_IDS
+    )
+
+
+def validate_frozen_forced_exact_teddy_v2_nonselection(
+    case: QueryCase,
+    receipt: Mapping[str, Any] | None,
+) -> list[str]:
+    """Bind each complement case to its frozen terminal compiler fact."""
+    if (
+        case.private_id
+        not in FROZEN_EXACT_TEDDY_V2_FORCE_NONSELECTED_PRIVATE_IDS
+    ):
+        raise HarnessError("nonselection expectation applied outside complement")
+    if not isinstance(receipt, Mapping):
+        return ["forced_exact_teddy_v2_nonselection_receipt_missing"]
+    if (
+        case.private_id
+        in FROZEN_EXACT_TEDDY_V2_FORCE_COMPILE_DECLINE_PRIVATE_IDS
+    ):
+        valid = (
+            receipt.get("outcome") == "declined"
+            and receipt.get("publication_stage") == "compile"
+            and receipt.get("publication_refusal_class") == "compile_object"
+            and receipt.get("decline_reason") == "compile_object"
+        )
+        return [] if valid else [
+            "forced_exact_teddy_v2_expected_compile_object_decline"
+        ]
+    valid = (
+        receipt.get("outcome") == "ready"
+        and receipt.get("compiled_primary_native_route") == "ordered_dfa"
+        and receipt.get("compiled_state_source") == "semantic_dfa"
+    )
+    return [] if valid else [
+        "forced_exact_teddy_v2_expected_ready_ordered_dfa"
+    ]
 
 
 def exact_teddy_v2_campaign_cases(
@@ -1870,6 +2041,41 @@ def validate_compile_receipt_v2(
     return failures
 
 
+def definitive_forced_exact_teddy_v2_nonselection(
+    receipt: Mapping[str, Any],
+) -> bool:
+    """Recognize a settled Force attempt that definitively selected no route.
+
+    Full field authentication remains the caller's responsibility. This
+    classifier only distinguishes a valid-shaped terminal disposition from a
+    missing, unfinished, pre-target, or otherwise ambiguous observation.
+    """
+    if (
+        receipt.get("schema") != RECEIPT_SCHEMA
+        or receipt.get("wait_requested") is not True
+        or receipt.get("compiler_settled") is not True
+        or receipt.get("exact_finite_selected_end_teddy_policy_v2_request")
+        != "force_structurally_eligible"
+        or receipt.get("exact_finite_selected_end_teddy_aot") is not None
+    ):
+        return False
+    compile_receipt_v2 = receipt.get("compile_receipt_v2")
+    if receipt.get("outcome") == "ready":
+        return (
+            isinstance(compile_receipt_v2, Mapping)
+            and compile_receipt_v2.get(
+                "exact_finite_selected_end_teddy_aot_v2"
+            ) is None
+        )
+    return (
+        receipt.get("outcome") == "declined"
+        and receipt.get("publication_stage") == "compile"
+        and isinstance(receipt.get("publication_refusal_class"), str)
+        and str(receipt["publication_refusal_class"]).startswith("compile_")
+        and compile_receipt_v2 is None
+    )
+
+
 def validate_receipt(
     receipt: Mapping[str, Any] | None,
     requested_cpu_profile: str,
@@ -1879,6 +2085,7 @@ def validate_receipt(
     require_compiler_settlement: bool = False,
     expected_exact_teddy_policy_v2: str | None = None,
     require_forced_exact_teddy_v2: bool = False,
+    require_forced_exact_teddy_v2_nonselection: bool = False,
 ) -> list[str]:
     if (
         expected_exact_teddy_policy_v2
@@ -1891,6 +2098,22 @@ def validate_receipt(
     ):
         raise HarnessError(
             "forced exact Teddy V2 validation requires explicit Force policy"
+        )
+    if require_forced_exact_teddy_v2_nonselection and (
+        expected_exact_teddy_policy_v2
+        != "force-structurally-eligible"
+        or not require_current_schema
+        or not require_compiler_settlement
+    ):
+        raise HarnessError(
+            "forced exact Teddy V2 nonselection requires settled current-schema Force evidence"
+        )
+    if (
+        require_forced_exact_teddy_v2
+        and require_forced_exact_teddy_v2_nonselection
+    ):
+        raise HarnessError(
+            "forced exact Teddy V2 selection expectations conflict"
         )
     failures = []
     if receipt is None:
@@ -2087,6 +2310,13 @@ def validate_receipt(
         exact_teddy_v2_report = receipt["compile_receipt_v2"].get(
             "exact_finite_selected_end_teddy_aot_v2"
         )
+    if require_forced_exact_teddy_v2_nonselection:
+        if exact_teddy_v2_report is not None:
+            failures.append("unexpected_forced_exact_teddy_v2_selection")
+        if not definitive_forced_exact_teddy_v2_nonselection(receipt):
+            failures.append(
+                "forced_exact_teddy_v2_nonselection_not_definitive"
+            )
     route_exact_teddy_report = exact_teddy_report
     route_exact_teddy_basis = "automatic_v1"
     if isinstance(exact_teddy_v2_report, Mapping):
@@ -2404,6 +2634,7 @@ def probe_one(
     cpu_profile: str,
     timeout_seconds: float,
     exact_teddy_policy_v2: str | None = None,
+    forced_exact_teddy_v2_selected: bool | None = None,
     collect_timing: bool = True,
 ) -> dict[str, Any]:
     args, normalization = query_args(case, panel)
@@ -2437,9 +2668,16 @@ def probe_one(
         require_compiler_settlement=(exact_teddy_policy_v2 is not None),
         expected_exact_teddy_policy_v2=exact_teddy_policy_v2,
         require_forced_exact_teddy_v2=(
-            exact_teddy_policy_v2 == "force-structurally-eligible"
+            forced_exact_teddy_v2_selected is True
+        ),
+        require_forced_exact_teddy_v2_nonselection=(
+            forced_exact_teddy_v2_selected is False
         ),
     )
+    if forced_exact_teddy_v2_selected is False:
+        failures.extend(validate_frozen_forced_exact_teddy_v2_nonselection(
+            case, background.get("receipt")
+        ))
     return {
         "query_argv_after_binary": list(args),
         "normalization": normalization,
@@ -2485,6 +2723,11 @@ def run_exact_teddy_v2_gate(
         cpu_profile=cpu_profile,
         timeout_seconds=timeout_seconds,
         exact_teddy_policy_v2=exact_teddy_policy_v2,
+        forced_exact_teddy_v2_selected=(
+            True
+            if exact_teddy_policy_v2 == "force-structurally-eligible"
+            else None
+        ),
         collect_timing=False,
     )
     gate = {
@@ -2827,6 +3070,7 @@ def probe_receipt_failures(
     require_compiler_settlement: bool = False,
     expected_exact_teddy_policy_v2: str | None = None,
     require_forced_exact_teddy_v2: bool = False,
+    require_forced_exact_teddy_v2_nonselection: bool = False,
 ) -> list[str]:
     failures = validate_receipt(
         background.get("receipt"),
@@ -2835,6 +3079,9 @@ def probe_receipt_failures(
         require_compiler_settlement=require_compiler_settlement,
         expected_exact_teddy_policy_v2=expected_exact_teddy_policy_v2,
         require_forced_exact_teddy_v2=require_forced_exact_teddy_v2,
+        require_forced_exact_teddy_v2_nonselection=(
+            require_forced_exact_teddy_v2_nonselection
+        ),
     )
     if (
         expected_exact_teddy_policy_v2 is None
@@ -3339,6 +3586,8 @@ def aggregate_groups(
     rows: Sequence[Mapping[str, Any]],
     cases: Mapping[str, QueryCase],
     aggregate: Any,
+    *,
+    include_exact_teddy_v2_force_strata: bool = False,
 ) -> dict[str, Any]:
     cohorts = sorted({str(row["cohort"]) for row in rows})
     combined = aggregate(rows, cases)
@@ -3356,7 +3605,7 @@ def aggregate_groups(
         combined["cross_cohort_occurrence_weighting"] = (
             "not_computed; source windows and inclusion probabilities differ"
         )
-    return {
+    result = {
         "all_selected": combined,
         "by_cohort": {
             cohort: aggregate(
@@ -3365,6 +3614,31 @@ def aggregate_groups(
             for cohort in cohorts
         },
     }
+    if include_exact_teddy_v2_force_strata:
+        unknown_ids = {
+            str(row["private_id"]) for row in rows
+        } - FROZEN_EXACT_TEDDY_V2_STRUCTURAL_PRIVATE_IDS
+        if unknown_ids:
+            raise HarnessError(
+                "exact Teddy V2 aggregate contains a non-frozen case"
+            )
+        result["by_compiler_fact_stratum"] = {
+            stratum: aggregate_groups(
+                [
+                    row for row in rows
+                    if exact_teddy_v2_force_stratum(
+                        str(row["private_id"])
+                    ) == stratum
+                ],
+                cases,
+                aggregate,
+            )
+            for stratum in (
+                FROZEN_EXACT_TEDDY_V2_FORCE_SELECTED_COHORT,
+                FROZEN_EXACT_TEDDY_V2_FORCE_NONSELECTED_COHORT,
+            )
+        }
+    return result
 
 
 def exact_teddy_diagnostic_census(
@@ -3399,6 +3673,7 @@ def exact_teddy_diagnostic_census(
             raise HarnessError("diagnostic census panel is incomplete")
         compiler_selected = []
         published = []
+        definitive_force_nonselected = []
         invalid = []
         routes = Counter()
         outcomes = Counter()
@@ -3437,6 +3712,8 @@ def exact_teddy_diagnostic_census(
             ):
                 invalid.append(qualified_id)
                 continue
+            if definitive_forced_exact_teddy_v2_nonselection(receipt):
+                definitive_force_nonselected.append(qualified_id)
             teddy = receipt.get("exact_finite_selected_end_teddy_aot")
             compile_v2 = receipt.get("compile_receipt_v2")
             if not isinstance(teddy, Mapping) and isinstance(
@@ -3461,11 +3738,15 @@ def exact_teddy_diagnostic_census(
             scanners[str(teddy.get("scanner", "unreported"))] += 1
         compiler_selected.sort()
         published.sort()
+        definitive_force_nonselected.sort()
         invalid.sort()
         common = {
             "selected_queries": len(selected),
             "compiler_selected_exact_teddy": len(compiler_selected),
             "published_exact_teddy": len(published),
+            "definitive_force_nonselected": len(
+                definitive_force_nonselected
+            ),
             "invalid_receipts": len(invalid),
             "primary_native_routes": dict(sorted(routes.items())),
             "outcomes": dict(sorted(outcomes.items())),
@@ -3479,6 +3760,9 @@ def exact_teddy_diagnostic_census(
                 compiler_selected
             ),
             "published_exact_teddy_fully_qualified_ids": published,
+            "definitive_force_nonselected_fully_qualified_ids": (
+                definitive_force_nonselected
+            ),
             "invalid_receipt_fully_qualified_ids": invalid,
         }
         public_profiles[profile] = common
@@ -3679,22 +3963,23 @@ def exact_teddy_v2_campaign_record(
         return None
     if policy not in EXACT_TEDDY_V2_CAMPAIGN_POLICIES:
         raise HarnessError("invalid exact Teddy V2 campaign policy")
-    validate_frozen_exact_teddy_v2_structural_cohort(cases)
-    frozen_ids = sorted(FROZEN_EXACT_TEDDY_V2_STRUCTURAL_PRIVATE_IDS)
-    frozen_ids_sha256 = hashlib.sha256(json.dumps(
-        frozen_ids,
-        ensure_ascii=True,
-        separators=(",", ":"),
-    ).encode("ascii")).hexdigest()
+    validate_frozen_exact_teddy_v2_force_strata(cases)
     return {
         "cohort": FROZEN_EXACT_TEDDY_V2_STRUCTURAL_COHORT,
         "result_blind": True,
+        "primary_analysis": "fixed_44_intention_to_treat",
+        "secondary_strata_result_blind": False,
+        "secondary_strata_source": (
+            "untimed settled authenticated Force census frozen before timing"
+        ),
         "exact_teddy_policy_v2": policy,
         "source_selection_manifest_sha256": (
             FROZEN_EXACT_TEDDY_V2_SOURCE_MANIFEST_SHA256
         ),
         "selection_manifest_sha256": manifest_digest(case_manifest(cases)),
-        "frozen_private_ids_sha256": frozen_ids_sha256,
+        "frozen_private_ids_sha256": frozen_private_ids_digest(
+            FROZEN_EXACT_TEDDY_V2_STRUCTURAL_PRIVATE_IDS
+        ),
         "selected_patterns": FROZEN_EXACT_TEDDY_V2_STRUCTURAL_COUNTS[
             "total"
         ],
@@ -3704,6 +3989,44 @@ def exact_teddy_v2_campaign_record(
             "case-sensitive simple exact alternation with at least four "
             "nonempty exact byte literals and minimum width at least three"
         ),
+        "secondary_compiler_fact_strata": {
+            FROZEN_EXACT_TEDDY_V2_FORCE_SELECTED_COHORT: {
+                "manifest_sha256": (
+                    FROZEN_EXACT_TEDDY_V2_FORCE_SELECTED_MANIFEST_SHA256
+                ),
+                "private_ids_sha256": (
+                    FROZEN_EXACT_TEDDY_V2_FORCE_SELECTED_IDS_SHA256
+                ),
+                "patterns": (
+                    FROZEN_EXACT_TEDDY_V2_FORCE_SELECTED_COUNTS["total"]
+                ),
+                "oot_patterns": (
+                    FROZEN_EXACT_TEDDY_V2_FORCE_SELECTED_COUNTS["oot"]
+                ),
+                "wider_patterns": (
+                    FROZEN_EXACT_TEDDY_V2_FORCE_SELECTED_COUNTS["wider"]
+                ),
+                "role": "secondary_pre_timing_compiler_fact",
+            },
+            FROZEN_EXACT_TEDDY_V2_FORCE_NONSELECTED_COHORT: {
+                "manifest_sha256": (
+                    FROZEN_EXACT_TEDDY_V2_FORCE_NONSELECTED_MANIFEST_SHA256
+                ),
+                "private_ids_sha256": (
+                    FROZEN_EXACT_TEDDY_V2_FORCE_NONSELECTED_IDS_SHA256
+                ),
+                "patterns": (
+                    FROZEN_EXACT_TEDDY_V2_FORCE_NONSELECTED_COUNTS["total"]
+                ),
+                "oot_patterns": (
+                    FROZEN_EXACT_TEDDY_V2_FORCE_NONSELECTED_COUNTS["oot"]
+                ),
+                "wider_patterns": (
+                    FROZEN_EXACT_TEDDY_V2_FORCE_NONSELECTED_COUNTS["wider"]
+                ),
+                "role": "secondary_pre_timing_compiler_fact_complement",
+            },
+        },
     }
 
 
@@ -3987,6 +4310,11 @@ def run_probe(args: argparse.Namespace) -> None:
                         cpu_profile=cpu_profile,
                         timeout_seconds=args.timeout_seconds,
                         exact_teddy_policy_v2=exact_teddy_policy_v2,
+                        forced_exact_teddy_v2_selected=(
+                            forced_exact_teddy_v2_selection_expectation(
+                                case, exact_teddy_policy_v2
+                            )
+                        ),
                         collect_timing=(exact_teddy_policy_v2 is None),
                     )
                     row = {
@@ -4006,7 +4334,12 @@ def run_probe(args: argparse.Namespace) -> None:
                     rows.append(row)
                 key = f"{cpu_profile}/{panel.id}"
                 public_panels[key] = aggregate_groups(
-                    rows, by_id, aggregate_observations
+                    rows,
+                    by_id,
+                    aggregate_observations,
+                    include_exact_teddy_v2_force_strata=(
+                        exact_teddy_policy_v2 is not None
+                    ),
                 )
         target_matrix = target_validation_matrix(
             private_rows, args.cpu_profile
@@ -4051,6 +4384,14 @@ def run_probe(args: argparse.Namespace) -> None:
             "filesystem_cache_state": "cache-hot/uncontrolled after one archive materialization; no eviction between repeated scans",
             "timing_role": "classification/correctness probe only; not formal timing",
             "exact_teddy_v2_campaign": campaign,
+            "exact_teddy_v2_primary_analysis": (
+                "fixed_44_intention_to_treat" if campaign is not None
+                else None
+            ),
+            "exact_teddy_v2_secondary_analysis": (
+                "frozen pre-timing Force selected-34/complement-10 strata"
+                if campaign is not None else None
+            ),
             "exact_teddy_v2_gate": (
                 "fixed untimed settled three-arm correctness barrier; "
                 "policy present only on the background arm"
@@ -4105,6 +4446,25 @@ def census_result(result: Mapping[str, Any]) -> dict[str, Any]:
     }
 
 
+def require_valid_exact_teddy_census_rows(
+    rows: Sequence[Mapping[str, Any]],
+) -> None:
+    invalid_rows = [
+        row for row in rows if row.get("receipt_failures")
+    ]
+    if not invalid_rows:
+        return
+    failures = Counter(
+        failure
+        for row in invalid_rows
+        for failure in row.get("receipt_failures", [])
+    )
+    raise HarnessError(
+        "exact Teddy census contains malformed or unexpected "
+        f"evidence: {dict(sorted(failures.items()))}"
+    )
+
+
 def run_exact_teddy_census(args: argparse.Namespace) -> None:
     oot, wider = selected_cases(args)
     selected = [*oot, *wider]
@@ -4115,6 +4475,8 @@ def run_exact_teddy_census(args: argparse.Namespace) -> None:
         frozen_exact_teddy_v2_structural_cohort(selected)
         if exact_teddy_policy_v2 is not None else selected
     )
+    if exact_teddy_policy_v2 is not None:
+        validate_frozen_exact_teddy_v2_force_strata(all_cases)
     census_oot = [
         case for case in all_cases if case.private_id.startswith("oot-")
     ]
@@ -4164,10 +4526,24 @@ def run_exact_teddy_census(args: argparse.Namespace) -> None:
                     require_compiler_settlement=True,
                     expected_exact_teddy_policy_v2=exact_teddy_policy_v2,
                     require_forced_exact_teddy_v2=(
-                        exact_teddy_policy_v2
-                        == "force-structurally-eligible"
+                        forced_exact_teddy_v2_selection_expectation(
+                            case, exact_teddy_policy_v2
+                        ) is True
+                    ),
+                    require_forced_exact_teddy_v2_nonselection=(
+                        forced_exact_teddy_v2_selection_expectation(
+                            case, exact_teddy_policy_v2
+                        ) is False
                     ),
                 )
+                if forced_exact_teddy_v2_selection_expectation(
+                    case, exact_teddy_policy_v2
+                ) is False:
+                    failures.extend(
+                        validate_frozen_forced_exact_teddy_v2_nonselection(
+                            case, background.get("receipt")
+                        )
+                    )
                 if background.get("receipt_parse_error"):
                     failures.append("malformed_receipt")
                 if background.get("unexpected_temporary_artifacts"):
@@ -4183,6 +4559,7 @@ def run_exact_teddy_census(args: argparse.Namespace) -> None:
                     "receipt_failures": sorted(set(failures)),
                     "background": census_result(background),
                 })
+        require_valid_exact_teddy_census_rows(rows)
         private_census, public_census = exact_teddy_diagnostic_census(
             rows, all_cases, args.cpu_profile
         )
@@ -4224,6 +4601,11 @@ def run_exact_teddy_census(args: argparse.Namespace) -> None:
             "exact_teddy_policy_v2": exact_teddy_policy_v2,
             "fixed_structural_cohort": (
                 exact_teddy_policy_v2 is not None
+            ),
+            "force_nonselection_evidence": (
+                "settled authenticated exact frozen disposition"
+                if exact_teddy_policy_v2 == "force-structurally-eligible"
+                else None
             ),
             "wider_sample_size": args.wider_sample_size,
             "wider_sample_seed": args.wider_sample_seed,
@@ -4401,9 +4783,24 @@ def validate_and_aggregate_private_probe(
             require_compiler_settlement=(exact_teddy_policy_v2 is not None),
             expected_exact_teddy_policy_v2=exact_teddy_policy_v2,
             require_forced_exact_teddy_v2=(
-                exact_teddy_policy_v2 == "force-structurally-eligible"
+                forced_exact_teddy_v2_selection_expectation(
+                    case, exact_teddy_policy_v2
+                ) is True
+            ),
+            require_forced_exact_teddy_v2_nonselection=(
+                forced_exact_teddy_v2_selection_expectation(
+                    case, exact_teddy_policy_v2
+                ) is False
             ),
         )
+        if forced_exact_teddy_v2_selection_expectation(
+            case, exact_teddy_policy_v2
+        ) is False:
+            receipt_failures.extend(
+                validate_frozen_forced_exact_teddy_v2_nonselection(
+                    case, background.get("receipt")
+                )
+            )
         _, normalization = profile_flags(case)
         if (
             original.get("exact_normal_background")
@@ -4431,7 +4828,12 @@ def validate_and_aggregate_private_probe(
                 if row["cpu_profile"] == profile and row["panel"] == panel
             ]
             panels[f"{profile}/{panel}"] = aggregate_groups(
-                panel_rows, by_id, aggregate_observations
+                panel_rows,
+                by_id,
+                aggregate_observations,
+                include_exact_teddy_v2_force_strata=(
+                    exact_teddy_policy_v2 is not None
+                ),
             )
     return panels, target_validation_matrix(validated_rows, cpu_profiles)
 
@@ -4702,7 +5104,12 @@ def run_benchmark(args: argparse.Namespace) -> None:
                     rows.append(row)
                     panel_rows.append(row)
                 public_panels[f"{cpu_profile}/{panel.id}"] = aggregate_groups(
-                    panel_rows, by_id, aggregate_benchmark
+                    panel_rows,
+                    by_id,
+                    aggregate_benchmark,
+                    include_exact_teddy_v2_force_strata=(
+                        exact_teddy_policy_v2 is not None
+                    ),
                 )
         workload_end = load_snapshot()
         revalidate_selection(args, source_oot, source_wider)
@@ -4749,6 +5156,14 @@ def run_benchmark(args: argparse.Namespace) -> None:
             "warmup_pairs": args.warmup_pairs,
             "sample_order": "four-order stock/NB rotation; normal/background always adjacent",
             "primary_aggregation": "median paired ratio per exact pattern, then equal-unique-pattern distribution",
+            "exact_teddy_v2_primary_analysis": (
+                "fixed_44_intention_to_treat" if campaign is not None
+                else None
+            ),
+            "exact_teddy_v2_secondary_analysis": (
+                "frozen pre-timing Force selected-34/complement-10 strata"
+                if campaign is not None else None
+            ),
             "occurrence_weighted_aggregation": "secondary",
             "all_selected_patterns_retained": True,
             "cpu_profiles": args.cpu_profile,
