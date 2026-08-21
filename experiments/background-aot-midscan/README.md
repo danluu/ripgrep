@@ -49,6 +49,7 @@ Run correctness before timing:
 python3 experiments/background-aot-midscan/harness.py correctness \
   --binary target/release/rg \
   --stock-binary /absolute/path/to/upstream/rg \
+  --stock-source /absolute/path/to/upstream/source \
   --output experiments/background-aot-midscan/results/correctness.json
 ```
 
@@ -59,6 +60,7 @@ env -u RG_FRE_AOT_BACKGROUND_TEST_MIN_STOCK_BYTES \
 python3 experiments/background-aot-midscan/harness.py benchmark \
   --binary target/release/rg \
   --stock-binary /absolute/path/to/upstream/rg \
+  --stock-source /absolute/path/to/upstream/source \
   --pairs 31 --warmup-pairs 3 \
   --output experiments/background-aot-midscan/results/benchmark.json
 ```

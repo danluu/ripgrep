@@ -422,6 +422,7 @@ def common_header(
             "python": platform.python_version(),
         },
         "source": git_record(args.cwd),
+        "stock_source": git_record(args.stock_source),
         "fre_dependency": fre_dependency_record(),
         "toolchain": {
             "rustc": command_record(("rustc", "+1.96.0", "-Vv")),
@@ -884,6 +885,7 @@ def parse_args() -> argparse.Namespace:
         child = subparsers.add_parser(mode)
         child.add_argument("--binary", type=Path, required=True)
         child.add_argument("--stock-binary", type=Path, required=True)
+        child.add_argument("--stock-source", type=Path, required=True)
         child.add_argument("--manifest", type=Path, default=DEFAULT_MANIFEST)
         child.add_argument("--output", type=Path, required=True)
         child.add_argument("--cwd", type=Path, default=REPO)
@@ -894,6 +896,7 @@ def parse_args() -> argparse.Namespace:
     args = parser.parse_args()
     args.binary = args.binary.resolve(strict=True)
     args.stock_binary = args.stock_binary.resolve(strict=True)
+    args.stock_source = args.stock_source.resolve(strict=True)
     args.manifest = args.manifest.resolve(strict=True)
     args.cwd = args.cwd.resolve(strict=True)
     args.output = args.output.resolve()
