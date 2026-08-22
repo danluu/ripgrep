@@ -1407,8 +1407,11 @@ mod tests {
             assert!(!profile.options.dot_matches_new_line);
             assert_eq!(profile.options.line_terminator, b'\n');
         }
-        assert_eq!(literal.regex.as_str(), "needle");
-        assert_eq!(alternatives.regex.as_str(), "needle|thread|fiber");
+        assert_eq!(literal.regex.as_str(), "(?:needle)");
+        assert_eq!(
+            alternatives.regex.as_str(),
+            "(?:(?:needle)|(?:thread)|(?:fiber))"
+        );
 
         let reference = grep_regex::RegexMatcherBuilder::new()
             .multi_line(true)
@@ -1420,6 +1423,68 @@ mod tests {
             &reference,
             &[b"needle", b"a needle here", b"thread", b"absent"],
         );
+
+        let alternatives_reference = grep_regex::RegexMatcherBuilder::new()
+            .multi_line(true)
+            .line_terminator(Some(b'\n'))
+            .build_many(&["needle", "thread", "fiber"])
+            .expect("reference alternatives matcher");
+        assert_find_parity(
+            &alternatives.worker().unwrap(),
+            &alternatives_reference,
+            &[b"needle", b"a fiber then needle", b"thread", b"absent"],
+        );
+    }
+
+    #[test]
+    fn standard_literal_handoff_preserves_source_and_resource_boundaries() {
+        let mut below_source = RegexMatcherBuilder::new();
+        below_source.multi_line(true).canonical_pattern_size_limit(5);
+        let error = below_source.build("ab").unwrap_err();
+        assert!(matches!(
+            error,
+            Error::CanonicalPatternLimit { attempted: 6, limit: 5 }
+        ));
+
+        let mut exact_source = RegexMatcherBuilder::new();
+        exact_source.multi_line(true).canonical_pattern_size_limit(6);
+        let exact_source =
+            exact_source.build("ab").expect("exact source boundary");
+        let report = exact_source.regex.build_report();
+        assert_eq!(exact_source.regex.as_str(), "(?:ab)");
+        assert_eq!(report.source_storage_bytes, 6);
+        assert_eq!(report.syntax.parse_work, 9);
+
+        let persistent_bytes = report.charged_persistent_bytes;
+        assert!(persistent_bytes > 0);
+        let mut below_persistent = RegexMatcherBuilder::new();
+        below_persistent.multi_line(true).size_limit(persistent_bytes - 1);
+        assert!(matches!(below_persistent.build("ab"), Err(Error::Build(_))));
+        let mut exact_persistent = RegexMatcherBuilder::new();
+        exact_persistent.multi_line(true).size_limit(persistent_bytes);
+        let exact_persistent =
+            exact_persistent.build("ab").expect("exact persistent boundary");
+        assert_eq!(
+            exact_persistent.regex.build_report().charged_persistent_bytes,
+            persistent_bytes
+        );
+    }
+
+    #[test]
+    fn standard_literal_handoff_matches_reference_across_literal_spellings() {
+        let haystacks: &[&[u8]] =
+            &[b"ab", b"zabz", "zéz".as_bytes(), b"xa|y", b"absent"];
+        for pattern in ["ab", "é", r"a\|"] {
+            let mut fre_builder = RegexMatcherBuilder::new();
+            fre_builder.multi_line(true);
+            let fre = fre_builder.build(pattern).expect("FRE literal matcher");
+            let reference = grep_regex::RegexMatcherBuilder::new()
+                .multi_line(true)
+                .line_terminator(Some(b'\n'))
+                .build(pattern)
+                .expect("reference literal matcher");
+            assert_find_parity(&fre.worker().unwrap(), &reference, haystacks);
+        }
     }
 
     #[test]
@@ -1433,7 +1498,7 @@ mod tests {
             )
             .expect("direct literal construction completes")
             .expect("standard literal HIR is admitted");
-        assert_eq!(literal.as_str(), r"a\|b");
+        assert_eq!(literal.as_str(), r"(?:a\|b)");
         assert_eq!(literal.build_report().plan, PlanKind::ExactLiteral);
         assert_eq!(
             literal
@@ -1454,7 +1519,10 @@ mod tests {
             .build_ripgrep_standard_literal_hir(&alternatives, usize::MAX)
             .expect("direct literal-set construction completes")
             .expect("flat literal alternation is admitted");
-        assert_eq!(alternatives.as_str(), "needle|thread|fiber");
+        assert_eq!(
+            alternatives.as_str(),
+            "(?:(?:needle)|(?:thread)|(?:fiber))"
+        );
         assert!(matches!(
             alternatives.build_report().plan,
             PlanKind::PackedLiteralSet | PlanKind::LiteralSetDfa
@@ -1536,7 +1604,7 @@ mod tests {
                 .multi_line(true)
                 .build_ripgrep_standard_literal_hir(
                     &Hir::literal(b"a|b".to_vec()),
-                    3,
+                    7,
                 )
                 .expect("source-envelope refusal is not a construction error")
                 .is_none()
@@ -1805,11 +1873,42 @@ mod tests {
 
     #[test]
     fn banned_byte_is_a_shared_configuration_error() {
-        let mut builder = RegexMatcherBuilder::new();
-        builder.line_terminator(Some(b'\n')).ban_byte(Some(b'\x00'));
-        let error = builder.build(r"(?-u:\x00)").unwrap_err();
+        for pattern in ["\0", r"(?-u:\x00)"] {
+            let mut builder = RegexMatcherBuilder::new();
+            builder
+                .multi_line(true)
+                .line_terminator(Some(b'\n'))
+                .ban_byte(Some(b'\x00'));
+            let error = builder.build(pattern).unwrap_err();
 
-        assert!(matches!(&error, Error::Regex(_)));
-        assert!(!error.is_bridge_refusal());
+            assert!(matches!(&error, Error::Regex(_)));
+            assert!(!error.is_bridge_refusal());
+        }
+
+        let mut unbanned_builder = RegexMatcherBuilder::new();
+        unbanned_builder.multi_line(true);
+        let unbanned = unbanned_builder.build("\0").expect("unbanned raw NUL");
+        assert_eq!(unbanned.regex.as_str().as_bytes(), b"\0");
+        assert_eq!(
+            unbanned
+                .worker()
+                .unwrap()
+                .find(b"x\0y")
+                .unwrap()
+                .map(|matched| (matched.start(), matched.end())),
+            Some((1, 2))
+        );
+
+        let mut binary_builder = RegexMatcherBuilder::new();
+        binary_builder.multi_line(true).ban_byte(Some(b'\x00'));
+        let binary = binary_builder
+            .build("needle")
+            .expect("absent byte ban keeps the literal handoff eligible");
+        let fre::CompatibilityProfile::RustBytes(profile) =
+            &binary.regex.build_report().profile
+        else {
+            panic!("portable byte matcher retained a non-byte profile");
+        };
+        assert!(profile.options.multi_line);
     }
 }

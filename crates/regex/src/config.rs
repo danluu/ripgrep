@@ -177,6 +177,9 @@ impl ConfiguredHIR {
                 alts.len()
             );
             let hir = Hir::alternation(alts);
+            if let Some(byte) = config.ban {
+                ban::check(&hir, byte)?;
+            }
             hir
         } else {
             let pattern = alternation_pattern(&config, patterns);
@@ -421,7 +424,10 @@ fn has_line_terminator(lineterm: LineTerminator, literal: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use {grep_matcher::Matcher, regex_syntax::ast};
+    use {
+        grep_matcher::Matcher,
+        regex_syntax::{ast, hir::HirKind},
+    };
 
     use super::*;
 
@@ -615,5 +621,30 @@ mod tests {
         let mut changed = standard();
         changed.ban = Some(b'x');
         assert!(!eligible(changed));
+    }
+
+    #[test]
+    fn fixed_literals_enforce_the_configured_byte_ban() {
+        let mut banned = standard();
+        banned.ban = Some(b'\0');
+        assert!(banned.build_many(&["\0"]).is_err());
+        assert!(banned.build_many(&["needle", "\0"]).is_err());
+
+        let mut explicitly_fixed = banned.clone();
+        explicitly_fixed.fixed_strings = true;
+        assert!(explicitly_fixed.build_many(&["\0"]).is_err());
+
+        let unbanned = standard()
+            .build_many(&["\0"])
+            .expect("raw NUL remains valid without a byte ban");
+        let HirKind::Literal(literal) = unbanned.hir().kind() else {
+            panic!("one raw fixed literal did not remain a literal HIR");
+        };
+        assert_eq!(literal.0.as_ref(), b"\0");
+
+        let eligible = banned
+            .build_many(&["needle"])
+            .expect("an absent banned byte does not reject a literal");
+        assert!(eligible.is_fre_standard_literal_handoff_config());
     }
 }
