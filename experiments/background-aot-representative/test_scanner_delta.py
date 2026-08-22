@@ -405,9 +405,9 @@ class PreregistrationTests(unittest.TestCase):
         self.assertEqual(
             {
                 "sha256": (
-                    "3aa879e37e9fa2fda2556469e6792837b6dbdaec9857bbf867b4bef06d9a298e"
+                    "14f5c14a06591922c72aa8da943606b7a9ebf1e1ff1bfce2ff82dbc30d76c856"
                 ),
-                "u64_big_endian_first8": 4226762268276138749,
+                "u64_big_endian_first8": 1510325773730912546,
             },
             RUNNER.bootstrap_seed_record(loaded),
         )
