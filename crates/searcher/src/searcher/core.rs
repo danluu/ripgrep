@@ -154,20 +154,6 @@ impl<'s, M: Matcher, S: Sink> Core<'s, M, S> {
         }
     }
 
-    fn shortest_match(
-        &mut self,
-        slice: &[u8],
-    ) -> Result<Option<usize>, S::Error> {
-        if self.has_exceeded_match_limit() {
-            return Ok(None);
-        }
-        match self.matcher.shortest_match(slice) {
-            Err(err) => return Err(S::Error::error_message(err)),
-            Ok(None) => return Ok(None),
-            Ok(Some(m)) => Ok(Some(m)),
-        }
-    }
-
     pub(crate) fn begin(&mut self) -> Result<bool, S::Error> {
         self.sink.begin(&self.searcher)
     }
@@ -359,7 +345,9 @@ impl<'s, M: Matcher, S: Sink> Core<'s, M, S> {
             {
                 return Ok(false);
             }
-            let matched = {
+            let matched = if self.has_exceeded_match_limit() {
+                false
+            } else {
                 // Stripping the line terminator is necessary to prevent some
                 // classes of regexes from matching the empty position *after*
                 // the end of the line. For example, `(?m)^$` will match at
@@ -368,7 +356,9 @@ impl<'s, M: Matcher, S: Sink> Core<'s, M, S> {
                     &buf[line],
                     self.config.line_term,
                 );
-                self.shortest_match(slice)?.is_some()
+                self.matcher
+                    .is_match(slice)
+                    .map_err(S::Error::error_message)?
             };
             self.set_pos(line.end());
 

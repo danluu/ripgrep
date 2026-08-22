@@ -727,8 +727,153 @@ impl TesterConfig {
 mod tests {
     use super::*;
 
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    struct BooleanProbeError;
+
+    impl std::fmt::Display for BooleanProbeError {
+        fn fmt(
+            &self,
+            formatter: &mut std::fmt::Formatter<'_>,
+        ) -> std::fmt::Result {
+            formatter.write_str("forced boolean matcher failure")
+        }
+    }
+
+    #[derive(Debug)]
+    struct BooleanProbeMatcher {
+        regex: Regex,
+        fail_on: Option<Vec<u8>>,
+        is_match_calls: std::cell::Cell<usize>,
+        shortest_match_calls: std::cell::Cell<usize>,
+        haystacks: std::cell::RefCell<Vec<Vec<u8>>>,
+    }
+
+    impl BooleanProbeMatcher {
+        fn new(pattern: &str) -> BooleanProbeMatcher {
+            BooleanProbeMatcher {
+                regex: Regex::new(pattern).unwrap(),
+                fail_on: None,
+                is_match_calls: std::cell::Cell::new(0),
+                shortest_match_calls: std::cell::Cell::new(0),
+                haystacks: std::cell::RefCell::new(Vec::new()),
+            }
+        }
+
+        fn fail_on(mut self, haystack: &[u8]) -> BooleanProbeMatcher {
+            self.fail_on = Some(haystack.to_vec());
+            self
+        }
+    }
+
+    impl Matcher for BooleanProbeMatcher {
+        type Captures = NoCaptures;
+        type Error = BooleanProbeError;
+
+        fn find_at(
+            &self,
+            haystack: &[u8],
+            at: usize,
+        ) -> Result<Option<Match>, BooleanProbeError> {
+            Ok(self
+                .regex
+                .find_at(haystack, at)
+                .map(|matched| Match::new(matched.start(), matched.end())))
+        }
+
+        fn new_captures(&self) -> Result<NoCaptures, BooleanProbeError> {
+            Ok(NoCaptures::new())
+        }
+
+        fn is_match(
+            &self,
+            haystack: &[u8],
+        ) -> Result<bool, BooleanProbeError> {
+            self.is_match_calls
+                .set(self.is_match_calls.get().saturating_add(1));
+            self.haystacks.borrow_mut().push(haystack.to_vec());
+            if self.fail_on.as_deref() == Some(haystack) {
+                return Err(BooleanProbeError);
+            }
+            Ok(self.regex.is_match(haystack))
+        }
+
+        fn shortest_match_at(
+            &self,
+            haystack: &[u8],
+            at: usize,
+        ) -> Result<Option<usize>, BooleanProbeError> {
+            self.shortest_match_calls
+                .set(self.shortest_match_calls.get().saturating_add(1));
+            Ok(self.regex.find_at(haystack, at).map(|matched| matched.end()))
+        }
+    }
+
     fn m(start: usize, end: usize) -> Match {
         Match::new(start, end)
+    }
+
+    #[test]
+    fn slow_line_search_uses_boolean_projection_with_exact_boundaries_and_errors()
+     {
+        let haystack = b"hit one\nmiss\nlast hit";
+        let probe = BooleanProbeMatcher::new("hit");
+        let mut probe_sink = KitchenSink::new();
+        let mut probe_searcher = SearcherBuilder::new().passthru(true).build();
+        probe_searcher
+            .search_slice(&probe, haystack, &mut probe_sink)
+            .unwrap();
+
+        let baseline = RegexMatcher::new("hit");
+        let mut baseline_sink = KitchenSink::new();
+        let mut baseline_searcher =
+            SearcherBuilder::new().passthru(true).build();
+        baseline_searcher
+            .search_slice(&baseline, haystack, &mut baseline_sink)
+            .unwrap();
+
+        assert_eq!(probe_sink.as_bytes(), baseline_sink.as_bytes());
+        assert_eq!(probe.is_match_calls.get(), 3);
+        assert_eq!(probe.shortest_match_calls.get(), 0);
+        assert_eq!(
+            probe.haystacks.borrow().as_slice(),
+            [b"hit one".as_slice(), b"miss", b"last hit"],
+            "the boolean matcher must receive one terminator-free line at a time",
+        );
+
+        let limited = BooleanProbeMatcher::new("hit");
+        let mut limited_sink = KitchenSink::new();
+        let mut limited_builder = SearcherBuilder::new();
+        limited_builder.passthru(true).max_matches(Some(1));
+        limited_builder
+            .build()
+            .search_slice(
+                &limited,
+                b"hit one\nhit two\nmiss",
+                &mut limited_sink,
+            )
+            .unwrap();
+        assert_eq!(
+            limited.is_match_calls.get(),
+            1,
+            "the post-limit passthru must retain the old no-search projection",
+        );
+        assert_eq!(limited.shortest_match_calls.get(), 0);
+
+        let failing = BooleanProbeMatcher::new("hit").fail_on(b"boom");
+        let mut failing_sink = KitchenSink::new();
+        let error = SearcherBuilder::new()
+            .passthru(true)
+            .build()
+            .search_slice(&failing, b"ok\nboom\nlater", &mut failing_sink)
+            .unwrap_err();
+        assert!(error.to_string().contains("forced boolean matcher failure"));
+        assert_eq!(failing.is_match_calls.get(), 2);
+        assert_eq!(failing.shortest_match_calls.get(), 0);
+        assert_eq!(
+            failing.haystacks.borrow().as_slice(),
+            [b"ok".as_slice(), b"boom"],
+            "the matcher error must stop before the next line",
+        );
     }
 
     #[test]
