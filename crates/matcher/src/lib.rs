@@ -1128,6 +1128,25 @@ pub trait Matcher {
     ) -> Result<Option<LineMatchKind>, Self::Error> {
         Ok(self.shortest_match(haystack)?.map(LineMatchKind::Confirmed))
     }
+
+    /// Like [`Matcher::find_candidate_line`], but may also return the actual
+    /// selected match used to confirm the line.
+    ///
+    /// The selected match, when present, uses offsets into `haystack`. It must
+    /// be the same first match that [`Matcher::find`] would return, and the
+    /// accompanying line match kind must be confirmed. Callers may use the
+    /// selected match to continue non-overlapping iteration without searching
+    /// for it again.
+    ///
+    /// By default, this preserves `find_candidate_line` behavior and does not
+    /// provide a selected match.
+    #[inline]
+    fn find_candidate_line_with_match(
+        &self,
+        haystack: &[u8],
+    ) -> Result<Option<(LineMatchKind, Option<Match>)>, Self::Error> {
+        Ok(self.find_candidate_line(haystack)?.map(|kind| (kind, None)))
+    }
 }
 
 impl<'a, M: Matcher> Matcher for &'a M {
@@ -1375,5 +1394,13 @@ impl<'a, M: Matcher> Matcher for &'a M {
         haystack: &[u8],
     ) -> Result<Option<LineMatchKind>, Self::Error> {
         (*self).find_candidate_line(haystack)
+    }
+
+    #[inline]
+    fn find_candidate_line_with_match(
+        &self,
+        haystack: &[u8],
+    ) -> Result<Option<(LineMatchKind, Option<Match>)>, Self::Error> {
+        (*self).find_candidate_line_with_match(haystack)
     }
 }

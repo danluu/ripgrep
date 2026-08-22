@@ -17,12 +17,18 @@ enum FastMatchResult {
     SwitchToSlow,
 }
 
+struct FastLineMatch {
+    line: Range,
+    selected_match: Option<Range>,
+}
+
 #[derive(Debug)]
 pub(crate) struct Core<'s, M: 's, S> {
     config: &'s Config,
     matcher: M,
     searcher: &'s Searcher,
     sink: S,
+    wants_selected_match: bool,
     binary: bool,
     pos: usize,
     absolute_byte_offset: u64,
@@ -45,11 +51,13 @@ impl<'s, M: Matcher, S: Sink> Core<'s, M, S> {
     ) -> Core<'s, M, S> {
         let line_number =
             if searcher.config.line_number { Some(1) } else { None };
+        let wants_selected_match = sink.wants_selected_match();
         let core = Core {
             config: &searcher.config,
             matcher,
             searcher,
             sink,
+            wants_selected_match,
             binary,
             pos: 0,
             absolute_byte_offset: 0,
@@ -397,7 +405,8 @@ impl<'s, M: Matcher, S: Sink> Core<'s, M, S> {
                 if !self.match_by_line_fast_invert(buf)? {
                     break;
                 }
-            } else if let Some(line) = self.find_by_line_fast(buf)? {
+            } else if let Some(found) = self.find_by_line_fast(buf)? {
+                let FastLineMatch { line, selected_match } = found;
                 self.has_matched = true;
                 self.increment_count();
                 if self.config.max_context() > 0 {
@@ -409,7 +418,11 @@ impl<'s, M: Matcher, S: Sink> Core<'s, M, S> {
                     }
                 }
                 self.set_pos(line.end());
-                if !self.sink_matched(buf, &line)? {
+                if !self.sink_matched_with_selected(
+                    buf,
+                    &line,
+                    selected_match,
+                )? {
                     return Ok(Stop);
                 }
             } else {
@@ -439,7 +452,8 @@ impl<'s, M: Matcher, S: Sink> Core<'s, M, S> {
                 self.set_pos(range.end());
                 range
             }
-            Some(line) => {
+            Some(found) => {
+                let line = found.line;
                 let range = Range::new(self.pos(), line.start());
                 self.set_pos(line.end());
                 range
@@ -476,7 +490,7 @@ impl<'s, M: Matcher, S: Sink> Core<'s, M, S> {
     fn find_by_line_fast(
         &mut self,
         buf: &[u8],
-    ) -> Result<Option<Range>, S::Error> {
+    ) -> Result<Option<FastLineMatch>, S::Error> {
         debug_assert!(!self.searcher.multi_line_with_matcher(&self.matcher));
         debug_assert!(self.is_line_by_line_fast());
 
@@ -485,10 +499,17 @@ impl<'s, M: Matcher, S: Sink> Core<'s, M, S> {
             if self.has_exceeded_match_limit() {
                 return Ok(None);
             }
-            match self.matcher.find_candidate_line(&buf[pos..]) {
+            let found = if self.wants_selected_match {
+                self.matcher.find_candidate_line_with_match(&buf[pos..])
+            } else {
+                self.matcher
+                    .find_candidate_line(&buf[pos..])
+                    .map(|found| found.map(|kind| (kind, None)))
+            };
+            match found {
                 Err(err) => return Err(S::Error::error_message(err)),
                 Ok(None) => return Ok(None),
-                Ok(Some(LineMatchKind::Confirmed(i))) => {
+                Ok(Some((LineMatchKind::Confirmed(i), selected_match))) => {
                     let line = lines::locate(
                         buf,
                         self.config.line_term.as_byte(),
@@ -500,16 +521,31 @@ impl<'s, M: Matcher, S: Sink> Core<'s, M, S> {
                         pos = buf.len();
                         continue;
                     }
-                    return Ok(Some(line));
+                    let selected_match = selected_match.and_then(|m| {
+                        let m = m.offset(pos);
+                        if m.start() < m.end()
+                            && pos <= line.start()
+                            && line.start() <= m.start()
+                            && m.end() <= line.end()
+                        {
+                            Some(m)
+                        } else {
+                            None
+                        }
+                    });
+                    return Ok(Some(FastLineMatch { line, selected_match }));
                 }
-                Ok(Some(LineMatchKind::Candidate(i))) => {
+                Ok(Some((LineMatchKind::Candidate(i), _))) => {
                     let line = lines::locate(
                         buf,
                         self.config.line_term.as_byte(),
                         Range::zero(i).offset(pos),
                     );
                     if self.is_match(&buf[line])? {
-                        return Ok(Some(line));
+                        return Ok(Some(FastLineMatch {
+                            line,
+                            selected_match: None,
+                        }));
                     }
                     pos = line.end();
                 }
@@ -523,6 +559,16 @@ impl<'s, M: Matcher, S: Sink> Core<'s, M, S> {
         &mut self,
         buf: &[u8],
         range: &Range,
+    ) -> Result<bool, S::Error> {
+        self.sink_matched_with_selected(buf, range, None)
+    }
+
+    #[inline(always)]
+    fn sink_matched_with_selected(
+        &mut self,
+        buf: &[u8],
+        range: &Range,
+        selected_match: Option<Range>,
     ) -> Result<bool, S::Error> {
         if self.binary && self.detect_binary(buf, range)? {
             return Ok(false);
@@ -542,6 +588,7 @@ impl<'s, M: Matcher, S: Sink> Core<'s, M, S> {
                 line_number: self.line_number,
                 buffer: buf,
                 bytes_range_in_buffer: range.start()..range.end(),
+                selected_match,
             },
         )?;
         if !keepgoing {

@@ -127,6 +127,18 @@ pub trait Sink {
         _mat: &SinkMatch<'_>,
     ) -> Result<bool, Self::Error>;
 
+    /// Returns true when this sink can use the selected first match for each
+    /// reported matching line.
+    ///
+    /// This is an optimization hint. Searchers may still omit the selected
+    /// match, and sinks must preserve their behavior in that case. When the
+    /// hint is enabled and the matcher can provide it cheaply, the match is
+    /// exposed through [`SinkMatch::selected_match`].
+    #[inline]
+    fn wants_selected_match(&self) -> bool {
+        false
+    }
+
     /// This method is called whenever a context line is found, and is optional
     /// to implement. By default, it does nothing and returns `true`.
     ///
@@ -226,6 +238,11 @@ impl<'a, S: Sink> Sink for &'a mut S {
     type Error = S::Error;
 
     #[inline]
+    fn wants_selected_match(&self) -> bool {
+        (**self).wants_selected_match()
+    }
+
+    #[inline]
     fn matched(
         &mut self,
         searcher: &Searcher,
@@ -277,6 +294,11 @@ impl<'a, S: Sink> Sink for &'a mut S {
 
 impl<S: Sink + ?Sized> Sink for Box<S> {
     type Error = S::Error;
+
+    #[inline]
+    fn wants_selected_match(&self) -> bool {
+        (**self).wants_selected_match()
+    }
 
     #[inline]
     fn matched(
@@ -370,6 +392,7 @@ pub struct SinkMatch<'b> {
     pub(crate) line_number: Option<u64>,
     pub(crate) buffer: &'b [u8],
     pub(crate) bytes_range_in_buffer: std::ops::Range<usize>,
+    pub(crate) selected_match: Option<grep_matcher::Match>,
 }
 
 impl<'b> SinkMatch<'b> {
@@ -422,6 +445,17 @@ impl<'b> SinkMatch<'b> {
     #[inline]
     pub fn bytes_range_in_buffer(&self) -> std::ops::Range<usize> {
         self.bytes_range_in_buffer.clone()
+    }
+
+    /// Returns the selected first match for this matching line, when the sink
+    /// requested one and the matcher supplied one.
+    ///
+    /// The returned offsets index [`SinkMatch::buffer`], not
+    /// [`SinkMatch::bytes`]. This is an optional optimization hint; callers
+    /// must retain a correct fallback when it is absent.
+    #[inline]
+    pub fn selected_match(&self) -> Option<grep_matcher::Match> {
+        self.selected_match
     }
 }
 

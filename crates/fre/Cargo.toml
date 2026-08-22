@@ -14,4 +14,5 @@ grep-regex = { version = "0.1.14", path = "../regex" }
 regex-syntax = "0.8.0"
 
 [dev-dependencies]
+grep-printer = { version = "0.3.1", path = "../printer" }
 grep-searcher = { version = "0.1.17", path = "../searcher" }

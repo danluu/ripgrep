@@ -473,14 +473,32 @@ pub(crate) fn trim_ascii_prefix(
 pub(crate) fn find_iter_at_in_context<M, F>(
     searcher: &Searcher,
     matcher: M,
+    bytes: &[u8],
+    range: std::ops::Range<usize>,
+    matched: F,
+) -> io::Result<()>
+where
+    M: Matcher,
+    F: FnMut(Match) -> bool,
+{
+    let at = range.start;
+    find_iter_at_in_context_from(searcher, matcher, bytes, range, at, matched)
+}
+
+pub(crate) fn find_iter_at_in_context_from<M, F>(
+    searcher: &Searcher,
+    matcher: M,
     mut bytes: &[u8],
     range: std::ops::Range<usize>,
+    at: usize,
     mut matched: F,
 ) -> io::Result<()>
 where
     M: Matcher,
     F: FnMut(Match) -> bool,
 {
+    debug_assert!(range.start <= at);
+    debug_assert!(at <= range.end);
     // This strange dance is to account for the possibility of look-ahead in
     // the regex. The problem here is that mat.bytes() doesn't include the
     // lines beyond the match boundaries in multi-line mode, which means that
@@ -520,7 +538,7 @@ where
         bytes = &bytes[..m.end()];
     }
     matcher
-        .find_iter_at(bytes, range.start, |m| {
+        .find_iter_at(bytes, at, |m| {
             if m.start() >= range.end {
                 return false;
             }

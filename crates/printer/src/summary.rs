@@ -17,7 +17,7 @@ use crate::{
     counter::CounterWriter,
     hyperlink::{self, HyperlinkConfig},
     stats::Stats,
-    util::{PrinterPath, find_iter_at_in_context},
+    util::{PrinterPath, find_iter_at_in_context_from},
 };
 
 /// The configuration for the summary printer.
@@ -630,6 +630,11 @@ impl<'p, 's, M: Matcher, W: WriteColor> SummarySink<'p, 's, M, W> {
 impl<'p, 's, M: Matcher, W: WriteColor> Sink for SummarySink<'p, 's, M, W> {
     type Error = io::Error;
 
+    #[inline]
+    fn wants_selected_match(&self) -> bool {
+        self.summary.config.kind == SummaryKind::CountMatches
+    }
+
     fn matched(
         &mut self,
         searcher: &Searcher,
@@ -646,11 +651,21 @@ impl<'p, 's, M: Matcher, W: WriteColor> Sink for SummarySink<'p, 's, M, W> {
             let buf = mat.buffer();
             let range = mat.bytes_range_in_buffer();
             let mut count = 0;
-            find_iter_at_in_context(
+            let selected_match = mat.selected_match().filter(|m| {
+                m.start() < m.end()
+                    && range.start <= m.start()
+                    && m.end() <= range.end
+            });
+            let at = selected_match.map_or(range.start, |m| {
+                count = 1;
+                m.end()
+            });
+            find_iter_at_in_context_from(
                 searcher,
                 &self.matcher,
                 buf,
                 range,
+                at,
                 |_| {
                     count += 1;
                     true

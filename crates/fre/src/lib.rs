@@ -9,7 +9,8 @@ use fre::{
     PortableOrdinarySession, PortableRegex, SearchError,
 };
 use grep_matcher::{
-    ByteSet, LineTerminator, Match as GrepMatch, Matcher, NoCaptures,
+    ByteSet, LineMatchKind, LineTerminator, Match as GrepMatch, Matcher,
+    NoCaptures,
 };
 use regex_syntax::hir::{Hir, HirKind};
 
@@ -135,6 +136,11 @@ impl RegexMatcherBuilder {
             }
         }
         let non_matching_bytes = configured.non_matching_bytes();
+        let matches_are_nonempty = configured
+            .hir()
+            .properties()
+            .minimum_len()
+            .map_or(false, |len| len > 0);
         let source = canonical_hir_pattern(
             configured.hir(),
             self.max_canonical_pattern_bytes,
@@ -156,6 +162,7 @@ impl RegexMatcherBuilder {
             regex: Arc::new(regex),
             line_terminator,
             non_matching_bytes,
+            matches_are_nonempty,
         })
     }
 
@@ -303,6 +310,7 @@ pub struct RegexMatcher {
     regex: Arc<PortableRegex>,
     line_terminator: Option<LineTerminator>,
     non_matching_bytes: ByteSet,
+    matches_are_nonempty: bool,
 }
 
 impl fmt::Debug for RegexMatcher {
@@ -323,6 +331,7 @@ impl RegexMatcher {
             session: RefCell::new(session),
             line_terminator: self.line_terminator,
             non_matching_bytes: &self.non_matching_bytes,
+            matches_are_nonempty: self.matches_are_nonempty,
         })
     }
 }
@@ -333,6 +342,7 @@ pub struct RegexMatcherWorker<'r> {
     session: RefCell<PortableOrdinarySession<'r>>,
     line_terminator: Option<LineTerminator>,
     non_matching_bytes: &'r ByteSet,
+    matches_are_nonempty: bool,
 }
 
 /// Search failure from one FRE matcher worker.
@@ -495,12 +505,28 @@ impl Matcher for RegexMatcherWorker<'_> {
     fn line_terminator(&self) -> Option<LineTerminator> {
         self.line_terminator
     }
+
+    #[inline]
+    fn find_candidate_line_with_match(
+        &self,
+        haystack: &[u8],
+    ) -> Result<Option<(LineMatchKind, Option<GrepMatch>)>, Self::Error> {
+        if !self.matches_are_nonempty {
+            return Ok(self
+                .shortest_match_at(haystack, 0)?
+                .map(|end| (LineMatchKind::Confirmed(end), None)));
+        }
+        Ok(self.find_at(haystack, 0)?.map(|matched| {
+            (LineMatchKind::Confirmed(matched.end()), Some(matched))
+        }))
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use fre::PortableFindIterError;
-    use grep_matcher::{LineTerminator, Matcher};
+    use grep_matcher::{LineMatchKind, LineTerminator, Matcher};
+    use grep_printer::{SummaryBuilder, SummaryKind};
     use grep_searcher::SearcherBuilder;
 
     use super::{Error, MatchError, RegexMatcher, RegexMatcherBuilder};
@@ -529,6 +555,19 @@ mod tests {
                 "{haystack:?}"
             );
         }
+    }
+
+    fn count_matches(pattern: &str, haystack: &[u8]) -> Vec<u8> {
+        let factory = RegexMatcher::new(pattern).expect("FRE matcher");
+        let worker = factory.worker().expect("FRE worker");
+        let mut printer = SummaryBuilder::new()
+            .kind(SummaryKind::CountMatches)
+            .build_no_color(Vec::new());
+        SearcherBuilder::new()
+            .build()
+            .search_reader(&worker, haystack, printer.sink(&worker))
+            .expect("count matches search");
+        printer.into_inner().into_inner()
     }
 
     #[test]
@@ -623,6 +662,48 @@ mod tests {
             .unwrap();
         assert!(saw_reentrant);
         assert!(worker.is_match(b"ae").unwrap());
+    }
+
+    #[test]
+    fn positive_line_candidate_carries_the_selected_span() {
+        let factory = RegexMatcher::new("a+").unwrap();
+        let worker = factory.worker().unwrap();
+        let (kind, selected) = worker
+            .find_candidate_line_with_match(b"zaaaa aa\n")
+            .unwrap()
+            .unwrap();
+        assert!(matches!(kind, LineMatchKind::Confirmed(5)));
+        let selected = selected.expect("positive matcher selected span");
+        assert_eq!((selected.start(), selected.end()), (1, 5));
+
+        let mut saw_reentrant = false;
+        worker
+            .try_find_iter(b"aaaa", |_| {
+                saw_reentrant = matches!(
+                    worker.find_candidate_line_with_match(b"aaaa"),
+                    Err(MatchError::Reentrant)
+                );
+                Ok::<bool, ()>(false)
+            })
+            .unwrap()
+            .unwrap();
+        assert!(saw_reentrant);
+        assert!(worker.is_match(b"aa").unwrap());
+    }
+
+    #[test]
+    fn count_matches_continues_after_the_selected_end() {
+        assert_eq!(count_matches("a+", b"aaaa aa\nbaaa\nnone\n"), b"3\n");
+    }
+
+    #[test]
+    fn nullable_count_matches_keeps_canonical_empty_progress() {
+        let factory = RegexMatcher::new("a*").unwrap();
+        let worker = factory.worker().unwrap();
+        let (_, selected) =
+            worker.find_candidate_line_with_match(b"bbb\n").unwrap().unwrap();
+        assert_eq!(selected, None);
+        assert_eq!(count_matches("a*", b"bbb\n"), b"4\n");
     }
 
     #[test]
