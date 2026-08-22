@@ -1,6 +1,6 @@
 use std::io;
 
-use grep_matcher::LineTerminator;
+use grep_matcher::{LineTerminator, SelectedMatchOwner};
 
 use crate::{
     lines::LineIter,
@@ -127,16 +127,16 @@ pub trait Sink {
         _mat: &SinkMatch<'_>,
     ) -> Result<bool, Self::Error>;
 
-    /// Returns true when this sink can use the selected first match for each
-    /// reported matching line.
+    /// Returns the matcher identity accepted for selected-match hints.
     ///
-    /// This is an optimization hint. Searchers may still omit the selected
-    /// match, and sinks must preserve their behavior in that case. When the
-    /// hint is enabled and the matcher can provide it cheaply, the match is
-    /// exposed through [`SinkMatch::selected_match`].
+    /// This is an optimization hint. A searcher only exposes a selected match
+    /// through [`SinkMatch::selected_match`] when its matcher reports the same
+    /// identity. Searchers may still omit the hint, so sinks must preserve
+    /// their behavior when it is absent. The default implementation disables
+    /// this optional optimization.
     #[inline]
-    fn wants_selected_match(&self) -> bool {
-        false
+    fn selected_match_owner(&self) -> Option<&SelectedMatchOwner> {
+        None
     }
 
     /// This method is called whenever a context line is found, and is optional
@@ -238,8 +238,8 @@ impl<'a, S: Sink> Sink for &'a mut S {
     type Error = S::Error;
 
     #[inline]
-    fn wants_selected_match(&self) -> bool {
-        (**self).wants_selected_match()
+    fn selected_match_owner(&self) -> Option<&SelectedMatchOwner> {
+        (**self).selected_match_owner()
     }
 
     #[inline]
@@ -296,8 +296,8 @@ impl<S: Sink + ?Sized> Sink for Box<S> {
     type Error = S::Error;
 
     #[inline]
-    fn wants_selected_match(&self) -> bool {
-        (**self).wants_selected_match()
+    fn selected_match_owner(&self) -> Option<&SelectedMatchOwner> {
+        (**self).selected_match_owner()
     }
 
     #[inline]
@@ -448,7 +448,8 @@ impl<'b> SinkMatch<'b> {
     }
 
     /// Returns the selected first match for this matching line, when the sink
-    /// requested one and the matcher supplied one.
+    /// and matcher reported the same owner identity and the matcher supplied
+    /// one.
     ///
     /// The returned offsets index [`SinkMatch::buffer`], not
     /// [`SinkMatch::bytes`]. This is an optional optimization hint; callers

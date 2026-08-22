@@ -7,7 +7,7 @@ use std::{
 };
 
 use {
-    grep_matcher::Matcher,
+    grep_matcher::{Matcher, SelectedMatchOwner},
     grep_searcher::{Searcher, Sink, SinkError, SinkFinish, SinkMatch},
     termcolor::{ColorSpec, NoColor, WriteColor},
 };
@@ -631,8 +631,12 @@ impl<'p, 's, M: Matcher, W: WriteColor> Sink for SummarySink<'p, 's, M, W> {
     type Error = io::Error;
 
     #[inline]
-    fn wants_selected_match(&self) -> bool {
-        self.summary.config.kind == SummaryKind::CountMatches
+    fn selected_match_owner(&self) -> Option<&SelectedMatchOwner> {
+        if self.summary.config.kind == SummaryKind::CountMatches {
+            self.matcher.selected_match_owner()
+        } else {
+            None
+        }
     }
 
     fn matched(

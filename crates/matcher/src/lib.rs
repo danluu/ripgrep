@@ -36,9 +36,43 @@ implementations.
 
 #![deny(missing_docs)]
 
+use std::sync::Arc;
+
 use crate::interpolate::interpolate;
 
 mod interpolate;
+
+/// An opaque identity token for the matcher that owns a selected-match hint.
+///
+/// Searchers use pointer identity, not token contents, to ensure that a hint
+/// produced by one matcher is consumed only by a sink using the same matcher.
+/// Cloning this token preserves its identity.
+#[derive(Clone, Debug)]
+pub struct SelectedMatchOwner(Arc<SelectedMatchOwnerMarker>);
+
+#[derive(Debug)]
+struct SelectedMatchOwnerMarker;
+
+impl SelectedMatchOwner {
+    /// Creates a new owner identity distinct from every existing identity.
+    #[inline]
+    pub fn new() -> SelectedMatchOwner {
+        SelectedMatchOwner(Arc::new(SelectedMatchOwnerMarker))
+    }
+
+    /// Returns true when both tokens identify the same matcher owner.
+    #[inline]
+    pub fn ptr_eq(&self, other: &SelectedMatchOwner) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+impl Default for SelectedMatchOwner {
+    #[inline]
+    fn default() -> SelectedMatchOwner {
+        SelectedMatchOwner::new()
+    }
+}
 
 /// The type of a match.
 ///
@@ -557,6 +591,17 @@ pub trait Matcher {
     /// (spelled `!`) type is stabilized, then it should probably be used
     /// instead.
     type Error: std::fmt::Display;
+
+    /// Returns the identity that owns selected-match hints from this matcher.
+    ///
+    /// This identity must remain stable for the life of the matcher. A
+    /// searcher only passes a selected-match hint to a sink when both expose
+    /// the same identity. The default implementation disables this optional
+    /// optimization.
+    #[inline]
+    fn selected_match_owner(&self) -> Option<&SelectedMatchOwner> {
+        None
+    }
 
     /// Returns the start and end byte range of the first match in `haystack`
     /// after `at`, where the byte offsets are relative to that start of
@@ -1136,7 +1181,8 @@ pub trait Matcher {
     /// be the same first match that [`Matcher::find`] would return, and the
     /// accompanying line match kind must be confirmed. Callers may use the
     /// selected match to continue non-overlapping iteration without searching
-    /// for it again.
+    /// for it again. A searcher must not expose the match to a sink unless the
+    /// identities returned by their `selected_match_owner` methods are equal.
     ///
     /// By default, this preserves `find_candidate_line` behavior and does not
     /// provide a selected match.
@@ -1152,6 +1198,11 @@ pub trait Matcher {
 impl<'a, M: Matcher> Matcher for &'a M {
     type Captures = M::Captures;
     type Error = M::Error;
+
+    #[inline]
+    fn selected_match_owner(&self) -> Option<&SelectedMatchOwner> {
+        (*self).selected_match_owner()
+    }
 
     #[inline]
     fn find_at(

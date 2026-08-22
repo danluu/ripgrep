@@ -10,7 +10,7 @@ use fre::{
 };
 use grep_matcher::{
     ByteSet, LineMatchKind, LineTerminator, Match as GrepMatch, Matcher,
-    NoCaptures,
+    NoCaptures, SelectedMatchOwner,
 };
 use regex_syntax::hir::{Hir, HirKind};
 
@@ -163,6 +163,7 @@ impl RegexMatcherBuilder {
             line_terminator,
             non_matching_bytes,
             matches_are_nonempty,
+            selected_match_owner: SelectedMatchOwner::new(),
         })
     }
 
@@ -311,6 +312,7 @@ pub struct RegexMatcher {
     line_terminator: Option<LineTerminator>,
     non_matching_bytes: ByteSet,
     matches_are_nonempty: bool,
+    selected_match_owner: SelectedMatchOwner,
 }
 
 impl fmt::Debug for RegexMatcher {
@@ -332,6 +334,7 @@ impl RegexMatcher {
             line_terminator: self.line_terminator,
             non_matching_bytes: &self.non_matching_bytes,
             matches_are_nonempty: self.matches_are_nonempty,
+            selected_match_owner: self.selected_match_owner.clone(),
         })
     }
 }
@@ -343,6 +346,7 @@ pub struct RegexMatcherWorker<'r> {
     line_terminator: Option<LineTerminator>,
     non_matching_bytes: &'r ByteSet,
     matches_are_nonempty: bool,
+    selected_match_owner: SelectedMatchOwner,
 }
 
 /// Search failure from one FRE matcher worker.
@@ -394,6 +398,11 @@ impl From<PortableFindIterError> for MatchError {
 impl Matcher for RegexMatcherWorker<'_> {
     type Captures = NoCaptures;
     type Error = MatchError;
+
+    #[inline]
+    fn selected_match_owner(&self) -> Option<&SelectedMatchOwner> {
+        Some(&self.selected_match_owner)
+    }
 
     #[inline]
     fn find_at(
@@ -524,12 +533,112 @@ impl Matcher for RegexMatcherWorker<'_> {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
+
     use fre::PortableFindIterError;
-    use grep_matcher::{LineMatchKind, LineTerminator, Matcher};
+    use grep_matcher::{
+        LineMatchKind, LineTerminator, Match as GrepMatch, Matcher,
+        NoCaptures, SelectedMatchOwner,
+    };
     use grep_printer::{SummaryBuilder, SummaryKind};
     use grep_searcher::SearcherBuilder;
 
     use super::{Error, MatchError, RegexMatcher, RegexMatcherBuilder};
+
+    #[derive(Clone, Copy, Debug)]
+    enum SelectedHint {
+        Forward,
+        Invalid,
+        Candidate,
+    }
+
+    struct ProbeMatcher<'m, 'r> {
+        inner: &'m super::RegexMatcherWorker<'r>,
+        hint: SelectedHint,
+        selected_calls: Cell<usize>,
+        iter_at: Cell<Option<usize>>,
+    }
+
+    impl<'m, 'r> ProbeMatcher<'m, 'r> {
+        fn new(
+            inner: &'m super::RegexMatcherWorker<'r>,
+            hint: SelectedHint,
+        ) -> ProbeMatcher<'m, 'r> {
+            ProbeMatcher {
+                inner,
+                hint,
+                selected_calls: Cell::new(0),
+                iter_at: Cell::new(None),
+            }
+        }
+    }
+
+    impl Matcher for ProbeMatcher<'_, '_> {
+        type Captures = NoCaptures;
+        type Error = MatchError;
+
+        fn selected_match_owner(&self) -> Option<&SelectedMatchOwner> {
+            self.inner.selected_match_owner()
+        }
+
+        fn find_at(
+            &self,
+            haystack: &[u8],
+            at: usize,
+        ) -> Result<Option<GrepMatch>, Self::Error> {
+            self.inner.find_at(haystack, at)
+        }
+
+        fn new_captures(&self) -> Result<Self::Captures, Self::Error> {
+            self.inner.new_captures()
+        }
+
+        fn try_find_iter_at<F, E>(
+            &self,
+            haystack: &[u8],
+            at: usize,
+            matched: F,
+        ) -> Result<Result<(), E>, Self::Error>
+        where
+            F: FnMut(GrepMatch) -> Result<bool, E>,
+        {
+            self.iter_at.set(Some(at));
+            self.inner.try_find_iter_at(haystack, at, matched)
+        }
+
+        fn line_terminator(&self) -> Option<LineTerminator> {
+            self.inner.line_terminator()
+        }
+
+        fn find_candidate_line(
+            &self,
+            haystack: &[u8],
+        ) -> Result<Option<LineMatchKind>, Self::Error> {
+            self.inner.find_candidate_line(haystack)
+        }
+
+        fn find_candidate_line_with_match(
+            &self,
+            haystack: &[u8],
+        ) -> Result<Option<(LineMatchKind, Option<GrepMatch>)>, Self::Error>
+        {
+            self.selected_calls.set(self.selected_calls.get() + 1);
+            let found = self.inner.find_candidate_line_with_match(haystack)?;
+            Ok(found.map(|(kind, selected)| match self.hint {
+                SelectedHint::Forward => (kind, selected),
+                SelectedHint::Invalid => {
+                    (kind, Some(GrepMatch::zero(haystack.len())))
+                }
+                SelectedHint::Candidate => {
+                    let at = match kind {
+                        LineMatchKind::Confirmed(at)
+                        | LineMatchKind::Candidate(at) => at,
+                    };
+                    (LineMatchKind::Candidate(at), selected)
+                }
+            }))
+        }
+    }
 
     fn span<M: Matcher>(matcher: &M, haystack: &[u8]) -> Option<(usize, usize)>
     where
@@ -557,17 +666,29 @@ mod tests {
         }
     }
 
-    fn count_matches(pattern: &str, haystack: &[u8]) -> Vec<u8> {
-        let factory = RegexMatcher::new(pattern).expect("FRE matcher");
-        let worker = factory.worker().expect("FRE worker");
+    fn count_matches_with<M: Matcher, N: Matcher>(
+        search_matcher: &M,
+        sink_matcher: &N,
+        haystack: &[u8],
+    ) -> Vec<u8> {
         let mut printer = SummaryBuilder::new()
             .kind(SummaryKind::CountMatches)
             .build_no_color(Vec::new());
         SearcherBuilder::new()
             .build()
-            .search_reader(&worker, haystack, printer.sink(&worker))
+            .search_reader(
+                search_matcher,
+                haystack,
+                printer.sink(sink_matcher),
+            )
             .expect("count matches search");
         printer.into_inner().into_inner()
+    }
+
+    fn count_matches(pattern: &str, haystack: &[u8]) -> Vec<u8> {
+        let factory = RegexMatcher::new(pattern).expect("FRE matcher");
+        let worker = factory.worker().expect("FRE worker");
+        count_matches_with(&worker, &worker, haystack)
     }
 
     #[test]
@@ -694,6 +815,60 @@ mod tests {
     #[test]
     fn count_matches_continues_after_the_selected_end() {
         assert_eq!(count_matches("a+", b"aaaa aa\nbaaa\nnone\n"), b"3\n");
+    }
+
+    #[test]
+    fn count_matches_reuses_a_selected_match_from_the_same_owner() {
+        let factory = RegexMatcher::new("a+").unwrap();
+        let worker = factory.worker().unwrap();
+        let matcher = ProbeMatcher::new(&worker, SelectedHint::Forward);
+        assert_eq!(
+            count_matches_with(&matcher, &matcher, b"aaaa aa\n"),
+            b"2\n"
+        );
+        assert!(matcher.selected_calls.get() > 0);
+        assert_eq!(matcher.iter_at.get(), Some(4));
+    }
+
+    #[test]
+    fn count_matches_rejects_a_selected_match_from_another_owner() {
+        let search_factory = RegexMatcher::new("aa").unwrap();
+        let search = search_factory.worker().unwrap();
+        let sink_factory = RegexMatcher::new("a").unwrap();
+        let sink = sink_factory.worker().unwrap();
+        assert_eq!(count_matches_with(&search, &sink, b"aaa\n"), b"3\n");
+    }
+
+    #[test]
+    fn inverted_count_matches_does_not_request_a_selected_match() {
+        let factory = RegexMatcher::new("z").unwrap();
+        let worker = factory.worker().unwrap();
+        let matcher = ProbeMatcher::new(&worker, SelectedHint::Forward);
+        let mut printer = SummaryBuilder::new()
+            .kind(SummaryKind::CountMatches)
+            .build_no_color(Vec::new());
+        SearcherBuilder::new()
+            .invert_match(true)
+            .build()
+            .search_reader(&matcher, &b"aaa\n"[..], printer.sink(&matcher))
+            .unwrap();
+        assert_eq!(matcher.selected_calls.get(), 0);
+    }
+
+    #[test]
+    fn count_matches_falls_back_for_invalid_or_candidate_hints() {
+        for hint in [SelectedHint::Invalid, SelectedHint::Candidate] {
+            let factory = RegexMatcher::new("a").unwrap();
+            let worker = factory.worker().unwrap();
+            let matcher = ProbeMatcher::new(&worker, hint);
+            assert_eq!(
+                count_matches_with(&matcher, &matcher, b"aaa\n"),
+                b"3\n",
+                "{hint:?}"
+            );
+            assert!(matcher.selected_calls.get() > 0, "{hint:?}");
+            assert_eq!(matcher.iter_at.get(), Some(0), "{hint:?}");
+        }
     }
 
     #[test]

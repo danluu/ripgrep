@@ -28,7 +28,7 @@ pub(crate) struct Core<'s, M: 's, S> {
     matcher: M,
     searcher: &'s Searcher,
     sink: S,
-    wants_selected_match: bool,
+    reuse_selected_match: bool,
     binary: bool,
     pos: usize,
     absolute_byte_offset: u64,
@@ -51,13 +51,21 @@ impl<'s, M: Matcher, S: Sink> Core<'s, M, S> {
     ) -> Core<'s, M, S> {
         let line_number =
             if searcher.config.line_number { Some(1) } else { None };
-        let wants_selected_match = sink.wants_selected_match();
+        let reuse_selected_match = if searcher.config.invert_match {
+            false
+        } else {
+            match (matcher.selected_match_owner(), sink.selected_match_owner())
+            {
+                (Some(matcher), Some(sink)) => matcher.ptr_eq(sink),
+                _ => false,
+            }
+        };
         let core = Core {
             config: &searcher.config,
             matcher,
             searcher,
             sink,
-            wants_selected_match,
+            reuse_selected_match,
             binary,
             pos: 0,
             absolute_byte_offset: 0,
@@ -499,7 +507,7 @@ impl<'s, M: Matcher, S: Sink> Core<'s, M, S> {
             if self.has_exceeded_match_limit() {
                 return Ok(None);
             }
-            let found = if self.wants_selected_match {
+            let found = if self.reuse_selected_match {
                 self.matcher.find_candidate_line_with_match(&buf[pos..])
             } else {
                 self.matcher
@@ -588,7 +596,11 @@ impl<'s, M: Matcher, S: Sink> Core<'s, M, S> {
                 line_number: self.line_number,
                 buffer: buf,
                 bytes_range_in_buffer: range.start()..range.end(),
-                selected_match,
+                selected_match: if self.reuse_selected_match {
+                    selected_match
+                } else {
+                    None
+                },
             },
         )?;
         if !keepgoing {
