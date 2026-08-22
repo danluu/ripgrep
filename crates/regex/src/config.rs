@@ -233,6 +233,16 @@ impl ConfiguredHIR {
         &self.hir
     }
 
+    /// Consume this configured value and return its owned HIR.
+    ///
+    /// This is an internal integration seam for consumers that have already
+    /// copied every configuration-derived fact they need. It does not attach
+    /// authority or skip the consumer's independent HIR validation.
+    #[doc(hidden)]
+    pub fn into_hir(self) -> Hir {
+        self.hir
+    }
+
     /// Whether this HIR came from ripgrep's narrow ordinary literal handoff
     /// configuration for FRE.
     ///

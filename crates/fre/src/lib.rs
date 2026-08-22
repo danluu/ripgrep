@@ -6,7 +6,8 @@ use std::{
 
 use fre::{
     BuildError, PortableBuilder, PortableFindIterError,
-    PortableOrdinarySession, PortableRegex, SearchError,
+    PortableOrdinarySession, PortableRegex, RipgrepStandardLiteralHirBuild,
+    SearchError,
 };
 use grep_matcher::{
     ByteSet, LineMatchKind, LineTerminator, Match as GrepMatch, Matcher,
@@ -167,17 +168,22 @@ impl RegexMatcherBuilder {
             }
             builder
         };
-        let direct = if configured.is_fre_standard_literal_handoff_config() {
-            configure_portable(String::new(), true)
-                .build_ripgrep_standard_literal_hir(
-                    configured.hir(),
+        let regex = if configured.is_fre_standard_literal_handoff_config() {
+            let hir = configured.into_hir();
+            match configure_portable(String::new(), true)
+                .build_ripgrep_standard_literal_hir_owned(
+                    hir,
                     self.max_canonical_pattern_bytes,
-                )?
-        } else {
-            None
-        };
-        let regex = if let Some(regex) = direct {
-            regex
+                )? {
+                RipgrepStandardLiteralHirBuild::Built(regex) => regex,
+                RipgrepStandardLiteralHirBuild::Refused(hir) => {
+                    let source = canonical_hir_pattern(
+                        &hir,
+                        self.max_canonical_pattern_bytes,
+                    )?;
+                    configure_portable(source, false).build()?
+                }
+            }
         } else {
             let source = canonical_hir_pattern(
                 configured.hir(),
@@ -579,7 +585,7 @@ mod tests {
 
     use fre::{
         BuildLimits, PlanKind, PlanSelection, PortableBuilder,
-        PortableFindIterError,
+        PortableFindIterError, RipgrepStandardLiteralHirBuild,
     };
     use grep_matcher::{
         LineMatchKind, LineTerminator, Match as GrepMatch, Matcher,
@@ -1608,6 +1614,58 @@ mod tests {
                 )
                 .expect("source-envelope refusal is not a construction error")
                 .is_none()
+        );
+
+        let owned = Hir::alternation(vec![
+            Hir::literal(b"owned-one".to_vec()),
+            Hir::literal(b"owned-two".to_vec()),
+        ]);
+        let owned = PortableBuilder::new("")
+            .multi_line(true)
+            .retained_find_iter(true)
+            .build_ripgrep_standard_literal_hir_owned(owned, usize::MAX)
+            .expect("owned literal-set construction completes");
+        let RipgrepStandardLiteralHirBuild::Built(owned) = owned else {
+            panic!("owned standard literal HIR should be admitted");
+        };
+        assert_eq!(owned.as_str(), r"(?:(?:owned\-one)|(?:owned\-two))");
+        assert_eq!(
+            owned
+                .find(b"an owned-two value")
+                .map(|matched| (matched.start(), matched.end())),
+            Some((3, 12))
+        );
+
+        let refused = Hir::concat(vec![
+            Hir::literal([b'a']),
+            Hir::look(regex_syntax::hir::Look::End),
+        ]);
+        let expected = refused.clone();
+        let refused = PortableBuilder::new("")
+            .multi_line(true)
+            .build_ripgrep_standard_literal_hir_owned(
+                refused,
+                usize::MAX,
+            )
+            .expect("owned shape refusal is not a construction error");
+        let RipgrepStandardLiteralHirBuild::Refused(refused) = refused else {
+            panic!("unsupported owned HIR should be returned");
+        };
+        assert_eq!(refused, expected);
+
+        let capped = Hir::literal(b"a|b".to_vec());
+        let expected = capped.clone();
+        let capped = PortableBuilder::new("")
+            .multi_line(true)
+            .build_ripgrep_standard_literal_hir_owned(capped, 7)
+            .expect("owned source-envelope refusal is not a build error");
+        let RipgrepStandardLiteralHirBuild::Refused(capped) = capped else {
+            panic!("source-envelope refusal should return the owned HIR");
+        };
+        assert_eq!(capped, expected);
+        assert_eq!(
+            super::canonical_hir_pattern(&capped, usize::MAX).unwrap(),
+            r"(?:a\|b)",
         );
     }
 
