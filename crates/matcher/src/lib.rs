@@ -605,6 +605,32 @@ pub trait Matcher {
         None
     }
 
+    /// Optionally counts positive-width selected matches at or after `at`
+    /// without reconstructing their span starts.
+    ///
+    /// `Ok(Some(count))` must equal the number of matches that
+    /// [`Matcher::find_iter_at`] would report when every match in this
+    /// matcher's language is statically known to be non-empty. Implementations
+    /// must preserve leftmost-first selection and resume each search at the
+    /// preceding selected endpoint.
+    ///
+    /// Unsupported implementations return `Ok(None)` before inspecting the
+    /// haystack or performing partial search work. Once an implementation
+    /// begins searching, an error is authoritative and callers must not retry
+    /// with ordinary span iteration.
+    ///
+    /// This optional internal acceleration is intended for count-only sinks.
+    /// The default implementation is unsupported.
+    #[doc(hidden)]
+    #[inline]
+    fn count_positive_width_selected_ends_at(
+        &self,
+        _haystack: &[u8],
+        _at: usize,
+    ) -> Result<Option<u64>, Self::Error> {
+        Ok(None)
+    }
+
     /// Returns the start and end byte range of the first match in `haystack`
     /// after `at`, where the byte offsets are relative to that start of
     /// `haystack` (and not `at`). If no match exists, then `None` is returned.
@@ -1212,6 +1238,15 @@ impl<'a, M: Matcher> Matcher for &'a M {
     #[inline]
     fn selected_match_owner(&self) -> Option<&SelectedMatchOwner> {
         (*self).selected_match_owner()
+    }
+
+    #[inline]
+    fn count_positive_width_selected_ends_at(
+        &self,
+        haystack: &[u8],
+        at: usize,
+    ) -> Result<Option<u64>, Self::Error> {
+        (*self).count_positive_width_selected_ends_at(haystack, at)
     }
 
     #[inline]

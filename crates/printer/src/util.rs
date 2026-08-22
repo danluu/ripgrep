@@ -490,12 +490,7 @@ where
     F: FnMut(Match) -> bool,
 {
     let bytes = context_haystack(searcher, &matcher, bytes, &range);
-    let seed = seed.filter(|m| {
-        !m.is_empty()
-            && range.start <= m.start()
-            && m.end() <= range.end
-            && m.end() <= bytes.len()
-    });
+    let seed = validated_nonempty_seed(bytes.len(), &range, seed);
     let mut suppress_empty_at = None;
     let at = match seed {
         None => range.start,
@@ -521,7 +516,22 @@ where
     )
 }
 
-fn context_haystack<'b, M: Matcher>(
+/// Filter a caller-authenticated seed to one that is non-empty and wholly
+/// inside both the reported match range and the prepared context haystack.
+pub(crate) fn validated_nonempty_seed(
+    prepared_haystack_len: usize,
+    range: &std::ops::Range<usize>,
+    seed: Option<Match>,
+) -> Option<Match> {
+    seed.filter(|m| {
+        !m.is_empty()
+            && range.start <= m.start()
+            && m.end() <= range.end
+            && m.end() <= prepared_haystack_len
+    })
+}
+
+pub(crate) fn context_haystack<'b, M: Matcher>(
     searcher: &Searcher,
     matcher: M,
     mut bytes: &'b [u8],
@@ -675,6 +685,8 @@ pub(crate) struct SeededRegexMatcher {
     hint: SeededRegexHint,
     selected_calls: std::cell::Cell<usize>,
     iter_at: std::cell::Cell<Option<usize>>,
+    selected_end_count: bool,
+    selected_end_count_calls: std::cell::Cell<usize>,
 }
 
 #[cfg(test)]
@@ -687,6 +699,8 @@ impl SeededRegexMatcher {
             hint: SeededRegexHint::First,
             selected_calls: std::cell::Cell::new(0),
             iter_at: std::cell::Cell::new(None),
+            selected_end_count: false,
+            selected_end_count_calls: std::cell::Cell::new(0),
         }
     }
 
@@ -697,12 +711,25 @@ impl SeededRegexMatcher {
         SeededRegexMatcher { hint, ..SeededRegexMatcher::new(pattern) }
     }
 
+    pub(crate) fn with_selected_end_count(
+        pattern: &str,
+    ) -> SeededRegexMatcher {
+        SeededRegexMatcher {
+            selected_end_count: true,
+            ..SeededRegexMatcher::new(pattern)
+        }
+    }
+
     pub(crate) fn selected_calls(&self) -> usize {
         self.selected_calls.get()
     }
 
     pub(crate) fn iter_at(&self) -> Option<usize> {
         self.iter_at.get()
+    }
+
+    pub(crate) fn selected_end_count_calls(&self) -> usize {
+        self.selected_end_count_calls.get()
     }
 }
 
@@ -715,6 +742,24 @@ impl Matcher for SeededRegexMatcher {
         &self,
     ) -> Option<&grep_matcher::SelectedMatchOwner> {
         Some(&self.owner)
+    }
+
+    fn count_positive_width_selected_ends_at(
+        &self,
+        haystack: &[u8],
+        at: usize,
+    ) -> Result<Option<u64>, Self::Error> {
+        if !self.selected_end_count {
+            return Ok(None);
+        }
+        self.selected_end_count_calls
+            .set(self.selected_end_count_calls.get() + 1);
+        let mut count = 0_u64;
+        self.inner.find_iter_at(haystack, at, |_| {
+            count += 1;
+            true
+        })?;
+        Ok(Some(count))
     }
 
     fn find_at(

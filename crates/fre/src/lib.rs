@@ -410,6 +410,21 @@ impl Matcher for RegexMatcherWorker<'_> {
     }
 
     #[inline]
+    fn count_positive_width_selected_ends_at(
+        &self,
+        haystack: &[u8],
+        at: usize,
+    ) -> Result<Option<u64>, Self::Error> {
+        let mut session = self
+            .session
+            .try_borrow_mut()
+            .map_err(|_| MatchError::Reentrant)?;
+        session
+            .count_positive_width_selected_ends_at(haystack, at)
+            .map_err(MatchError::from)
+    }
+
+    #[inline]
     fn find_at(
         &self,
         haystack: &[u8],
@@ -556,6 +571,8 @@ mod tests {
     enum SelectedHint {
         Forward,
         ForwardWithoutLineProof,
+        Empty,
+        OutOfWindow,
         Invalid,
         Candidate,
     }
@@ -565,6 +582,8 @@ mod tests {
         hint: SelectedHint,
         selected_calls: Cell<usize>,
         iter_at: Cell<Option<usize>>,
+        selected_end_count_calls: Cell<usize>,
+        selected_end_count_error: bool,
     }
 
     impl<'m, 'r> ProbeMatcher<'m, 'r> {
@@ -577,7 +596,14 @@ mod tests {
                 hint,
                 selected_calls: Cell::new(0),
                 iter_at: Cell::new(None),
+                selected_end_count_calls: Cell::new(0),
+                selected_end_count_error: false,
             }
+        }
+
+        fn with_selected_end_count_error(mut self) -> Self {
+            self.selected_end_count_error = true;
+            self
         }
     }
 
@@ -587,6 +613,19 @@ mod tests {
 
         fn selected_match_owner(&self) -> Option<&SelectedMatchOwner> {
             self.inner.selected_match_owner()
+        }
+
+        fn count_positive_width_selected_ends_at(
+            &self,
+            haystack: &[u8],
+            at: usize,
+        ) -> Result<Option<u64>, Self::Error> {
+            self.selected_end_count_calls
+                .set(self.selected_end_count_calls.get() + 1);
+            if self.selected_end_count_error {
+                return Err(MatchError::Reentrant);
+            }
+            self.inner.count_positive_width_selected_ends_at(haystack, at)
         }
 
         fn find_at(
@@ -638,6 +677,15 @@ mod tests {
             Ok(found.map(|(kind, selected)| match self.hint {
                 SelectedHint::Forward
                 | SelectedHint::ForwardWithoutLineProof => (kind, selected),
+                SelectedHint::Empty => (
+                    kind,
+                    selected.map(|matched| GrepMatch::zero(matched.end())),
+                ),
+                SelectedHint::OutOfWindow => {
+                    let end = haystack.len();
+                    let start = end.saturating_sub(1);
+                    (kind, Some(GrepMatch::new(start, end)))
+                }
                 SelectedHint::Invalid => {
                     (kind, Some(GrepMatch::zero(haystack.len())))
                 }
@@ -864,6 +912,7 @@ mod tests {
     #[test]
     fn count_matches_continues_after_the_selected_end() {
         assert_eq!(count_matches("a+", b"aaaa aa\nbaaa\nnone\n"), b"3\n");
+        assert_eq!(count_matches("a+$", b"zaaa\nnone\na\n"), b"2\n");
     }
 
     #[test]
@@ -877,6 +926,99 @@ mod tests {
         );
         assert!(matcher.selected_calls.get() > 0);
         assert_eq!(matcher.iter_at.get(), Some(4));
+    }
+
+    #[test]
+    fn selected_end_count_errors_are_authoritative_without_span_retry() {
+        let factory = RegexMatcher::new("a+").unwrap();
+        let worker = factory.worker().unwrap();
+        let matcher = ProbeMatcher::new(&worker, SelectedHint::Forward)
+            .with_selected_end_count_error();
+        let mut printer = SummaryBuilder::new()
+            .kind(SummaryKind::CountMatches)
+            .build_no_color(Vec::new());
+        let error = SearcherBuilder::new()
+            .build()
+            .search_reader(&matcher, &b"aaaa aa\n"[..], printer.sink(&matcher))
+            .unwrap_err();
+        assert!(error.to_string().contains("reentrant"), "{error}");
+        assert_eq!(matcher.selected_end_count_calls.get(), 1);
+        assert_eq!(matcher.iter_at.get(), None);
+    }
+
+    #[test]
+    fn multiline_count_matches_never_attempts_selected_end_tail() {
+        let factory = RegexMatcher::new("a+").unwrap();
+        let worker = factory.worker().unwrap();
+        let matcher =
+            ProbeMatcher::new(&worker, SelectedHint::ForwardWithoutLineProof)
+                .with_selected_end_count_error();
+        let mut printer = SummaryBuilder::new()
+            .kind(SummaryKind::CountMatches)
+            .build_no_color(Vec::new());
+        SearcherBuilder::new()
+            .multi_line(true)
+            .build()
+            .search_reader(&matcher, &b"zaaa aa\n"[..], printer.sink(&matcher))
+            .unwrap();
+        assert_eq!(printer.into_inner().into_inner(), b"2\n");
+        assert_eq!(matcher.selected_end_count_calls.get(), 0);
+        assert_eq!(matcher.iter_at.get(), Some(0));
+    }
+
+    #[test]
+    fn canonical_selected_end_count_declines_before_start_validation() {
+        let factory = RegexMatcher::new("literal").unwrap();
+        let worker = factory.worker().unwrap();
+        assert_eq!(
+            worker
+                .count_positive_width_selected_ends_at(b"literal", usize::MAX,)
+                .unwrap(),
+            None,
+        );
+
+        let matcher = ProbeMatcher::new(&worker, SelectedHint::Forward);
+        assert_eq!(
+            count_matches_with(&matcher, &matcher, b"literal literal\n"),
+            b"2\n",
+        );
+        assert!(matcher.selected_end_count_calls.get() > 0);
+        assert_eq!(matcher.iter_at.get(), Some(7));
+    }
+
+    #[test]
+    fn positive_k0_selected_end_count_drives_actual_summary_tail() {
+        let pattern = r"([0-9][0-9]?)/([0-9][0-9]?)/([0-9][0-9]([0-9][0-9])?)";
+        let mut builder = RegexMatcherBuilder::new();
+        builder.unicode(false);
+        let factory = builder.build(pattern).unwrap();
+        let worker = factory.worker().unwrap();
+        let haystack = b"1/2/23 12/31/2024";
+        assert_eq!(
+            worker.count_positive_width_selected_ends_at(haystack, 0).unwrap(),
+            Some(2),
+        );
+        assert_eq!(
+            worker.count_positive_width_selected_ends_at(haystack, 1).unwrap(),
+            Some(1),
+        );
+        assert!(
+            worker
+                .count_positive_width_selected_ends_at(
+                    haystack,
+                    haystack.len() + 1,
+                )
+                .is_err()
+        );
+
+        let matcher = ProbeMatcher::new(&worker, SelectedHint::Forward);
+        assert_eq!(
+            count_matches_with(&matcher, &matcher, b"1/2/23 12/31/2024\n"),
+            b"2\n",
+        );
+        assert!(matcher.selected_calls.get() > 0);
+        assert_eq!(matcher.selected_end_count_calls.get(), 1);
+        assert_eq!(matcher.iter_at.get(), None);
     }
 
     #[test]
@@ -1078,10 +1220,32 @@ mod tests {
     #[test]
     fn count_matches_rejects_a_selected_match_from_another_owner() {
         let search_factory = RegexMatcher::new("aa").unwrap();
-        let search = search_factory.worker().unwrap();
+        let search_worker = search_factory.worker().unwrap();
+        let search = ProbeMatcher::new(&search_worker, SelectedHint::Forward);
         let sink_factory = RegexMatcher::new("a").unwrap();
-        let sink = sink_factory.worker().unwrap();
+        let sink_worker = sink_factory.worker().unwrap();
+        let sink = ProbeMatcher::new(&sink_worker, SelectedHint::Forward);
         assert_eq!(count_matches_with(&search, &sink, b"aaa\n"), b"3\n");
+        assert_eq!(search.selected_calls.get(), 0);
+        assert_eq!(sink.selected_end_count_calls.get(), 0);
+        assert_eq!(sink.iter_at.get(), Some(0));
+    }
+
+    #[test]
+    fn count_matches_preserves_crlf_and_nul_semantics() {
+        let factory =
+            RegexMatcherBuilder::new().crlf(true).build("a+").unwrap();
+        let worker = factory.worker().unwrap();
+        let matcher = ProbeMatcher::new(&worker, SelectedHint::Forward);
+        let mut printer = SummaryBuilder::new()
+            .kind(SummaryKind::CountMatches)
+            .build_no_color(Vec::new());
+        SearcherBuilder::new()
+            .line_terminator(LineTerminator::crlf())
+            .build()
+            .search_reader(&matcher, &b"a\0aa\r\n"[..], printer.sink(&matcher))
+            .unwrap();
+        assert_eq!(printer.into_inner().into_inner(), b"2\r\n");
     }
 
     #[test]
@@ -1102,7 +1266,12 @@ mod tests {
 
     #[test]
     fn count_matches_falls_back_for_invalid_or_candidate_hints() {
-        for hint in [SelectedHint::Invalid, SelectedHint::Candidate] {
+        for hint in [
+            SelectedHint::Empty,
+            SelectedHint::OutOfWindow,
+            SelectedHint::Invalid,
+            SelectedHint::Candidate,
+        ] {
             let factory = RegexMatcher::new("a").unwrap();
             let worker = factory.worker().unwrap();
             let matcher = ProbeMatcher::new(&worker, hint);
@@ -1112,6 +1281,7 @@ mod tests {
                 "{hint:?}"
             );
             assert!(matcher.selected_calls.get() > 0, "{hint:?}");
+            assert_eq!(matcher.selected_end_count_calls.get(), 0, "{hint:?}",);
             assert_eq!(matcher.iter_at.get(), Some(0), "{hint:?}");
         }
     }
@@ -1123,7 +1293,10 @@ mod tests {
         let (_, selected) =
             worker.find_candidate_line_with_match(b"bbb\n").unwrap().unwrap();
         assert_eq!(selected, None);
-        assert_eq!(count_matches("a*", b"bbb\n"), b"4\n");
+        let matcher = ProbeMatcher::new(&worker, SelectedHint::Forward);
+        assert_eq!(count_matches_with(&matcher, &matcher, b"bbb\n"), b"4\n",);
+        assert_eq!(matcher.selected_end_count_calls.get(), 0);
+        assert_eq!(matcher.iter_at.get(), Some(0));
     }
 
     #[test]

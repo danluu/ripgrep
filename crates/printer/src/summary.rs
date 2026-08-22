@@ -17,7 +17,10 @@ use crate::{
     counter::CounterWriter,
     hyperlink::{self, HyperlinkConfig},
     stats::Stats,
-    util::{PrinterPath, find_iter_at_in_context_with_seed},
+    util::{
+        PrinterPath, context_haystack, find_iter_at_in_context_with_seed,
+        validated_nonempty_seed,
+    },
 };
 
 /// The configuration for the summary printer.
@@ -654,23 +657,56 @@ impl<'p, 's, M: Matcher, W: WriteColor> Sink for SummarySink<'p, 's, M, W> {
             // practice.
             let buf = mat.buffer();
             let range = mat.bytes_range_in_buffer();
-            let mut count = 0;
-            find_iter_at_in_context_with_seed(
-                searcher,
-                &self.matcher,
-                buf,
-                range,
-                mat.selected_match(),
-                |_| {
-                    count += 1;
-                    true
-                },
-            )?;
-            // Because of context-bounded iteration being a giant
-            // kludge internally, it's possible that it won't find
-            // *any* matches even though we clearly know that there is
-            // at least one. So make sure we record at least one here.
-            count.max(1)
+            let selected_end_count = if is_multi_line {
+                None
+            } else {
+                let bytes =
+                    context_haystack(searcher, &self.matcher, buf, &range);
+                let seed = validated_nonempty_seed(
+                    bytes.len(),
+                    &range,
+                    mat.selected_match(),
+                );
+                match seed {
+                    None => None,
+                    Some(seed) => self
+                        .matcher
+                        .count_positive_width_selected_ends_at(
+                            bytes,
+                            seed.end(),
+                        )
+                        .map_err(io::Error::error_message)?
+                        .map(|tail| {
+                            tail.checked_add(1).ok_or_else(|| {
+                                io::Error::error_message(
+                                    "selected-end match count overflowed",
+                                )
+                            })
+                        })
+                        .transpose()?,
+                }
+            };
+            if let Some(count) = selected_end_count {
+                count
+            } else {
+                let mut count = 0;
+                find_iter_at_in_context_with_seed(
+                    searcher,
+                    &self.matcher,
+                    buf,
+                    range,
+                    mat.selected_match(),
+                    |_| {
+                        count += 1;
+                        true
+                    },
+                )?;
+                // Because of context-bounded iteration being a giant
+                // kludge internally, it's possible that it won't find
+                // *any* matches even though we clearly know that there is
+                // at least one. So make sure we record at least one here.
+                count.max(1)
+            }
         };
         if is_multi_line {
             self.match_count += sink_match_count;
@@ -1057,6 +1093,16 @@ and exhibited clearly, with a label attached.
 
         let got = printer_contents(&mut printer);
         assert_eq_printed!("sherlock:4\n", got);
+    }
+
+    #[test]
+    fn count_matches_uses_positive_selected_end_tail_after_valid_seed() {
+        let matcher = SeededRegexMatcher::with_selected_end_count("ab|a");
+        let got = count_matches_with(&matcher, &matcher, b"ababa\n");
+        assert_eq_printed!("fixture:3\n", got);
+        assert!(matcher.selected_calls() > 0);
+        assert_eq!(matcher.selected_end_count_calls(), 1);
+        assert_eq!(matcher.iter_at(), None);
     }
 
     #[test]

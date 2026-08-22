@@ -24,6 +24,23 @@ fn find() {
 }
 
 #[test]
+fn positive_width_selected_end_count_defaults_to_unsupported() {
+    let matcher = matcher(r"a+");
+    assert_eq!(
+        matcher
+            .count_positive_width_selected_ends_at(b"aaa", usize::MAX)
+            .unwrap(),
+        None,
+    );
+    assert_eq!(
+        (&matcher)
+            .count_positive_width_selected_ends_at(b"aaa", usize::MAX)
+            .unwrap(),
+        None,
+    );
+}
+
+#[test]
 fn find_iter() {
     let matcher = matcher(r"(\w+)\s+(\w+)");
     let mut matches = vec![];
