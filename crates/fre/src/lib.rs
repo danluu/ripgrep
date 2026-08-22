@@ -6,8 +6,7 @@ use std::{
 
 use fre::{
     BuildError, PortableBuilder, PortableFindIterError,
-    PortableFindIterRunLimits, PortableRegex, PortableSearchSession,
-    SearchError, SearchLimits, SearchSessionLimits,
+    PortableOrdinarySession, PortableRegex, SearchError,
 };
 use grep_matcher::{
     ByteSet, LineTerminator, Match as GrepMatch, Matcher, NoCaptures,
@@ -157,9 +156,6 @@ impl RegexMatcherBuilder {
             regex: Arc::new(regex),
             line_terminator,
             non_matching_bytes,
-            session_limits: SearchSessionLimits::unlimited(),
-            search_limits: SearchLimits::unlimited(),
-            iter_limits: PortableFindIterRunLimits::unlimited(),
         })
     }
 
@@ -307,9 +303,6 @@ pub struct RegexMatcher {
     regex: Arc<PortableRegex>,
     line_terminator: Option<LineTerminator>,
     non_matching_bytes: ByteSet,
-    session_limits: SearchSessionLimits,
-    search_limits: SearchLimits,
-    iter_limits: PortableFindIterRunLimits,
 }
 
 impl fmt::Debug for RegexMatcher {
@@ -325,13 +318,11 @@ impl RegexMatcher {
 
     /// Construct independent mutable state for one ripgrep search worker.
     pub fn worker(&self) -> Result<RegexMatcherWorker<'_>, MatchError> {
-        let session = self.regex.search_session(self.session_limits)?;
+        let session = self.regex.ordinary_session()?;
         Ok(RegexMatcherWorker {
             session: RefCell::new(session),
             line_terminator: self.line_terminator,
             non_matching_bytes: &self.non_matching_bytes,
-            search_limits: self.search_limits,
-            iter_limits: self.iter_limits,
         })
     }
 }
@@ -339,11 +330,9 @@ impl RegexMatcher {
 /// A thread-confined adapter retaining one FRE session across worker files.
 #[derive(Debug)]
 pub struct RegexMatcherWorker<'r> {
-    session: RefCell<PortableSearchSession<'r>>,
+    session: RefCell<PortableOrdinarySession<'r>>,
     line_terminator: Option<LineTerminator>,
     non_matching_bytes: &'r ByteSet,
-    search_limits: SearchLimits,
-    iter_limits: PortableFindIterRunLimits,
 }
 
 /// Search failure from one FRE matcher worker.
@@ -407,7 +396,7 @@ impl Matcher for RegexMatcherWorker<'_> {
             .try_borrow_mut()
             .map_err(|_| MatchError::Reentrant)?;
         session
-            .find_at_value(haystack, at, self.search_limits)
+            .find_at(haystack, at)
             .map(|matched| {
                 matched.map(|matched| {
                     GrepMatch::new(matched.start(), matched.end())
@@ -434,16 +423,11 @@ impl Matcher for RegexMatcherWorker<'_> {
             .session
             .try_borrow_mut()
             .map_err(|_| MatchError::Reentrant)?;
-        for found in session.find_iter_value(haystack, self.iter_limits) {
-            let found = found.map_err(MatchError::from)?;
-            let found = GrepMatch::new(found.start(), found.end());
-            match matched(found) {
-                Ok(true) => {}
-                Ok(false) => return Ok(Ok(())),
-                Err(error) => return Ok(Err(error)),
-            }
-        }
-        Ok(Ok(()))
+        session
+            .try_visit_spans(haystack, |found| {
+                matched(GrepMatch::new(found.start(), found.end()))
+            })
+            .map_err(MatchError::from)
     }
 
     #[inline]
@@ -460,17 +444,11 @@ impl Matcher for RegexMatcherWorker<'_> {
             .session
             .try_borrow_mut()
             .map_err(|_| MatchError::Reentrant)?;
-        for found in session.find_iter_value_at(haystack, at, self.iter_limits)
-        {
-            let found = found.map_err(MatchError::from)?;
-            let found = GrepMatch::new(found.start(), found.end());
-            match matched(found) {
-                Ok(true) => {}
-                Ok(false) => return Ok(Ok(())),
-                Err(error) => return Ok(Err(error)),
-            }
-        }
-        Ok(Ok(()))
+        session
+            .try_visit_spans_at(haystack, at, |found| {
+                matched(GrepMatch::new(found.start(), found.end()))
+            })
+            .map_err(MatchError::from)
     }
 
     #[inline]
@@ -479,9 +457,7 @@ impl Matcher for RegexMatcherWorker<'_> {
             .session
             .try_borrow_mut()
             .map_err(|_| MatchError::Reentrant)?;
-        session
-            .is_match_value(haystack, self.search_limits)
-            .map_err(MatchError::from)
+        session.is_match_at(haystack, 0).map_err(MatchError::from)
     }
 
     #[inline]
@@ -494,9 +470,7 @@ impl Matcher for RegexMatcherWorker<'_> {
             .session
             .try_borrow_mut()
             .map_err(|_| MatchError::Reentrant)?;
-        session
-            .is_match_value_at(haystack, at, self.search_limits)
-            .map_err(MatchError::from)
+        session.is_match_at(haystack, at).map_err(MatchError::from)
     }
 
     #[inline]
@@ -509,9 +483,7 @@ impl Matcher for RegexMatcherWorker<'_> {
             .session
             .try_borrow_mut()
             .map_err(|_| MatchError::Reentrant)?;
-        session
-            .shortest_match_at_value(haystack, at, self.search_limits)
-            .map_err(MatchError::from)
+        session.shortest_match_at(haystack, at).map_err(MatchError::from)
     }
 
     #[inline]
@@ -527,10 +499,11 @@ impl Matcher for RegexMatcherWorker<'_> {
 
 #[cfg(test)]
 mod tests {
+    use fre::PortableFindIterError;
     use grep_matcher::{LineTerminator, Matcher};
     use grep_searcher::SearcherBuilder;
 
-    use super::{Error, RegexMatcher, RegexMatcherBuilder};
+    use super::{Error, MatchError, RegexMatcher, RegexMatcherBuilder};
 
     fn span<M: Matcher>(matcher: &M, haystack: &[u8]) -> Option<(usize, usize)>
     where
@@ -604,6 +577,92 @@ mod tests {
                 assert!(!clone.worker().unwrap().is_match(b"zz").unwrap())
             });
         });
+    }
+
+    #[test]
+    fn ordinary_visitor_preserves_callback_control_and_worker_lifecycle() {
+        let factory = RegexMatcher::new("a.").unwrap();
+        let worker = factory.worker().unwrap();
+
+        let mut spans = Vec::new();
+        assert_eq!(
+            worker
+                .try_find_iter(b"ab-ac-ad", |matched| {
+                    spans.push((matched.start(), matched.end()));
+                    Ok::<bool, &'static str>(false)
+                })
+                .unwrap(),
+            Ok(())
+        );
+        assert_eq!(spans, [(0, 2)]);
+        assert!(worker.is_match(b"zzac").unwrap());
+
+        let mut callbacks = 0;
+        assert_eq!(
+            worker
+                .try_find_iter(b"ab-ac", |_| {
+                    callbacks += 1;
+                    Err::<bool, _>("callback")
+                })
+                .unwrap(),
+            Err("callback")
+        );
+        assert_eq!(callbacks, 1);
+        assert!(worker.is_match(b"ad").unwrap());
+
+        let mut saw_reentrant = false;
+        worker
+            .try_find_iter(b"ab-ac", |_| {
+                saw_reentrant = matches!(
+                    worker.is_match(b"ab"),
+                    Err(MatchError::Reentrant)
+                );
+                Ok::<bool, ()>(false)
+            })
+            .unwrap()
+            .unwrap();
+        assert!(saw_reentrant);
+        assert!(worker.is_match(b"ae").unwrap());
+    }
+
+    #[test]
+    fn ordinary_visitor_keeps_byte_empty_progress_and_iteration_errors() {
+        let factory = RegexMatcher::new("a*").unwrap();
+        let worker = factory.worker().unwrap();
+
+        let mut spans = Vec::new();
+        worker
+            .try_find_iter(b"bbb", |matched| {
+                spans.push((matched.start(), matched.end()));
+                Ok::<bool, ()>(true)
+            })
+            .unwrap()
+            .unwrap();
+        assert_eq!(spans, [(0, 0), (1, 1), (2, 2), (3, 3)]);
+
+        spans.clear();
+        worker
+            .try_find_iter_at(b"bbb", 1, |matched| {
+                spans.push((matched.start(), matched.end()));
+                Ok::<bool, ()>(true)
+            })
+            .unwrap()
+            .unwrap();
+        assert_eq!(spans, [(1, 1), (2, 2), (3, 3)]);
+
+        let mut callback_called = false;
+        let error = worker
+            .try_find_iter_at(b"bbb", 4, |_| {
+                callback_called = true;
+                Ok::<bool, ()>(true)
+            })
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            MatchError::Iter(PortableFindIterError::Search(_))
+        ));
+        assert!(!callback_called);
+        assert!(worker.is_match(b"bbb").unwrap());
     }
 
     #[test]
