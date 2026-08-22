@@ -1643,10 +1643,7 @@ mod tests {
         let expected = refused.clone();
         let refused = PortableBuilder::new("")
             .multi_line(true)
-            .build_ripgrep_standard_literal_hir_owned(
-                refused,
-                usize::MAX,
-            )
+            .build_ripgrep_standard_literal_hir_owned(refused, usize::MAX)
             .expect("owned shape refusal is not a construction error");
         let RipgrepStandardLiteralHirBuild::Refused(refused) = refused else {
             panic!("unsupported owned HIR should be returned");
