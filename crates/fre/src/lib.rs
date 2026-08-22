@@ -128,14 +128,19 @@ impl RegexMatcherBuilder {
         }
         let configured = self.configured.configured_hir_many(patterns)?;
         let line_terminator = configured.line_terminator();
+        let non_matching_bytes = configured.non_matching_bytes();
         if let Some(line_terminator) = line_terminator {
             for &byte in line_terminator.as_bytes() {
-                if hir_can_consume_ascii(configured.hir(), byte) {
+                // The conservative byte analysis certifies the common case
+                // without another full HIR walk. Keep the exact scan as the
+                // fallback whenever the byte set cannot prove exclusion.
+                if !non_matching_bytes.contains(byte)
+                    && hir_can_consume_ascii(configured.hir(), byte)
+                {
                     return Err(Error::UncertifiedLineTerminator(byte));
                 }
             }
         }
-        let non_matching_bytes = configured.non_matching_bytes();
         let matches_are_nonempty = configured
             .hir()
             .properties()
@@ -1230,6 +1235,30 @@ mod tests {
             Some(LineTerminator::byte(b'\n'))
         );
         assert!(worker.non_matching_bytes().unwrap().contains(b'\n'));
+    }
+
+    #[test]
+    fn line_boundary_uses_exact_terminator_fallback_when_needed() {
+        let pattern = r"(?m:^abc)";
+        let mut fre_builder = RegexMatcherBuilder::new();
+        fre_builder.multi_line(true).line_terminator(Some(b'\n'));
+        let fre = fre_builder.build(pattern).expect("FRE matcher");
+        let mut reference_builder = grep_regex::RegexMatcherBuilder::new();
+        reference_builder.multi_line(true).line_terminator(Some(b'\n'));
+        let reference =
+            reference_builder.build(pattern).expect("reference matcher");
+        let worker = fre.worker().unwrap();
+
+        assert_find_parity(
+            &worker,
+            &reference,
+            &[b"abc", b"z\nabc", b"zabc", b"abc\nabc"],
+        );
+        assert_eq!(
+            worker.line_terminator(),
+            Some(LineTerminator::byte(b'\n')),
+        );
+        assert!(!worker.non_matching_bytes().unwrap().contains(b'\n'));
     }
 
     #[test]
