@@ -9,7 +9,7 @@ use std::{
 
 use {
     bstr::ByteSlice,
-    grep_matcher::{Match, Matcher},
+    grep_matcher::{Match, Matcher, SelectedMatchOwner},
     grep_searcher::{
         LineStep, Searcher, Sink, SinkContext, SinkFinish, SinkMatch,
     },
@@ -23,7 +23,8 @@ use crate::{
     stats::Stats,
     util::{
         DecimalFormatter, PrinterPath, Replacer, Sunk,
-        find_iter_at_in_context, trim_ascii_prefix, trim_line_terminator,
+        find_iter_at_in_context_with_seed, trim_ascii_prefix,
+        trim_line_terminator,
     },
 };
 
@@ -700,6 +701,7 @@ impl<'p, 's, M: Matcher, W: WriteColor> StandardSink<'p, 's, M, W> {
         searcher: &Searcher,
         bytes: &[u8],
         range: std::ops::Range<usize>,
+        selected_match: Option<Match>,
     ) -> io::Result<()> {
         self.standard.matches.clear();
         if !self.needs_match_granularity {
@@ -713,11 +715,12 @@ impl<'p, 's, M: Matcher, W: WriteColor> StandardSink<'p, 's, M, W> {
         // one search to find the matches (well, for replacements, we do one
         // additional search to perform the actual replacement).
         let matches = &mut self.standard.matches;
-        find_iter_at_in_context(
+        find_iter_at_in_context_with_seed(
             searcher,
             &self.matcher,
             bytes,
             range.clone(),
+            selected_match,
             |m| {
                 let (s, e) = (m.start() - range.start, m.end() - range.start);
                 matches.push(Match::new(s, e));
@@ -763,6 +766,15 @@ impl<'p, 's, M: Matcher, W: WriteColor> StandardSink<'p, 's, M, W> {
 impl<'p, 's, M: Matcher, W: WriteColor> Sink for StandardSink<'p, 's, M, W> {
     type Error = io::Error;
 
+    #[inline]
+    fn selected_match_owner(&self) -> Option<&SelectedMatchOwner> {
+        if self.needs_match_granularity {
+            self.matcher.selected_match_owner()
+        } else {
+            None
+        }
+    }
+
     fn matched(
         &mut self,
         searcher: &Searcher,
@@ -774,6 +786,7 @@ impl<'p, 's, M: Matcher, W: WriteColor> Sink for StandardSink<'p, 's, M, W> {
             searcher,
             mat.buffer(),
             mat.bytes_range_in_buffer(),
+            mat.selected_match(),
         )?;
         self.replace(searcher, mat.buffer(), mat.bytes_range_in_buffer())?;
 
@@ -799,7 +812,12 @@ impl<'p, 's, M: Matcher, W: WriteColor> Sink for StandardSink<'p, 's, M, W> {
         self.replacer.clear();
 
         if searcher.invert_match() {
-            self.record_matches(searcher, ctx.bytes(), 0..ctx.bytes().len())?;
+            self.record_matches(
+                searcher,
+                ctx.bytes(),
+                0..ctx.bytes().len(),
+                None,
+            )?;
             self.replace(searcher, ctx.bytes(), 0..ctx.bytes().len())?;
         }
         if searcher.binary_detection().convert_byte().is_some() {
@@ -1749,6 +1767,7 @@ mod tests {
     use termcolor::{Ansi, NoColor};
 
     use super::{ColorSpecs, Standard, StandardBuilder};
+    use crate::util::SeededRegexMatcher;
 
     const SHERLOCK: &'static str = "\
 For the Doctor Watsons of this world, as opposed to the Sherlock
@@ -1798,6 +1817,21 @@ and exhibited clearly, with a label attached.\
             .search_reader(&matcher, SHERLOCK.as_bytes(), &mut sink)
             .unwrap();
         assert!(!sink.has_match());
+    }
+
+    #[test]
+    fn selected_nonempty_seed_suppresses_adjacent_empty_match() {
+        let matcher = SeededRegexMatcher::new("a|");
+        let mut printer = StandardBuilder::new()
+            .only_matching(true)
+            .build(NoColor::new(vec![]));
+        SearcherBuilder::new()
+            .line_number(false)
+            .build()
+            .search_reader(&matcher, &b"a\n"[..], printer.sink(&matcher))
+            .unwrap();
+        assert!(matcher.selected_calls() > 0);
+        assert_eq!(printer_contents(&mut printer), "a\n");
     }
 
     #[test]

@@ -6,14 +6,16 @@ use std::{
 };
 
 use {
-    grep_matcher::{Match, Matcher},
+    grep_matcher::{Match, Matcher, SelectedMatchOwner},
     grep_searcher::{Searcher, Sink, SinkContext, SinkFinish, SinkMatch},
     serde_json as json,
 };
 
 use crate::{
-    counter::CounterWriter, jsont, stats::Stats, util::Replacer,
-    util::find_iter_at_in_context,
+    counter::CounterWriter,
+    jsont,
+    stats::Stats,
+    util::{Replacer, find_iter_at_in_context_with_seed},
 };
 
 /// The configuration for the JSON printer.
@@ -649,6 +651,7 @@ impl<'p, 's, M: Matcher, W: io::Write> JSONSink<'p, 's, M, W> {
         searcher: &Searcher,
         bytes: &[u8],
         range: std::ops::Range<usize>,
+        selected_match: Option<Match>,
     ) -> io::Result<()> {
         self.json.matches.clear();
         // If printing requires knowing the location of each individual match,
@@ -658,11 +661,12 @@ impl<'p, 's, M: Matcher, W: io::Write> JSONSink<'p, 's, M, W> {
         // the extent that it's easy to ensure that we never do more than
         // one search to find the matches.
         let matches = &mut self.json.matches;
-        find_iter_at_in_context(
+        find_iter_at_in_context_with_seed(
             searcher,
             &self.matcher,
             bytes,
             range.clone(),
+            selected_match,
             |m| {
                 let (s, e) = (m.start() - range.start, m.end() - range.start);
                 matches.push(Match::new(s, e));
@@ -719,6 +723,11 @@ impl<'p, 's, M: Matcher, W: io::Write> JSONSink<'p, 's, M, W> {
 impl<'p, 's, M: Matcher, W: io::Write> Sink for JSONSink<'p, 's, M, W> {
     type Error = io::Error;
 
+    #[inline]
+    fn selected_match_owner(&self) -> Option<&SelectedMatchOwner> {
+        self.matcher.selected_match_owner()
+    }
+
     fn matched(
         &mut self,
         searcher: &Searcher,
@@ -731,6 +740,7 @@ impl<'p, 's, M: Matcher, W: io::Write> Sink for JSONSink<'p, 's, M, W> {
             searcher,
             mat.buffer(),
             mat.bytes_range_in_buffer(),
+            mat.selected_match(),
         )?;
         self.replace(searcher, mat.buffer(), mat.bytes_range_in_buffer())?;
         self.stats.add_matches(self.json.matches.len() as u64);
@@ -761,7 +771,12 @@ impl<'p, 's, M: Matcher, W: io::Write> Sink for JSONSink<'p, 's, M, W> {
         self.json.matches.clear();
 
         let submatches = if searcher.invert_match() {
-            self.record_matches(searcher, ctx.bytes(), 0..ctx.bytes().len())?;
+            self.record_matches(
+                searcher,
+                ctx.bytes(),
+                0..ctx.bytes().len(),
+                None,
+            )?;
             self.replace(searcher, ctx.bytes(), 0..ctx.bytes().len())?;
             SubMatches::new(
                 ctx.bytes(),
@@ -904,6 +919,7 @@ mod tests {
     use grep_searcher::SearcherBuilder;
 
     use super::{JSON, JSONBuilder};
+    use crate::util::SeededRegexMatcher;
 
     const SHERLOCK: &'static [u8] = b"\
 For the Doctor Watsons of this world, as opposed to the Sherlock
@@ -958,6 +974,20 @@ and exhibited clearly, with a label attached.\
         let got = printer_contents(&mut printer);
 
         assert_eq!(got.lines().count(), 3);
+    }
+
+    #[test]
+    fn selected_nonempty_seed_suppresses_adjacent_empty_match() {
+        let matcher = SeededRegexMatcher::new("a|");
+        let mut printer = JSONBuilder::new().build(vec![]);
+        SearcherBuilder::new()
+            .build()
+            .search_reader(&matcher, &b"a\n"[..], printer.sink(&matcher))
+            .unwrap();
+        let got = printer_contents(&mut printer);
+        assert!(matcher.selected_calls() > 0);
+        assert!(got.contains(r#""start":0,"end":1"#), "{got}");
+        assert!(!got.contains(r#""start":1,"end":1"#), "{got}");
     }
 
     #[test]

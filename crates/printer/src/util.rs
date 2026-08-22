@@ -56,8 +56,8 @@ impl<M: Matcher> Replacer<M> {
         range: std::ops::Range<usize>,
         replacement: &[u8],
     ) -> io::Result<()> {
-        // See the giant comment in 'find_iter_at_in_context' below for why we
-        // do this dance.
+        // See the giant comment in 'find_iter_at_in_context_from' below for
+        // why we do this dance.
         let is_multi_line = searcher.multi_line_with_matcher(&matcher);
         // Get the line_terminator that was removed (if any) so we can add it
         // back.
@@ -470,28 +470,64 @@ pub(crate) fn trim_ascii_prefix(
     range.with_start(range.start() + count)
 }
 
-pub(crate) fn find_iter_at_in_context<M, F>(
+/// Finds matches in the given context, reusing an already authenticated first
+/// match when one is available.
+///
+/// The seed uses offsets into `bytes`. Invalid and empty seeds are ignored so
+/// that callers retain the ordinary full-iteration fallback. After emitting a
+/// valid seed, iteration resumes at its end, matching the non-overlapping
+/// progress made by `Matcher::find_iter_at` after a non-empty match.
+pub(crate) fn find_iter_at_in_context_with_seed<M, F>(
     searcher: &Searcher,
     matcher: M,
     bytes: &[u8],
     range: std::ops::Range<usize>,
-    matched: F,
+    seed: Option<Match>,
+    mut matched: F,
 ) -> io::Result<()>
 where
     M: Matcher,
     F: FnMut(Match) -> bool,
 {
-    let at = range.start;
-    find_iter_at_in_context_from(searcher, matcher, bytes, range, at, matched)
+    let bytes = context_haystack(searcher, &matcher, bytes, &range);
+    let seed = seed.filter(|m| {
+        !m.is_empty()
+            && range.start <= m.start()
+            && m.end() <= range.end
+            && m.end() <= bytes.len()
+    });
+    let mut suppress_empty_at = None;
+    let at = match seed {
+        None => range.start,
+        Some(m) => {
+            if !matched(m) {
+                return Ok(());
+            }
+            // A canonical non-overlapping iterator suppresses an empty match
+            // immediately adjacent to the preceding non-empty match. Since
+            // this iterator starts fresh after an externally supplied seed,
+            // preserve that one bit of iteration history explicitly.
+            suppress_empty_at = Some(m.end());
+            m.end()
+        }
+    };
+    find_iter_at_in_prepared_context(
+        matcher,
+        bytes,
+        range.end,
+        at,
+        suppress_empty_at,
+        matched,
+    )
 }
 
 pub(crate) fn find_iter_at_in_context_from<M, F>(
     searcher: &Searcher,
     matcher: M,
-    mut bytes: &[u8],
+    bytes: &[u8],
     range: std::ops::Range<usize>,
     at: usize,
-    mut matched: F,
+    matched: F,
 ) -> io::Result<()>
 where
     M: Matcher,
@@ -499,6 +535,18 @@ where
 {
     debug_assert!(range.start <= at);
     debug_assert!(at <= range.end);
+    let bytes = context_haystack(searcher, &matcher, bytes, &range);
+    find_iter_at_in_prepared_context(
+        matcher, bytes, range.end, at, None, matched,
+    )
+}
+
+fn context_haystack<'b, M: Matcher>(
+    searcher: &Searcher,
+    matcher: M,
+    mut bytes: &'b [u8],
+    range: &std::ops::Range<usize>,
+) -> &'b [u8] {
     // This strange dance is to account for the possibility of look-ahead in
     // the regex. The problem here is that mat.bytes() doesn't include the
     // lines beyond the match boundaries in multi-line mode, which means that
@@ -522,7 +570,7 @@ where
     // responsible for finding matches when necessary, and the printer
     // shouldn't be involved in this business in the first place. Sigh. Live
     // and learn. Abstraction boundaries are hard.
-    let is_multi_line = searcher.multi_line_with_matcher(&matcher);
+    let is_multi_line = searcher.multi_line_with_matcher(matcher);
     if is_multi_line {
         if bytes[range.end..].len() >= MAX_LOOK_AHEAD {
             bytes = &bytes[..range.end + MAX_LOOK_AHEAD];
@@ -537,9 +585,32 @@ where
         trim_line_terminator(searcher, bytes, &mut m);
         bytes = &bytes[..m.end()];
     }
+    bytes
+}
+
+fn find_iter_at_in_prepared_context<M, F>(
+    matcher: M,
+    bytes: &[u8],
+    range_end: usize,
+    at: usize,
+    mut suppress_empty_at: Option<usize>,
+    mut matched: F,
+) -> io::Result<()>
+where
+    M: Matcher,
+    F: FnMut(Match) -> bool,
+{
     matcher
         .find_iter_at(bytes, at, |m| {
-            if m.start() >= range.end {
+            if let Some(adjacent) = suppress_empty_at.take() {
+                if m.is_empty() && m.start() == adjacent {
+                    // Returning true is important: the fresh iterator must
+                    // make its normal empty-match progress even though this
+                    // callback is intentionally hidden from the consumer.
+                    return true;
+                }
+            }
+            if m.start() >= range_end {
                 return false;
             }
             matched(m)
@@ -571,7 +642,7 @@ pub(crate) fn trim_line_terminator<'b>(
 
 /// Like `Matcher::replace_with_captures_at`, but accepts an end bound.
 ///
-/// See also: `find_iter_at_in_context` for why we need this.
+/// See also: `find_iter_at_in_context_from` for why we need this.
 fn replace_with_captures_in_context<M, F>(
     matcher: M,
     bytes: &[u8],
@@ -607,7 +678,110 @@ where
 }
 
 #[cfg(test)]
+pub(crate) struct SeededRegexMatcher {
+    inner: grep_regex::RegexMatcher,
+    owner: grep_matcher::SelectedMatchOwner,
+    selected_calls: std::cell::Cell<usize>,
+}
+
+#[cfg(test)]
+impl SeededRegexMatcher {
+    pub(crate) fn new(pattern: &str) -> SeededRegexMatcher {
+        SeededRegexMatcher {
+            inner: grep_regex::RegexMatcher::new_line_matcher(pattern)
+                .unwrap(),
+            owner: grep_matcher::SelectedMatchOwner::new(),
+            selected_calls: std::cell::Cell::new(0),
+        }
+    }
+
+    pub(crate) fn selected_calls(&self) -> usize {
+        self.selected_calls.get()
+    }
+}
+
+#[cfg(test)]
+impl Matcher for SeededRegexMatcher {
+    type Captures = <grep_regex::RegexMatcher as Matcher>::Captures;
+    type Error = <grep_regex::RegexMatcher as Matcher>::Error;
+
+    fn selected_match_owner(
+        &self,
+    ) -> Option<&grep_matcher::SelectedMatchOwner> {
+        Some(&self.owner)
+    }
+
+    fn find_at(
+        &self,
+        haystack: &[u8],
+        at: usize,
+    ) -> Result<Option<Match>, Self::Error> {
+        self.inner.find_at(haystack, at)
+    }
+
+    fn new_captures(&self) -> Result<Self::Captures, Self::Error> {
+        self.inner.new_captures()
+    }
+
+    fn capture_count(&self) -> usize {
+        self.inner.capture_count()
+    }
+
+    fn capture_index(&self, name: &str) -> Option<usize> {
+        self.inner.capture_index(name)
+    }
+
+    fn captures_at(
+        &self,
+        haystack: &[u8],
+        at: usize,
+        caps: &mut Self::Captures,
+    ) -> Result<bool, Self::Error> {
+        self.inner.captures_at(haystack, at, caps)
+    }
+
+    fn shortest_match_at(
+        &self,
+        haystack: &[u8],
+        at: usize,
+    ) -> Result<Option<usize>, Self::Error> {
+        self.inner.shortest_match_at(haystack, at)
+    }
+
+    fn non_matching_bytes(&self) -> Option<&grep_matcher::ByteSet> {
+        self.inner.non_matching_bytes()
+    }
+
+    fn line_terminator(&self) -> Option<LineTerminator> {
+        self.inner.line_terminator()
+    }
+
+    fn find_candidate_line(
+        &self,
+        haystack: &[u8],
+    ) -> Result<Option<grep_matcher::LineMatchKind>, Self::Error> {
+        self.inner.find_candidate_line(haystack)
+    }
+
+    fn find_candidate_line_with_match(
+        &self,
+        haystack: &[u8],
+    ) -> Result<
+        Option<(grep_matcher::LineMatchKind, Option<Match>)>,
+        Self::Error,
+    > {
+        self.selected_calls.set(self.selected_calls.get() + 1);
+        Ok(self.inner.find(haystack)?.map(|m| {
+            (grep_matcher::LineMatchKind::Confirmed(m.end()), Some(m))
+        }))
+    }
+}
+
+#[cfg(test)]
 mod tests {
+    use grep_regex::RegexMatcher;
+    use grep_searcher::SearcherBuilder;
+
     use super::*;
 
     #[test]
@@ -622,5 +796,136 @@ mod tests {
         for n in ints {
             assert_eq!(std(n), fmt(n));
         }
+    }
+
+    #[test]
+    fn seeded_context_iteration_honors_callback_stop() {
+        let searcher = SearcherBuilder::new().build();
+        let matcher = RegexMatcher::new("a+").unwrap();
+        let mut matches = vec![];
+        find_iter_at_in_context_with_seed(
+            &searcher,
+            &matcher,
+            b"aa aa\n",
+            0..6,
+            Some(Match::new(0, 2)),
+            |m| {
+                matches.push(m);
+                false
+            },
+        )
+        .unwrap();
+        assert_eq!(matches, [Match::new(0, 2)]);
+    }
+
+    #[test]
+    fn seeded_context_iteration_suppresses_adjacent_empty() {
+        let searcher = SearcherBuilder::new().build();
+        let matcher = RegexMatcher::new("a|").unwrap();
+        let mut matches = vec![];
+        find_iter_at_in_context_with_seed(
+            &searcher,
+            &matcher,
+            b"a\n",
+            0..2,
+            Some(Match::new(0, 1)),
+            |m| {
+                matches.push(m);
+                true
+            },
+        )
+        .unwrap();
+        assert_eq!(matches, [Match::new(0, 1)]);
+    }
+
+    #[test]
+    fn seeded_context_iteration_preserves_later_terminal_empty() {
+        let searcher = SearcherBuilder::new().build();
+        let matcher = RegexMatcher::new("a|").unwrap();
+        let mut matches = vec![];
+        find_iter_at_in_context_with_seed(
+            &searcher,
+            &matcher,
+            b"aX\n",
+            0..3,
+            Some(Match::new(0, 1)),
+            |m| {
+                matches.push(m);
+                true
+            },
+        )
+        .unwrap();
+        assert_eq!(matches, [Match::new(0, 1), Match::new(2, 2)]);
+    }
+
+    #[test]
+    fn seeded_context_iteration_preserves_consecutive_match_progress() {
+        let searcher = SearcherBuilder::new().build();
+        let matcher = RegexMatcher::new("a|").unwrap();
+        let mut matches = vec![];
+        find_iter_at_in_context_with_seed(
+            &searcher,
+            &matcher,
+            b"aaX\n",
+            0..4,
+            Some(Match::new(0, 1)),
+            |m| {
+                matches.push(m);
+                true
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            matches,
+            [Match::new(0, 1), Match::new(1, 2), Match::new(3, 3)]
+        );
+    }
+
+    #[test]
+    fn seeded_context_iteration_stops_after_hidden_adjacent_empty() {
+        let searcher = SearcherBuilder::new().build();
+        let matcher = RegexMatcher::new("a|").unwrap();
+        let mut matches = vec![];
+        find_iter_at_in_context_with_seed(
+            &searcher,
+            &matcher,
+            b"aXY\n",
+            0..4,
+            Some(Match::new(0, 1)),
+            |m| {
+                matches.push(m);
+                matches.len() < 2
+            },
+        )
+        .unwrap();
+        assert_eq!(matches, [Match::new(0, 1), Match::new(2, 2)]);
+    }
+
+    #[test]
+    fn seeded_context_iteration_rejects_seed_in_trimmed_terminator() {
+        let searcher = SearcherBuilder::new().build();
+        let matcher = RegexMatcher::new(".").unwrap();
+        let mut matches = vec![];
+        find_iter_at_in_context_with_seed(
+            &searcher,
+            &matcher,
+            b"abcd\n",
+            0..5,
+            Some(Match::new(4, 5)),
+            |m| {
+                matches.push(m);
+                true
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            matches,
+            [
+                Match::new(0, 1),
+                Match::new(1, 2),
+                Match::new(2, 3),
+                Match::new(3, 4),
+            ]
+        );
     }
 }

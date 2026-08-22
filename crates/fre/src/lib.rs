@@ -540,7 +540,9 @@ mod tests {
         LineMatchKind, LineTerminator, Match as GrepMatch, Matcher,
         NoCaptures, SelectedMatchOwner,
     };
-    use grep_printer::{SummaryBuilder, SummaryKind};
+    use grep_printer::{
+        JSONBuilder, StandardBuilder, SummaryBuilder, SummaryKind,
+    };
     use grep_searcher::SearcherBuilder;
 
     use super::{Error, MatchError, RegexMatcher, RegexMatcherBuilder};
@@ -548,6 +550,7 @@ mod tests {
     #[derive(Clone, Copy, Debug)]
     enum SelectedHint {
         Forward,
+        ForwardWithoutLineProof,
         Invalid,
         Candidate,
     }
@@ -607,7 +610,10 @@ mod tests {
         }
 
         fn line_terminator(&self) -> Option<LineTerminator> {
-            self.inner.line_terminator()
+            match self.hint {
+                SelectedHint::ForwardWithoutLineProof => None,
+                _ => self.inner.line_terminator(),
+            }
         }
 
         fn find_candidate_line(
@@ -625,7 +631,8 @@ mod tests {
             self.selected_calls.set(self.selected_calls.get() + 1);
             let found = self.inner.find_candidate_line_with_match(haystack)?;
             Ok(found.map(|(kind, selected)| match self.hint {
-                SelectedHint::Forward => (kind, selected),
+                SelectedHint::Forward
+                | SelectedHint::ForwardWithoutLineProof => (kind, selected),
                 SelectedHint::Invalid => {
                     (kind, Some(GrepMatch::zero(haystack.len())))
                 }
@@ -689,6 +696,43 @@ mod tests {
         let factory = RegexMatcher::new(pattern).expect("FRE matcher");
         let worker = factory.worker().expect("FRE worker");
         count_matches_with(&worker, &worker, haystack)
+    }
+
+    fn standard_only_matches_with<M: Matcher, N: Matcher>(
+        search_matcher: &M,
+        sink_matcher: &N,
+        haystack: &[u8],
+    ) -> Vec<u8> {
+        let mut printer = StandardBuilder::new()
+            .only_matching(true)
+            .build_no_color(Vec::new());
+        SearcherBuilder::new()
+            .line_number(false)
+            .build()
+            .search_reader(
+                search_matcher,
+                haystack,
+                printer.sink(sink_matcher),
+            )
+            .expect("standard output search");
+        printer.into_inner().into_inner()
+    }
+
+    fn json_with<M: Matcher, N: Matcher>(
+        search_matcher: &M,
+        sink_matcher: &N,
+        haystack: &[u8],
+    ) -> Vec<u8> {
+        let mut printer = JSONBuilder::new().build(Vec::new());
+        SearcherBuilder::new()
+            .build()
+            .search_reader(
+                search_matcher,
+                haystack,
+                printer.sink(sink_matcher),
+            )
+            .expect("JSON output search");
+        printer.into_inner()
     }
 
     #[test]
@@ -828,6 +872,202 @@ mod tests {
         );
         assert!(matcher.selected_calls.get() > 0);
         assert_eq!(matcher.iter_at.get(), Some(4));
+    }
+
+    #[test]
+    fn standard_match_granularity_continues_after_the_selected_end() {
+        let factory = RegexMatcher::new("a+").unwrap();
+        let worker = factory.worker().unwrap();
+        let matcher = ProbeMatcher::new(&worker, SelectedHint::Forward);
+        assert_eq!(
+            standard_only_matches_with(&matcher, &matcher, b"zaaa aa\n",),
+            b"aaa\naa\n"
+        );
+        assert!(matcher.selected_calls.get() > 0);
+        assert_eq!(matcher.iter_at.get(), Some(4));
+    }
+
+    #[test]
+    fn json_match_granularity_continues_after_the_selected_end() {
+        let factory = RegexMatcher::new("a+").unwrap();
+        let worker = factory.worker().unwrap();
+        let matcher = ProbeMatcher::new(&worker, SelectedHint::Forward);
+        let got =
+            String::from_utf8(json_with(&matcher, &matcher, b"zaaa aa\n"))
+                .unwrap();
+        assert!(got.contains(r#""start":1,"end":4"#), "{got}");
+        assert!(got.contains(r#""start":5,"end":7"#), "{got}");
+        assert!(matcher.selected_calls.get() > 0);
+        assert_eq!(matcher.iter_at.get(), Some(4));
+    }
+
+    #[test]
+    fn standard_line_output_does_not_request_unneeded_match_granularity() {
+        let factory = RegexMatcher::new("a+").unwrap();
+        let worker = factory.worker().unwrap();
+        let matcher = ProbeMatcher::new(&worker, SelectedHint::Forward);
+        let mut printer = StandardBuilder::new().build_no_color(Vec::new());
+        SearcherBuilder::new()
+            .line_number(false)
+            .build()
+            .search_reader(&matcher, &b"zaaa aa\n"[..], printer.sink(&matcher))
+            .unwrap();
+        assert_eq!(printer.into_inner().into_inner(), b"zaaa aa\n");
+        assert_eq!(matcher.selected_calls.get(), 0);
+        assert_eq!(matcher.iter_at.get(), None);
+    }
+
+    #[test]
+    fn standard_match_granularity_rejects_another_owner_seed() {
+        let search_factory = RegexMatcher::new("aa").unwrap();
+        let search_worker = search_factory.worker().unwrap();
+        let search = ProbeMatcher::new(&search_worker, SelectedHint::Forward);
+        let sink_factory = RegexMatcher::new("a").unwrap();
+        let sink_worker = sink_factory.worker().unwrap();
+        let sink = ProbeMatcher::new(&sink_worker, SelectedHint::Forward);
+        assert_eq!(
+            standard_only_matches_with(&search, &sink, b"aaa\n"),
+            b"a\na\na\n"
+        );
+        assert_eq!(search.selected_calls.get(), 0);
+        assert_eq!(sink.iter_at.get(), Some(0));
+    }
+
+    #[test]
+    fn json_match_granularity_rejects_another_owner_seed() {
+        let search_factory = RegexMatcher::new("aa").unwrap();
+        let search_worker = search_factory.worker().unwrap();
+        let search = ProbeMatcher::new(&search_worker, SelectedHint::Forward);
+        let sink_factory = RegexMatcher::new("a").unwrap();
+        let sink_worker = sink_factory.worker().unwrap();
+        let sink = ProbeMatcher::new(&sink_worker, SelectedHint::Forward);
+        let got =
+            String::from_utf8(json_with(&search, &sink, b"aaa\n")).unwrap();
+        for (start, end) in [(0, 1), (1, 2), (2, 3)] {
+            assert!(
+                got.contains(&format!(r#""start":{start},"end":{end}"#)),
+                "{got}"
+            );
+        }
+        assert_eq!(search.selected_calls.get(), 0);
+        assert_eq!(sink.iter_at.get(), Some(0));
+    }
+
+    #[test]
+    fn nullable_standard_output_keeps_canonical_empty_progress() {
+        let factory = RegexMatcher::new("a*").unwrap();
+        let worker = factory.worker().unwrap();
+        let matcher = ProbeMatcher::new(&worker, SelectedHint::Forward);
+        let got = standard_only_matches_with(&matcher, &matcher, b"bbb\n");
+
+        let reference = grep_regex::RegexMatcher::new("a*").unwrap();
+        let expected =
+            standard_only_matches_with(&reference, &reference, b"bbb\n");
+        assert_eq!(got, expected);
+        assert!(matcher.selected_calls.get() > 0);
+        assert_eq!(matcher.iter_at.get(), Some(0));
+    }
+
+    #[test]
+    fn inverted_standard_output_does_not_request_a_selected_match() {
+        let factory = RegexMatcher::new("z").unwrap();
+        let worker = factory.worker().unwrap();
+        let matcher = ProbeMatcher::new(&worker, SelectedHint::Forward);
+        let mut printer =
+            StandardBuilder::new().stats(true).build_no_color(Vec::new());
+        SearcherBuilder::new()
+            .line_number(false)
+            .invert_match(true)
+            .build()
+            .search_reader(&matcher, &b"aaa\n"[..], printer.sink(&matcher))
+            .unwrap();
+        assert_eq!(printer.into_inner().into_inner(), b"aaa\n");
+        assert_eq!(matcher.selected_calls.get(), 0);
+        assert_eq!(matcher.iter_at.get(), Some(0));
+    }
+
+    #[test]
+    fn crlf_standard_output_continues_after_the_selected_end() {
+        let factory =
+            RegexMatcherBuilder::new().crlf(true).build("a+").unwrap();
+        let worker = factory.worker().unwrap();
+        let matcher = ProbeMatcher::new(&worker, SelectedHint::Forward);
+        let mut printer = StandardBuilder::new()
+            .only_matching(true)
+            .build_no_color(Vec::new());
+        SearcherBuilder::new()
+            .line_number(false)
+            .line_terminator(LineTerminator::crlf())
+            .build()
+            .search_reader(
+                &matcher,
+                &b"zaaa aa\r\n"[..],
+                printer.sink(&matcher),
+            )
+            .unwrap();
+        assert_eq!(printer.into_inner().into_inner(), b"aaa\r\naa\r\n");
+        assert!(matcher.selected_calls.get() > 0);
+        assert_eq!(matcher.iter_at.get(), Some(4));
+    }
+
+    #[test]
+    fn line_assertion_standard_output_safely_uses_the_fallback() {
+        let factory = RegexMatcher::new("a+$").unwrap();
+        let worker = factory.worker().unwrap();
+        let matcher = ProbeMatcher::new(&worker, SelectedHint::Forward);
+        assert_eq!(
+            standard_only_matches_with(&matcher, &matcher, b"zaaa\nnone\n",),
+            b"aaa\n"
+        );
+        assert_eq!(matcher.selected_calls.get(), 0);
+        assert_eq!(matcher.iter_at.get(), Some(0));
+    }
+
+    #[test]
+    fn contextual_standard_output_reuses_only_the_matching_line_seed() {
+        let factory = RegexMatcher::new("a+").unwrap();
+        let worker = factory.worker().unwrap();
+        let matcher = ProbeMatcher::new(&worker, SelectedHint::Forward);
+        let mut printer = StandardBuilder::new()
+            .only_matching(true)
+            .build_no_color(Vec::new());
+        SearcherBuilder::new()
+            .line_number(false)
+            .before_context(1)
+            .after_context(1)
+            .build()
+            .search_reader(
+                &matcher,
+                &b"before\nzaaa aa\nend\n"[..],
+                printer.sink(&matcher),
+            )
+            .unwrap();
+        assert_eq!(
+            printer.into_inner().into_inner(),
+            b"before\naaa\naa\nend\n"
+        );
+        assert!(matcher.selected_calls.get() > 0);
+        assert_eq!(matcher.iter_at.get(), Some(11));
+    }
+
+    #[test]
+    fn multiline_standard_output_safely_receives_no_selected_match() {
+        let factory = RegexMatcher::new("a+").unwrap();
+        let worker = factory.worker().unwrap();
+        let matcher =
+            ProbeMatcher::new(&worker, SelectedHint::ForwardWithoutLineProof);
+        let mut printer = StandardBuilder::new()
+            .only_matching(true)
+            .build_no_color(Vec::new());
+        SearcherBuilder::new()
+            .line_number(false)
+            .multi_line(true)
+            .build()
+            .search_reader(&matcher, &b"zaaa aa\n"[..], printer.sink(&matcher))
+            .unwrap();
+        assert_eq!(printer.into_inner().into_inner(), b"aaa\naa\n");
+        assert_eq!(matcher.selected_calls.get(), 0);
+        assert_eq!(matcher.iter_at.get(), Some(0));
     }
 
     #[test]
