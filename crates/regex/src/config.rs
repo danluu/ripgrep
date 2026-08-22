@@ -168,7 +168,7 @@ impl ConfiguredHIR {
         patterns: &[P],
     ) -> Result<ConfiguredHIR, Error> {
         let hir = if config.is_fixed_strings(patterns) {
-            let mut alts = vec![];
+            let mut alts = Vec::with_capacity(patterns.len());
             for p in patterns.iter() {
                 alts.push(Hir::literal(p.as_ref().as_bytes()));
             }
@@ -179,15 +179,7 @@ impl ConfiguredHIR {
             let hir = Hir::alternation(alts);
             hir
         } else {
-            let mut alts = vec![];
-            for p in patterns.iter() {
-                alts.push(if config.fixed_strings {
-                    format!("(?:{})", regex_syntax::escape(p.as_ref()))
-                } else {
-                    format!("(?:{})", p.as_ref())
-                });
-            }
-            let pattern = alts.join("|");
+            let pattern = alternation_pattern(&config, patterns);
             let ast = ast::parse::ParserBuilder::new()
                 .nest_limit(config.nest_limit)
                 .octal(config.octal)
@@ -345,6 +337,51 @@ impl ConfiguredHIR {
     }
 }
 
+/// Assemble the exact pattern that was historically produced by wrapping
+/// each input in a non-capturing group and joining the groups with `|`.
+///
+/// The capacity hint counts the original input bytes, four group bytes per
+/// pattern and one separator byte after every pattern but the last. Escaping
+/// fixed strings can require more room, which `escape_into` grows normally.
+/// If the hint itself overflows, normal `String` growth preserves the same
+/// eventual allocation-failure behavior without making the hint observable.
+fn alternation_pattern<P: AsRef<str>>(
+    config: &Config,
+    patterns: &[P],
+) -> String {
+    let mut pattern = match alternation_pattern_capacity(
+        patterns.iter().map(|p| p.as_ref().len()),
+    ) {
+        Some(capacity) => String::with_capacity(capacity),
+        None => String::new(),
+    };
+    for (i, p) in patterns.iter().enumerate() {
+        if i > 0 {
+            pattern.push('|');
+        }
+        pattern.push_str("(?:");
+        if config.fixed_strings {
+            regex_syntax::escape_into(p.as_ref(), &mut pattern);
+        } else {
+            pattern.push_str(p.as_ref());
+        }
+        pattern.push(')');
+    }
+    pattern
+}
+
+fn alternation_pattern_capacity(
+    pattern_lens: impl IntoIterator<Item = usize>,
+) -> Option<usize> {
+    let mut capacity = 0usize;
+    let mut count = 0usize;
+    for len in pattern_lens {
+        capacity = capacity.checked_add(len)?.checked_add(5)?;
+        count += 1;
+    }
+    if count == 0 { Some(0) } else { capacity.checked_sub(1) }
+}
+
 /// Returns true if the given literal string contains any byte from the line
 /// terminator given.
 fn has_line_terminator(lineterm: LineTerminator, literal: &str) -> bool {
@@ -352,5 +389,132 @@ fn has_line_terminator(lineterm: LineTerminator, literal: &str) -> bool {
         literal.as_bytes().iter().copied().any(|b| b == b'\r' || b == b'\n')
     } else {
         literal.as_bytes().iter().copied().any(|b| b == lineterm.as_byte())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use {grep_matcher::Matcher, regex_syntax::ast};
+
+    use super::*;
+
+    fn legacy_alternation_pattern<P: AsRef<str>>(
+        fixed_strings: bool,
+        patterns: &[P],
+    ) -> String {
+        patterns
+            .iter()
+            .map(|p| {
+                if fixed_strings {
+                    format!("(?:{})", regex_syntax::escape(p.as_ref()))
+                } else {
+                    format!("(?:{})", p.as_ref())
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("|")
+    }
+
+    fn assert_legacy_pattern<P: AsRef<str>>(
+        fixed_strings: bool,
+        patterns: &[P],
+    ) {
+        let mut config = Config::default();
+        config.fixed_strings = fixed_strings;
+        assert_eq!(
+            legacy_alternation_pattern(fixed_strings, patterns),
+            alternation_pattern(&config, patterns),
+        );
+    }
+
+    #[test]
+    fn alternation_pattern_has_legacy_byte_identity() {
+        assert_legacy_pattern(false, &[] as &[&str]);
+        assert_legacy_pattern(false, &[""]);
+        assert_legacy_pattern(false, &["one"]);
+        assert_legacy_pattern(false, &["first", "", "third"]);
+        assert_legacy_pattern(false, &["(?:already)", r"escaped\d+"]);
+        assert_legacy_pattern(false, &["snowman ☃", "東京", "\0\n"]);
+
+        let all_metas = r"\.+*?()|[]{}^$#&-~";
+        assert_legacy_pattern(true, &[] as &[&str]);
+        assert_legacy_pattern(true, &[""]);
+        assert_legacy_pattern(true, &["one"]);
+        assert_legacy_pattern(
+            true,
+            &[all_metas, "snowman ☃", "\0\n", r"already\d+"],
+        );
+        assert_eq!(
+            "(?:third)|(?:first)|(?:second)",
+            alternation_pattern(
+                &Config::default(),
+                &["third", "first", "second"],
+            ),
+        );
+    }
+
+    #[test]
+    fn alternation_pattern_capacity_is_checked() {
+        assert_eq!(Some(0), alternation_pattern_capacity([]));
+        assert_eq!(Some(4), alternation_pattern_capacity([0]));
+        assert_eq!(Some(11), alternation_pattern_capacity([1, 1]));
+        assert_eq!(None, alternation_pattern_capacity([usize::MAX]));
+        assert_eq!(None, alternation_pattern_capacity([usize::MAX - 5, 1]));
+    }
+
+    #[test]
+    fn builder_accepts_an_empty_pattern_set() {
+        let matcher =
+            crate::RegexMatcherBuilder::new().build_many::<&str>(&[]).unwrap();
+        assert!(!matcher.is_match(b"").unwrap());
+        assert!(!matcher.is_match(b"anything").unwrap());
+    }
+
+    #[test]
+    fn fixed_strings_with_case_folding_use_literal_semantics() {
+        let matcher = crate::RegexMatcherBuilder::new()
+            .fixed_strings(true)
+            .case_insensitive(true)
+            .build_many(&["a.b", "snow(☃)"])
+            .unwrap();
+        assert!(matcher.is_match("xx A.B yy".as_bytes()).unwrap());
+        assert!(matcher.is_match("SNOW(☃)".as_bytes()).unwrap());
+        assert!(!matcher.is_match(b"axb").unwrap());
+    }
+
+    #[test]
+    fn smart_case_is_analyzed_across_all_patterns() {
+        let insensitive = crate::RegexMatcherBuilder::new()
+            .case_smart(true)
+            .build_many(&["abc", "def"])
+            .unwrap();
+        assert!(insensitive.is_match(b"ABC").unwrap());
+
+        let sensitive = crate::RegexMatcherBuilder::new()
+            .case_smart(true)
+            .build_many(&["abc", "Def"])
+            .unwrap();
+        assert!(!sensitive.is_match(b"ABC").unwrap());
+        assert!(sensitive.is_match(b"Def").unwrap());
+    }
+
+    #[test]
+    fn invalid_second_pattern_preserves_diagnostic() {
+        let config = Config::default();
+        let patterns = ["first", "("];
+        let legacy = legacy_alternation_pattern(false, &patterns);
+        let legacy_error = ast::parse::ParserBuilder::new()
+            .nest_limit(config.nest_limit)
+            .octal(config.octal)
+            .ignore_whitespace(config.ignore_whitespace)
+            .build()
+            .parse(&legacy)
+            .unwrap_err();
+        assert_eq!(10, legacy_error.span().start.offset);
+        assert_eq!(11, legacy_error.span().start.column);
+        let expected = legacy_error.to_string();
+        let actual =
+            ConfiguredHIR::new(config, &patterns).unwrap_err().to_string();
+        assert_eq!(expected, actual);
     }
 }
