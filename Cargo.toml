@@ -57,10 +57,10 @@ rust-version = "1.96"
 [dependencies]
 anyhow = "1.0.75"
 bstr = "1.7.0"
-fre-ripgrep-aot-thin = { git = "https://github.com/danluu/fre.git", rev = "eca0972ff205daa860ca8cd20e125910b05baa34" }
-fre-aot-regex = { git = "https://github.com/danluu/fre.git", rev = "eca0972ff205daa860ca8cd20e125910b05baa34" }
-fre-aot-regex-loader = { git = "https://github.com/danluu/fre.git", rev = "eca0972ff205daa860ca8cd20e125910b05baa34" }
-fre-syntax = { git = "https://github.com/danluu/fre.git", rev = "eca0972ff205daa860ca8cd20e125910b05baa34" }
+fre-ripgrep-aot-thin = { git = "https://github.com/danluu/fre.git", rev = "76fc8a58e8d65007a714770fe9478e198bb88442" }
+fre-aot-regex = { git = "https://github.com/danluu/fre.git", rev = "76fc8a58e8d65007a714770fe9478e198bb88442" }
+fre-aot-regex-loader = { git = "https://github.com/danluu/fre.git", rev = "76fc8a58e8d65007a714770fe9478e198bb88442" }
+fre-syntax = { git = "https://github.com/danluu/fre.git", rev = "76fc8a58e8d65007a714770fe9478e198bb88442" }
 grep = { version = "0.4.1", path = "crates/grep" }
 grep-index = { version = "0.0.1", path = "crates/index", optional = true }
 ignore = { version = "0.4.29", path = "crates/ignore" }
