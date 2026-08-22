@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run the sealed four-arm retained-mask scanner-delta experiment.
+"""Run the sealed four-arm SVE batch4 scanner screen.
 
 This is deliberately a control runner, not a build driver. It accepts two
 already-qualified ripgrep binaries, authenticates their exact source and FRE
@@ -33,7 +33,7 @@ HERE = Path(__file__).resolve().parent
 REPO = HERE.parents[1]
 AUDITOR = HERE / "audit_scanner_delta.py"
 
-SCHEMA = "background-aot-scanner-delta-v1"
+SCHEMA = "background-aot-sve-batch4-screen-v1"
 PREREG_SCHEMA = f"{SCHEMA}.preregistration"
 PRIVATE_SCHEMA = f"{SCHEMA}.private"
 PUBLIC_SCHEMA = f"{SCHEMA}.public"
@@ -41,44 +41,44 @@ AUDIT_SCHEMA = f"{SCHEMA}.audit"
 CHECKPOINT_SCHEMA = f"{SCHEMA}.private-checkpoint-jsonl"
 HOST_CAPABILITY_SCHEMA = f"{SCHEMA}.host-capability-v1"
 PROTOCOL_SHA256 = (
-    "e244d3b79d0430994c99abc2edc3d191c7a33ab8dcd5392bd9410a8b9c1670c5"
+    "441b635f217c36209646e83e68498ee28318c0645d790826b9db8afdda6d9bd4"
 )
 POLICY = "force-selected-or-stock"
 
-OLD_SOURCE_COMMIT = "1aae40aefaab5cdf6142de0079dc51b622b4b589"
-OLD_SOURCE_TREE = "44e2c9777143f2ddc9e4da5791b741e41c6a3b48"
+OLD_SOURCE_COMMIT = "77ed5a475666d56dedd90200a8ffefeee543b949"
+OLD_SOURCE_TREE = "60b89c07fc89a5115310ca8bb6996d47d9ce9c9d"
 OLD_BINARY_SHA256 = (
-    "793d8971ea374448252e3cdbd2b22cadef99a9a9ad06acd7904aa0b3aba1e228"
-)
-OLD_FRE_COMMIT = "d2b352b7a051628bbcf8afc7f23d1362a850cb25"
-OLD_FRE_TREE = "fc129a6436035103c3f5d3c589127a08f93ab3a0"
-OLD_OPTIMIZER_VERSION = 25
-OLD_PROBE_PRIVATE_SHA256 = (
-    "872893a89d613a1c6c84dfbaa4037eb7925aa33dbb06c212675aa9956bca11bd"
-)
-OLD_PROBE_PUBLIC_SHA256 = (
-    "0344f0befe93289643af6ea92d2cbb82fe5793031b95058d16e18164c431d27c"
-)
-
-NEW_SOURCE_COMMIT = "77ed5a475666d56dedd90200a8ffefeee543b949"
-NEW_SOURCE_TREE = "60b89c07fc89a5115310ca8bb6996d47d9ce9c9d"
-NEW_BINARY_SHA256 = (
     "72009b3cc591f4da60abbaaf391de7d823f503b42c2b7ea6a87bc8b3e3d2ce87"
 )
-NEW_FRE_COMMIT = "eca0972ff205daa860ca8cd20e125910b05baa34"
-NEW_FRE_TREE = "07e72f0a7f6ade8acb15533fb041b6d60c81bc10"
-NEW_OPTIMIZER_VERSION = 26
-NEW_PROBE_PRIVATE_SHA256 = (
+OLD_FRE_COMMIT = "eca0972ff205daa860ca8cd20e125910b05baa34"
+OLD_FRE_TREE = "07e72f0a7f6ade8acb15533fb041b6d60c81bc10"
+OLD_OPTIMIZER_VERSION = 26
+OLD_PROBE_PRIVATE_SHA256 = (
     "494229fb67d4d25df4b9a161587ab9576990ac9525dda83d8909fa329ed8023c"
 )
-NEW_PROBE_PUBLIC_SHA256 = (
+OLD_PROBE_PUBLIC_SHA256 = (
     "296c5e01692a5f5f5e7a1e2631fe223103aa07aad3ce3eb8c29788273f30ec22"
 )
+
+NEW_SOURCE_COMMIT = "16879a181bd768e25f80af203efc5518b7ec4800"
+NEW_SOURCE_TREE = "89a4ef811c4edeb69b174f27b0b3b62a57b04a5a"
+NEW_BINARY_SHA256 = (
+    "0ed88e013674250281a493fef74b9d72e116b66a321202f68dbd56ee5f2d0168"
+)
+NEW_FRE_COMMIT = "76fc8a58e8d65007a714770fe9478e198bb88442"
+NEW_FRE_TREE = "536a45ab4c67fbb272c0788196a7b699ce2f8b9d"
+NEW_OPTIMIZER_VERSION = 26
+NEW_PROBE_PRIVATE_SHA256 = (
+    "cb351bbe9e7b73fa4cd2fb4e45ce1cef295e76d6e9cc074145f9359ce86d5754"
+)
+NEW_PROBE_PUBLIC_SHA256 = (
+    "0baa031d45de310d994784df87e55a17367fc5a90301e70ae96e8482b676a20a"
+)
 NEW_QUALIFICATION_MANIFEST_SHA256 = (
-    "92b7004df4d003ba9e1ee1ec60cf3ad202b799209e7d35f744db37cd3d730194"
+    "c6ff10c912f93de019b3f7d441abb63eb0a6e3cd0b4f59c817e3ae775657e273"
 )
 NEW_QUALIFICATION_ARCHIVE_SHA256 = (
-    "eb75c7fa645cfd2529bf4b1b1b6ff02a45cdfa9bd5b14f61fc724b55a89fa40b"
+    "a4a41baf9be67e7301e33c360eb761867c7bfc2dd574b8f746579c0b8808cea6"
 )
 
 FIXED44_MANIFEST_SHA256 = (
@@ -106,7 +106,7 @@ MEASURED_QUARTETS = 8
 BOOTSTRAP_REPLICATES = 10_000
 BOOTSTRAP_LOW_INDEX = 250
 BOOTSTRAP_HIGH_INDEX = 9749
-BOOTSTRAP_DOMAIN = b"rg-aot-retained-mask-scanner-delta-v1-bootstrap"
+BOOTSTRAP_DOMAIN = b"rg-aot-sve-batch4-screen-v1-bootstrap"
 METRICS = ("S", "C", "D", "R0", "R1")
 STRATA = ("intention_to_treat", "selected34", "complement10")
 PROFILE_TARGET_BITS = {
@@ -415,7 +415,6 @@ def protocol_record() -> dict[str, Any]:
         ),
         "row_traversals": {
             "primary": "canonical",
-            "reverse-row-confirmation": "reverse-canonical",
         },
         "profiles": list(CPU_PROFILES),
         "panels": list(PANELS),
@@ -486,50 +485,38 @@ def protocol_record() -> dict[str, Any]:
         "decision": {
             "primary_cell": {
                 "profile": "auto",
-                "panel": "fre-count-default-threads",
-                "stratum": "intention_to_treat",
+                "panel": "fre-count-thread1",
+                "stratum": "selected34",
             },
-            "direct_R1_target": 1.03,
-            "clear_go": "R1 interval wholly above 1.03",
-            "clear_no_go": "R1 interval wholly below 1.03",
-            "scanner_win": {
-                "ITT_S_interval_wholly_above": 1.0,
-                "ITT_D_interval_wholly_above": 1.0,
-                "selected34_D_interval_wholly_above": 1.0,
-                "C_point_inclusive": [0.97, 1.03],
-                "complement10_S_point_inclusive": [0.97, 1.03],
-                "complement10_D_point_inclusive": [0.97, 1.03],
+            "mechanism_screen": {
+                "background_S_point_at_least": 1.07,
+                "background_S_interval_wholly_above": 1.0,
+                "difference_in_differences_D_point_at_least": 1.03,
+                "difference_in_differences_D_interval_wholly_above": 1.0,
+                "integrated_R1_point_at_least": 1.03,
+                "integrated_R1_interval_wholly_above": 1.03,
+                "minimum_per_id_background_S_at_least": 0.90,
                 "background_direction_ratio_inclusive": [0.95, 1.05],
                 "cycle_orientation_ratio_inclusive": [0.95, 1.05],
             },
-            "material_delta_D_point_at_least": 1.03,
-            "reverse_confirmation_trigger": "any failed or inconclusive primary gate",
-            "reverse_confirmation_analysis": (
-                "validate runs separately; per-ID pool is sqrt(primary median "
-                "times reverse median); equal-ID geometric-mean cells; joint "
-                "bootstrap resamples the same IDs and independently resamples "
-                "eight complete quartets within each run"
-            ),
-            "combined_enablement": {
-                "both_run_R1_points_at_least": 1.03,
-                "pooled_R1_interval_wholly_above": 1.03,
-                "reverse_over_primary_R1_point_inclusive": [0.95, 1.05],
+            "controls": {
+                "panel": "fre-count-thread1",
+                "normal_C_points_inclusive": [0.99, 1.03],
+                "asimd_selected34_S_D_points_inclusive": [0.99, 1.03],
+                "complement10_S_D_points_inclusive": [0.99, 1.03],
+                "auto_sve_sve2_selected34_S_D_points_at_least": 1.0,
             },
-            "combined_scanner_win": {
-                "both_run_S_and_D_points_wholly_above": 1.0,
-                "pooled_S_and_D_intervals_wholly_above": 1.0,
-                "pooled_selected34_D_interval_wholly_above": 1.0,
-                "pooled_C_point_inclusive": [0.97, 1.03],
-                "pooled_complement10_S_D_points_inclusive": [0.97, 1.03],
-                "reverse_over_primary_S_D_C_R1_inclusive": [0.95, 1.05],
-                "each_run_direction_orientation_and_controls_must_pass": True,
-            },
-            "combined_clear_no_go": (
-                "pooled R1 interval wholly below 1.03 or either run R1 point "
-                "below 1.03"
+            "background_S_1_07_is_a_point_estimate_screen": (
+                "the separately required S lower bound above 1 establishes "
+                "positive direction, not a confidence lower bound above 1.07"
             ),
-            "combined_material_delta_D_point_at_least": 1.03,
-            "pooling_cannot_rescue_direction_order_or_control_failure": True,
+            "advance_only_if_every_requirement_passes": True,
+            "failed_or_inconclusive_gate": "no_go",
+            "reverse_timing": "ineligible and unsupported",
+            "post_go_requirement": (
+                "freeze and pass a new chronological identity-disjoint holdout "
+                "selected from baseline-only compiler facts before enablement"
+            ),
         },
         "correctness": {
             "statuses": [0, 1],
@@ -538,6 +525,19 @@ def protocol_record() -> dict[str, Any]:
             "timeouts_allowed": False,
             "temporary_artifacts_allowed": False,
             "timed_receipts": False,
+            "candidate_selected_receipt_batch_vectors_by_profile": {
+                "auto": 4,
+                "asimd": 1,
+                "sve": 4,
+                "sve2": 4,
+            },
+            "candidate_selected_receipts_per_profile": 79,
+            "candidate_selected_receipts_per_profile_by_panel": {
+                "ripgrep-default-output": 11,
+                "fre-count-default-threads": 34,
+                "fre-count-thread1": 34,
+            },
+            "candidate_selected_receipt_keys_exact": True,
         },
         "failure_evidence": {
             "format": CHECKPOINT_SCHEMA,
@@ -806,10 +806,10 @@ def stratum_rows(
 def point_aggregate(rows: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
     if not rows:
         raise ScannerDeltaError("aggregate stratum is empty")
-    points = {
-        metric: geometric_mean([
+    per_id = {
+        metric: [
             float(row["summary"]["metrics"][metric]) for row in rows
-        ])
+        ]
         for metric in METRICS
     }
     direction_a = geometric_mean([
@@ -831,7 +831,12 @@ def point_aggregate(rows: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
     return {
         "patterns": len(rows),
         "metrics": {
-            metric: {"point": points[metric]} for metric in METRICS
+            metric: {
+                "point": geometric_mean(per_id[metric]),
+                "minimum_per_id": min(per_id[metric]),
+                "maximum_per_id": max(per_id[metric]),
+            }
+            for metric in METRICS
         },
         "diagnostic_splits": {
             "background_direction_S": {
@@ -904,81 +909,97 @@ def in_closed_interval(value: float, bounds: Sequence[float]) -> bool:
 
 
 def decision_record(cells: Mapping[str, Any]) -> dict[str, Any]:
-    primary = cells["auto"]["fre-count-default-threads"]
-    itt = primary["intention_to_treat"]
-    selected = primary["selected34"]
-    complement = primary["complement10"]
-    r1 = itt["metrics"]["R1"]
-    r1_low, r1_high = r1["confidence_interval_95"]
-    direct = (
-        "clear_go" if r1_low > 1.03
-        else "clear_no_go" if r1_high < 1.03
-        else "inconclusive"
-    )
+    primary = cells["auto"]["fre-count-thread1"]["selected34"]
+    s = primary["metrics"]["S"]
+    d = primary["metrics"]["D"]
+    r1 = primary["metrics"]["R1"]
+    normal_controls = [
+        cells[profile]["fre-count-thread1"]["intention_to_treat"]
+        ["metrics"]["C"]["point"]
+        for profile in CPU_PROFILES
+    ]
+    asimd_controls = [
+        cells["asimd"]["fre-count-thread1"]["selected34"]
+        ["metrics"][metric]["point"]
+        for metric in ("S", "D")
+    ]
+    complement_controls = [
+        cells[profile]["fre-count-thread1"]["complement10"]
+        ["metrics"][metric]["point"]
+        for profile in CPU_PROFILES
+        for metric in ("S", "D")
+    ]
+    relevant_directions = [
+        cells[profile]["fre-count-thread1"]["selected34"]
+        ["metrics"][metric]["point"]
+        for profile in ("auto", "sve", "sve2")
+        for metric in ("S", "D")
+    ]
     requirements = {
-        "direct_R1_point_at_least_1_03": r1["point"] >= 1.03,
-        "direct_R1_interval_wholly_above_1_03": r1_low > 1.03,
-        "ITT_S_interval_wholly_above_1": (
-            itt["metrics"]["S"]["confidence_interval_95"][0] > 1.0
+        "selected34_auto_thread1_S_point_at_least_1_07": s["point"] >= 1.07,
+        "selected34_auto_thread1_S_interval_wholly_above_1": (
+            s["confidence_interval_95"][0] > 1.0
         ),
-        "ITT_D_interval_wholly_above_1": (
-            itt["metrics"]["D"]["confidence_interval_95"][0] > 1.0
+        "selected34_auto_thread1_D_point_at_least_1_03": d["point"] >= 1.03,
+        "selected34_auto_thread1_D_interval_wholly_above_1": (
+            d["confidence_interval_95"][0] > 1.0
         ),
-        "selected34_D_interval_wholly_above_1": (
-            selected["metrics"]["D"]["confidence_interval_95"][0] > 1.0
+        "selected34_auto_thread1_R1_point_at_least_1_03": r1["point"] >= 1.03,
+        "selected34_auto_thread1_R1_interval_wholly_above_1_03": (
+            r1["confidence_interval_95"][0] > 1.03
         ),
-        "C_point_in_0_97_1_03": in_closed_interval(
-            itt["metrics"]["C"]["point"], (0.97, 1.03)
-        ),
-        "complement10_S_point_in_0_97_1_03": in_closed_interval(
-            complement["metrics"]["S"]["point"], (0.97, 1.03)
-        ),
-        "complement10_D_point_in_0_97_1_03": in_closed_interval(
-            complement["metrics"]["D"]["point"], (0.97, 1.03)
+        "selected34_auto_thread1_minimum_per_id_S_at_least_0_90": (
+            s["minimum_per_id"] >= 0.90
         ),
         "background_direction_ratio_in_0_95_1_05": in_closed_interval(
-            itt["diagnostic_splits"]["background_direction_S"]["ratio"],
+            primary["diagnostic_splits"]["background_direction_S"]["ratio"],
             (0.95, 1.05),
         ),
         "cycle_orientation_ratio_in_0_95_1_05": in_closed_interval(
-            itt["diagnostic_splits"]["cycle_orientation_D"]["ratio"],
+            primary["diagnostic_splits"]["cycle_orientation_D"]["ratio"],
             (0.95, 1.05),
         ),
-        "material_D_point_at_least_1_03": (
-            itt["metrics"]["D"]["point"] >= 1.03
+        "thread1_normal_C_points_in_0_99_1_03": all(
+            in_closed_interval(value, (0.99, 1.03))
+            for value in normal_controls
+        ),
+        "thread1_asimd_selected34_S_D_points_in_0_99_1_03": all(
+            in_closed_interval(value, (0.99, 1.03))
+            for value in asimd_controls
+        ),
+        "thread1_complement10_S_D_points_in_0_99_1_03": all(
+            in_closed_interval(value, (0.99, 1.03))
+            for value in complement_controls
+        ),
+        "thread1_auto_sve_sve2_selected34_S_D_points_at_least_1": all(
+            value >= 1.0 for value in relevant_directions
         ),
     }
-    triggers = [name for name, passed in requirements.items() if not passed]
-    scanner_gate_names = (
-        "ITT_S_interval_wholly_above_1",
-        "ITT_D_interval_wholly_above_1",
-        "selected34_D_interval_wholly_above_1",
-        "C_point_in_0_97_1_03",
-        "complement10_S_point_in_0_97_1_03",
-        "complement10_D_point_in_0_97_1_03",
-        "background_direction_ratio_in_0_95_1_05",
-        "cycle_orientation_ratio_in_0_95_1_05",
+    failures = [name for name, passed in requirements.items() if not passed]
+    direct = (
+        "clear_go"
+        if requirements["selected34_auto_thread1_R1_point_at_least_1_03"]
+        and requirements[
+            "selected34_auto_thread1_R1_interval_wholly_above_1_03"
+        ]
+        else "clear_no_go"
     )
-    scanner_win = all(requirements[name] for name in scanner_gate_names)
-    material = requirements["material_D_point_at_least_1_03"]
-    overall = (
-        "go" if direct == "clear_go" and scanner_win and material
-        else "no_go" if direct == "clear_no_go"
-        else "inconclusive"
-    )
+    scanner_win = all(requirements.values())
+    material = requirements["selected34_auto_thread1_S_point_at_least_1_07"]
     return {
         "primary_cell": {
             "profile": "auto",
-            "panel": "fre-count-default-threads",
-            "stratum": "intention_to_treat",
+            "panel": "fre-count-thread1",
+            "stratum": "selected34",
         },
         "direct_R1_classification": direct,
         "scanner_win": scanner_win,
         "material_delta": material,
         "requirements": requirements,
-        "overall": overall,
-        "reverse_row_confirmation_required": bool(triggers),
-        "reverse_row_confirmation_triggers": triggers,
+        "overall": "go" if scanner_win else "no_go",
+        "advancement_gate_failures": failures,
+        "reverse_row_confirmation_required": False,
+        "reverse_row_confirmation_triggers": [],
     }
 
 
@@ -995,12 +1016,7 @@ def load_json_object(path: Path, label: str) -> dict[str, Any]:
 def normalize_bound_probe_optimizer(
     value: Any, *, role: str, expected: int,
 ) -> tuple[Any, int]:
-    """Authenticate a probe optimizer and normalize only the sealed old copy.
-
-    The representative validator remains unchanged: v7 generally requires
-    optimizer 26. The sole optimizer-25 exception is an in-memory copy of the
-    exact old probe whose source, binary, and file digests were already pinned.
-    """
+    """Authenticate optimizer identities without mutating sealed probes."""
     count = 0
 
     def visit(item: Any) -> Any:
@@ -1020,12 +1036,131 @@ def normalize_bound_probe_optimizer(
                     f"{role} probe optimizer identity is invalid"
                 )
             count += 1
-            if role == "old":
-                copied["optimizer_version"] = NEW_OPTIMIZER_VERSION
         return copied
 
     normalized = visit(value)
     return normalized, count
+
+
+def batch_vector_verification(
+    private: Mapping[str, Any], *, role: str,
+) -> dict[str, Any]:
+    if role == "old":
+        return {
+            "required": False,
+            "reason": "baseline predates the authenticated batch-width field",
+        }
+    if role != "new":
+        raise ScannerDeltaError("unknown batch-vector verification role")
+    rows = private.get("rows")
+    if not isinstance(rows, list):
+        raise ScannerDeltaError("new probe rows are missing")
+    expected_batches = {"auto": 4, "asimd": 1, "sve": 4, "sve2": 4}
+    expected_tiers = {
+        "auto": "aarch64_sve2",
+        "asimd": "aarch64_asimd",
+        "sve": "aarch64_sve",
+        "sve2": "aarch64_sve2",
+    }
+    selected_ids = (
+        representative.FROZEN_EXACT_TEDDY_V2_FORCE_SELECTED_PRIVATE_IDS
+    )
+    expected_ids_by_panel = {
+        "ripgrep-default-output": {
+            private_id for private_id in selected_ids
+            if private_id.startswith("oot-")
+        },
+        "fre-count-default-threads": set(selected_ids),
+        "fre-count-thread1": set(selected_ids),
+    }
+    expected_keys = {
+        (profile, panel, private_id)
+        for profile in CPU_PROFILES
+        for panel, private_ids in expected_ids_by_panel.items()
+        for private_id in private_ids
+    }
+    observed_keys: set[tuple[str, str, str]] = set()
+    observed = {profile: 0 for profile in CPU_PROFILES}
+    observed_by_panel = {
+        profile: {panel: 0 for panel in PANELS}
+        for profile in CPU_PROFILES
+    }
+    distributions = {profile: {} for profile in CPU_PROFILES}
+    for row in rows:
+        if (
+            not isinstance(row, Mapping)
+            or row.get("private_id") not in selected_ids
+        ):
+            continue
+        profile = row.get("cpu_profile")
+        panel = row.get("panel")
+        private_id = row.get("private_id")
+        key = (profile, panel, private_id)
+        if key not in expected_keys or key in observed_keys:
+            raise ScannerDeltaError(
+                "new probe batch-vector receipt key is invalid or duplicated"
+            )
+        observed_keys.add(key)
+        background = row.get("background")
+        receipt = (
+            background.get("receipt")
+            if isinstance(background, Mapping) else None
+        )
+        compile_receipt = (
+            receipt.get("compile_receipt_v2")
+            if isinstance(receipt, Mapping) else None
+        )
+        report = (
+            compile_receipt.get("exact_finite_selected_end_teddy_aot_v2")
+            if isinstance(compile_receipt, Mapping) else None
+        )
+        lowering = report.get("lowering") if isinstance(report, Mapping) else None
+        expected_batch = expected_batches[str(profile)]
+        expected_tier = expected_tiers[str(profile)]
+        if (
+            not isinstance(lowering, Mapping)
+            or lowering.get("batch_vectors") != expected_batch
+            or lowering.get("selected_target_tier") != expected_tier
+            or lowering.get("emitted_isa")
+            != ("aarch64_asimd" if profile == "asimd" else "aarch64_sve")
+            or lowering.get("authenticated_compiler_report") is not True
+        ):
+            raise ScannerDeltaError(
+                "new probe does not authenticate the selected batch width"
+        )
+        observed[str(profile)] += 1
+        observed_by_panel[str(profile)][str(panel)] += 1
+        key = str(lowering["batch_vectors"])
+        distributions[str(profile)][key] = (
+            distributions[str(profile)].get(key, 0) + 1
+        )
+    expected_counts = {profile: 79 for profile in CPU_PROFILES}
+    expected_panel_counts = {
+        panel: len(private_ids)
+        for panel, private_ids in expected_ids_by_panel.items()
+    }
+    expected_by_panel = {
+        profile: dict(expected_panel_counts) for profile in CPU_PROFILES
+    }
+    if (
+        observed_keys != expected_keys
+        or observed != expected_counts
+        or observed_by_panel != expected_by_panel
+    ):
+        raise ScannerDeltaError(
+            "new probe batch-vector receipt matrix is incomplete"
+        )
+    return {
+        "required": True,
+        "expected_selected_receipts_per_profile": expected_counts,
+        "expected_selected_receipts_per_profile_by_panel": expected_by_panel,
+        "expected_batch_vectors_by_profile": expected_batches,
+        "observed_selected_receipts_per_profile": observed,
+        "observed_selected_receipts_per_profile_by_panel": observed_by_panel,
+        "observed_batch_vectors_by_profile": distributions,
+        "exact_profile_panel_private_id_coverage": True,
+        "all_passed": True,
+    }
 
 
 def validate_qualification_probe(
@@ -1132,6 +1267,7 @@ def validate_qualification_probe(
     rows = normalized.get("rows")
     if not isinstance(rows, list):
         raise ScannerDeltaError(f"{role} probe rows are missing")
+    batch_verification = batch_vector_verification(normalized, role=role)
     forced_gates = normalized.get("forced_midscan_gates")
     v2_gates = normalized.get("exact_teddy_v2_gates")
     if (
@@ -1253,6 +1389,7 @@ def validate_qualification_probe(
         "host_capability_signature": probe_host_signature,
         "forced_midscan_gate_verification": forced_verification,
         "exact_teddy_v2_gate_verification": v2_verification,
+        "batch_vector_verification": batch_verification,
         "untimed_reference_correctness_verified": True,
     }
 
@@ -1701,122 +1838,6 @@ def run_row(
     }
 
 
-def validate_primary_authorization(
-    args: argparse.Namespace,
-    prereg: Mapping[str, Any],
-    prereg_sha256: str,
-) -> dict[str, Any] | None:
-    primary_paths = (
-        args.primary_private_result,
-        args.primary_public_result,
-        args.primary_audit_result,
-    )
-    if args.campaign_role == "primary":
-        if args.row_traversal != "canonical" or any(path is not None for path in primary_paths):
-            raise ScannerDeltaError("primary role/traversal or inputs are invalid")
-        return None
-    if (
-        args.campaign_role != "reverse-row-confirmation"
-        or args.row_traversal != "reverse-canonical"
-        or any(path is None for path in primary_paths)
-    ):
-        raise ScannerDeltaError("reverse confirmation is not fully authorized")
-    assert args.primary_private_result is not None
-    assert args.primary_public_result is not None
-    assert args.primary_audit_result is not None
-    primary_private_sha = representative.sha256_file(args.primary_private_result)
-    primary_public_sha = representative.sha256_file(args.primary_public_result)
-    primary_public = load_json_object(args.primary_public_result, "primary public result")
-    audit = load_json_object(args.primary_audit_result, "primary audit")
-    exact_keys(
-        audit,
-        (
-            "schema", "verified", "auditor", "audit_unix_ns",
-            "preregistration_sha256", "primary_private_sha256",
-            "primary_public_sha256", "reverse_private_sha256",
-            "reverse_public_sha256", "reverse_row_confirmation_required",
-            "reverse_row_confirmation_triggers", "chronology", "primary",
-            "reverse", "combined_analysis",
-        ),
-        "primary authorization audit",
-    )
-    auditor = exact_keys(
-        audit["auditor"],
-        ("implementation", "sha256", "imports_runner_or_representative_harness"),
-        "primary authorization auditor",
-    )
-    chronology = exact_keys(
-        audit["chronology"],
-        (
-            "primary_start_unix_ns", "primary_end_unix_ns",
-            "primary_authorization_audit_unix_ns", "reverse_start_unix_ns",
-            "reverse_end_unix_ns", "non_overlapping",
-        ),
-        "primary authorization chronology",
-    )
-    workload = primary_public.get("workload_environment")
-    decision = primary_public.get("decision")
-    if not isinstance(workload, Mapping) or not isinstance(decision, Mapping):
-        raise ScannerDeltaError("primary public authorization evidence is malformed")
-    primary_end = workload.get("end")
-    if not isinstance(primary_end, Mapping):
-        raise ScannerDeltaError("primary workload end is malformed")
-    audit_unix_ns = audit["audit_unix_ns"]
-    if (
-        primary_public.get("schema") != PUBLIC_SCHEMA
-        or primary_public.get("campaign_role") != "primary"
-        or primary_public.get("row_traversal") != "canonical"
-        or primary_public.get("preregistration_sha256") != prereg_sha256
-        or primary_public.get("private_result_sha256") != primary_private_sha
-        or decision.get("reverse_row_confirmation_required") is not True
-        or audit.get("schema") != AUDIT_SCHEMA
-        or audit.get("verified") is not True
-        or audit.get("preregistration_sha256") != prereg_sha256
-        or audit.get("primary_private_sha256") != primary_private_sha
-        or audit.get("primary_public_sha256") != primary_public_sha
-        or not strict_json_equal(auditor, {
-            "implementation": "independent_offline_v1",
-            "sha256": prereg["runner"]["auditor_sha256"],
-            "imports_runner_or_representative_harness": False,
-        })
-        or audit.get("reverse_row_confirmation_required") is not True
-        or audit.get("reverse_row_confirmation_triggers")
-        != decision.get("reverse_row_confirmation_triggers")
-        or audit.get("reverse_private_sha256") is not None
-        or audit.get("reverse_public_sha256") is not None
-        or not strict_json_equal(audit.get("primary"), {
-            "decision": decision, "cells": primary_public.get("cells")
-        })
-        or audit.get("reverse") is not None
-        or audit.get("combined_analysis") is not None
-        or not positive_int(audit_unix_ns)
-        or not positive_int(primary_end.get("unix_ns"))
-        or audit_unix_ns <= primary_end["unix_ns"]
-        or not strict_json_equal(chronology, {
-            "primary_start_unix_ns": workload.get("start", {}).get("unix_ns"),
-            "primary_end_unix_ns": primary_end["unix_ns"],
-            "primary_authorization_audit_unix_ns": audit_unix_ns,
-            "reverse_start_unix_ns": None,
-            "reverse_end_unix_ns": None,
-            "non_overlapping": None,
-        })
-    ):
-        raise ScannerDeltaError("primary audit does not authorize confirmation")
-    return {
-        "primary_private_sha256": primary_private_sha,
-        "primary_public_sha256": primary_public_sha,
-        "primary_audit_sha256": representative.sha256_file(
-            args.primary_audit_result
-        ),
-        "auditor_sha256": prereg["runner"]["auditor_sha256"],
-        "primary_audit_unix_ns": audit_unix_ns,
-        "primary_workload_end": dict(primary_end),
-        "triggers": decision[
-            "reverse_row_confirmation_triggers"
-        ],
-    }
-
-
 class PrivateCheckpointJournal:
     """Append-only, fsync'd private evidence surviving a terminal failure."""
 
@@ -1884,11 +1905,8 @@ class PrivateCheckpointJournal:
 def run_scanner_delta(
     args: argparse.Namespace, journal: PrivateCheckpointJournal,
 ) -> None:
-    journal.stage("preregistration_and_authorization")
+    journal.stage("preregistration")
     prereg, prereg_sha256 = load_preregistration(args.preregistration)
-    authorization = validate_primary_authorization(
-        args, prereg, prereg_sha256
-    )
     journal.stage("selection_and_probe_binding")
     source_oot, source_wider = representative.selected_cases(args)
     all_cases = representative.exact_teddy_v2_campaign_cases(
@@ -1919,27 +1937,12 @@ def run_scanner_delta(
             raise ScannerDeltaError("materialized corpus identity changed")
         panels = representative.panels_for(corpus_paths)
         canonical = canonical_rows(panels, oot, wider)
-        traversal = (
-            canonical
-            if args.row_traversal == "canonical"
-            else list(reversed(canonical))
-        )
+        traversal = canonical
         pre = input_binding(
             args, prereg, prereg_sha256, oot, wider, corpus_paths,
             corpus_records,
         )
         workload_start = representative.load_snapshot()
-        if authorization is not None:
-            primary_end = authorization.get("primary_workload_end")
-            audit_unix_ns = authorization.get("primary_audit_unix_ns")
-            if (
-                not isinstance(primary_end, Mapping)
-                or not isinstance(primary_end.get("unix_ns"), int)
-                or not positive_int(audit_unix_ns)
-                or workload_start["unix_ns"] <= primary_end["unix_ns"]
-                or workload_start["unix_ns"] <= audit_unix_ns
-            ):
-                raise ScannerDeltaError("confirmation does not follow primary")
         rows = []
         journal.stage("timing_rows")
         binaries = {"old": args.old_binary, "new": args.new_binary}
@@ -1972,14 +1975,14 @@ def run_scanner_delta(
         "schema": PRIVATE_SCHEMA,
         "contains_raw_patterns": True,
         "local_only_do_not_commit": True,
-        "campaign_role": args.campaign_role,
-        "row_traversal": args.row_traversal,
+        "campaign_role": "primary",
+        "row_traversal": "canonical",
         "preregistration_sha256": prereg_sha256,
         "protocol": protocol_record(),
         "bootstrap_seed": seed_record,
         "pre_run_input_binding": pre,
         "post_run_input_binding": post,
-        "confirmation_of": authorization,
+        "confirmation_of": None,
         "selection_manifest_sha256": FIXED44_MANIFEST_SHA256,
         "selection_manifest": representative.case_manifest(all_cases),
         "workload_environment": {
@@ -1996,14 +1999,14 @@ def run_scanner_delta(
         "schema": PUBLIC_SCHEMA,
         "aggregate_only": True,
         "contains_patterns_commands_paths_or_per_pattern_rows": False,
-        "campaign_role": args.campaign_role,
-        "row_traversal": args.row_traversal,
+        "campaign_role": "primary",
+        "row_traversal": "canonical",
         "preregistration_sha256": prereg_sha256,
         "protocol": protocol_record(),
         "bootstrap_seed": seed_record,
         "pre_run_input_binding": pre,
         "post_run_input_binding": post,
-        "confirmation_of": authorization,
+        "confirmation_of": None,
         "method": {
             "unit": "one frozen query in one fresh ripgrep process",
             "timed_arms": ["B0", "B1", "N1", "N0"],
@@ -2077,19 +2080,6 @@ def benchmark_parser() -> argparse.ArgumentParser:
     parser.add_argument("--ripgrep-corpus-commit", required=True)
     add_existing_path_argument(parser, "--fre-corpus-repo")
     parser.add_argument("--fre-corpus-commit", required=True)
-    parser.add_argument(
-        "--campaign-role",
-        choices=("primary", "reverse-row-confirmation"),
-        required=True,
-    )
-    parser.add_argument(
-        "--row-traversal",
-        choices=("canonical", "reverse-canonical"),
-        required=True,
-    )
-    parser.add_argument("--primary-private-result", type=Path)
-    parser.add_argument("--primary-public-result", type=Path)
-    parser.add_argument("--primary-audit-result", type=Path)
     parser.add_argument("--private-output", required=True)
     parser.add_argument("--public-output", required=True)
     parser.add_argument("--private-checkpoint-output", required=True)
@@ -2099,13 +2089,6 @@ def benchmark_parser() -> argparse.ArgumentParser:
 def parse_benchmark_args(argv: Sequence[str]) -> argparse.Namespace:
     parser = benchmark_parser()
     args = parser.parse_args(argv)
-    for field in (
-        "primary_private_result", "primary_public_result",
-        "primary_audit_result",
-    ):
-        value = getattr(args, field)
-        if value is not None:
-            setattr(args, field, value.expanduser().resolve(strict=True))
     args.private_output = resolved_new_path(parser, args.private_output)
     args.public_output = resolved_new_path(parser, args.public_output)
     args.private_checkpoint_output = resolved_new_path(
@@ -2138,8 +2121,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         args = parse_benchmark_args(arguments)
         journal = PrivateCheckpointJournal(
             args.private_checkpoint_output,
-            campaign_role=args.campaign_role,
-            row_traversal=args.row_traversal,
+            campaign_role="primary",
+            row_traversal="canonical",
         )
         run_scanner_delta(args, journal)
         return 0

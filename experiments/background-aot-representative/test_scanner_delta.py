@@ -188,6 +188,34 @@ def external_probe_records() -> dict:
                 "profiles": 4,
                 "all_passed": True,
             },
+            "batch_vector_verification": (
+                {
+                    "required": False,
+                    "reason": (
+                        "baseline predates the authenticated batch-width field"
+                    ),
+                }
+                if role == "old"
+                else {
+                    "required": True,
+                    "expected_selected_receipts_per_profile": {
+                        profile: 79 for profile in RUNNER.CPU_PROFILES
+                    },
+                    "expected_batch_vectors_by_profile": {
+                        "auto": 4, "asimd": 1, "sve": 4, "sve2": 4,
+                    },
+                    "observed_selected_receipts_per_profile": {
+                        profile: 79 for profile in RUNNER.CPU_PROFILES
+                    },
+                    "observed_batch_vectors_by_profile": {
+                        "auto": {"4": 79},
+                        "asimd": {"1": 79},
+                        "sve": {"4": 79},
+                        "sve2": {"4": 79},
+                    },
+                    "all_passed": True,
+                }
+            ),
         }
     return result
 
@@ -229,6 +257,9 @@ def input_binding_document(prereg: dict, prereg_sha256: str) -> dict:
             ],
             "exact_teddy_v2_gate_verification": external[role][
                 "exact_teddy_v2_gate_verification"
+            ],
+            "batch_vector_verification": external[role][
+                "batch_vector_verification"
             ],
             "untimed_reference_correctness_verified": True,
         }
@@ -374,9 +405,9 @@ class PreregistrationTests(unittest.TestCase):
         self.assertEqual(
             {
                 "sha256": (
-                    "1caba9b4acf7e92d40917bfafce52b33867be78078b4c4a748e3216b67629892"
+                    "3aa879e37e9fa2fda2556469e6792837b6dbdaec9857bbf867b4bef06d9a298e"
                 ),
-                "u64_big_endian_first8": 2065931447540640045,
+                "u64_big_endian_first8": 4226762268276138749,
             },
             RUNNER.bootstrap_seed_record(loaded),
         )
@@ -650,23 +681,96 @@ class RunnerIsolationTests(unittest.TestCase):
         self.assertTrue(all(call["capture_receipt"] is False for call in calls))
         self.assertEqual(set(RUNNER.METRICS), set(result["metrics"]))
 
-    def test_bound_old_optimizer_exception_is_copy_only(self) -> None:
+    def test_both_optimizer_26_probes_are_unchanged_and_25_is_rejected(self) -> None:
         receipt = {
             "schema_version": 2,
-            "optimizer_version": 25,
+            "optimizer_version": 26,
             "exact_finite_selected_end_teddy_policy": "force_structurally_eligible",
         }
         original = {"compile_receipt_v2": receipt}
-        normalized, count = RUNNER.normalize_bound_probe_optimizer(
-            original, role="old", expected=25
-        )
-        self.assertEqual(1, count)
-        self.assertEqual(25, original["compile_receipt_v2"]["optimizer_version"])
-        self.assertEqual(26, normalized["compile_receipt_v2"]["optimizer_version"])
-        with self.assertRaises(RUNNER.ScannerDeltaError):
-            RUNNER.normalize_bound_probe_optimizer(
-                original, role="new", expected=26
+        for role in ("old", "new"):
+            normalized, count = RUNNER.normalize_bound_probe_optimizer(
+                original, role=role, expected=26
             )
+            self.assertEqual(1, count)
+            self.assertEqual(original, normalized)
+            self.assertIsNot(original, normalized)
+        changed = copy.deepcopy(original)
+        changed["compile_receipt_v2"]["optimizer_version"] = 25
+        for role in ("old", "new"):
+            with self.assertRaises(RUNNER.ScannerDeltaError):
+                RUNNER.normalize_bound_probe_optimizer(
+                    changed, role=role, expected=26
+                )
+
+    def test_candidate_batch_width_matrix_is_independently_authenticated(self) -> None:
+        selected_ids = (
+            RUNNER.representative
+            .FROZEN_EXACT_TEDDY_V2_FORCE_SELECTED_PRIVATE_IDS
+        )
+        expected_ids_by_panel = {
+            "ripgrep-default-output": {
+                private_id for private_id in selected_ids
+                if private_id.startswith("oot-")
+            },
+            "fre-count-default-threads": set(selected_ids),
+            "fre-count-thread1": set(selected_ids),
+        }
+        expected = {"auto": 4, "asimd": 1, "sve": 4, "sve2": 4}
+        tiers = {
+            "auto": "aarch64_sve2",
+            "asimd": "aarch64_asimd",
+            "sve": "aarch64_sve",
+            "sve2": "aarch64_sve2",
+        }
+        rows = []
+        for profile in RUNNER.CPU_PROFILES:
+            for panel, private_ids in expected_ids_by_panel.items():
+                for private_id in private_ids:
+                    rows.append({
+                        "private_id": private_id,
+                        "cpu_profile": profile,
+                        "panel": panel,
+                        "background": {
+                            "receipt": {
+                                "compile_receipt_v2": {
+                                    "exact_finite_selected_end_teddy_aot_v2": {
+                                        "lowering": {
+                                            "authenticated_compiler_report": True,
+                                            "batch_vectors": expected[profile],
+                                            "selected_target_tier": tiers[profile],
+                                            "emitted_isa": (
+                                                "aarch64_asimd"
+                                                if profile == "asimd"
+                                                else "aarch64_sve"
+                                            ),
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    })
+        private = {"rows": rows}
+        runner = RUNNER.batch_vector_verification(private, role="new")
+        auditor = AUDITOR.batch_vector_verification(private, role="new")
+        self.assertEqual(runner, auditor)
+        self.assertTrue(runner["all_passed"])
+        self.assertTrue(runner["exact_profile_panel_private_id_coverage"])
+        changed = copy.deepcopy(private)
+        changed["rows"][0]["background"]["receipt"]["compile_receipt_v2"][
+            "exact_finite_selected_end_teddy_aot_v2"
+        ]["lowering"]["batch_vectors"] = 1
+        with self.assertRaises(RUNNER.ScannerDeltaError):
+            RUNNER.batch_vector_verification(changed, role="new")
+        with self.assertRaises(AUDITOR.AuditError):
+            AUDITOR.batch_vector_verification(changed, role="new")
+
+        duplicated = copy.deepcopy(private)
+        duplicated["rows"][1] = copy.deepcopy(duplicated["rows"][0])
+        with self.assertRaises(RUNNER.ScannerDeltaError):
+            RUNNER.batch_vector_verification(duplicated, role="new")
+        with self.assertRaises(AUDITOR.AuditError):
+            AUDITOR.batch_vector_verification(duplicated, role="new")
 
 
 class ProvenanceAndFailureTests(unittest.TestCase):
@@ -833,100 +937,66 @@ class ProvenanceAndFailureTests(unittest.TestCase):
                 AUDITOR.build_audit(args)
         external.assert_not_called()
 
-    def test_reverse_authorization_requires_exact_audit_envelope(self) -> None:
-        prereg = prereg_document()
-        prereg_sha = "a" * 64
-        decision = {
-            "reverse_row_confirmation_required": True,
-            "reverse_row_confirmation_triggers": ["gate"],
-        }
-        cells = {"sealed": True}
-        workload = {
-            "start": {"unix_ns": 100},
-            "end": {"unix_ns": 150},
-        }
+    def test_reverse_options_are_absent_from_both_clis(self) -> None:
         with tempfile.TemporaryDirectory() as text:
             root = Path(text)
-            private_path = root / "primary.private.json"
-            public_path = root / "primary.public.json"
-            audit_path = root / "primary.audit.json"
-            private_path.write_text("private\n")
-            private_sha = hashlib.sha256(private_path.read_bytes()).hexdigest()
-            public = {
-                "schema": RUNNER.PUBLIC_SCHEMA,
-                "campaign_role": "primary",
-                "row_traversal": "canonical",
-                "preregistration_sha256": prereg_sha,
-                "private_result_sha256": private_sha,
-                "decision": decision,
-                "cells": cells,
-                "workload_environment": workload,
-            }
-            public_path.write_text(json.dumps(public) + "\n")
-            public_sha = hashlib.sha256(public_path.read_bytes()).hexdigest()
-            audit = {
-                "schema": RUNNER.AUDIT_SCHEMA,
-                "verified": True,
-                "auditor": {
-                    "implementation": "independent_offline_v1",
-                    "sha256": prereg["runner"]["auditor_sha256"],
-                    "imports_runner_or_representative_harness": False,
-                },
-                "audit_unix_ns": 200,
-                "preregistration_sha256": prereg_sha,
-                "primary_private_sha256": private_sha,
-                "primary_public_sha256": public_sha,
-                "reverse_private_sha256": None,
-                "reverse_public_sha256": None,
-                "reverse_row_confirmation_required": True,
-                "reverse_row_confirmation_triggers": ["gate"],
-                "chronology": {
-                    "primary_start_unix_ns": 100,
-                    "primary_end_unix_ns": 150,
-                    "primary_authorization_audit_unix_ns": 200,
-                    "reverse_start_unix_ns": None,
-                    "reverse_end_unix_ns": None,
-                    "non_overlapping": None,
-                },
-                "primary": {"decision": decision, "cells": cells},
-                "reverse": None,
-                "combined_analysis": None,
-            }
-            audit_path.write_text(json.dumps(audit) + "\n")
-            args = SimpleNamespace(
-                campaign_role="reverse-row-confirmation",
-                row_traversal="reverse-canonical",
-                primary_private_result=private_path,
-                primary_public_result=public_path,
-                primary_audit_result=audit_path,
-            )
-            authorization = RUNNER.validate_primary_authorization(
-                args, prereg, prereg_sha
-            )
-            self.assertEqual(200, authorization["primary_audit_unix_ns"])
-            primary_record = {
-                "private_sha256": private_sha,
-                "public_sha256": public_sha,
-                "decision": decision,
-                "cells": cells,
-                "start": {"unix_ns": 100},
-                "end": {"unix_ns": 150},
-                "binding": input_binding_document(prereg, prereg_sha),
-            }
-            confirmation = copy.deepcopy(authorization)
-            self.assertEqual(
-                200,
-                AUDITOR.validate_primary_authorization_audit(
-                    audit_path,
-                    prereg_sha256=prereg_sha,
-                    primary=primary_record,
-                    confirmation=confirmation,
-                ),
-            )
-            audit["extra"] = True
-            audit_path.write_text(json.dumps(audit) + "\n")
-            with self.assertRaises(RUNNER.ScannerDeltaError):
-                RUNNER.validate_primary_authorization(args, prereg, prereg_sha)
+            existing = root / "input"
+            existing.write_text("sealed\n")
+            runner_args = ["benchmark-scanner-delta"]
+            for name in (
+                "preregistration", "selection-manifest-input", "old-binary",
+                "old-source", "old-fre-source", "new-binary", "new-source",
+                "new-fre-source", "old-probe-private", "old-probe-public",
+                "new-probe-private", "new-probe-public",
+                "new-qualification-manifest", "new-qualification-archive",
+                "ripgrep-corpus-repo", "fre-corpus-repo",
+            ):
+                runner_args.extend((f"--{name}", str(existing)))
+            runner_args.extend((
+                "--ripgrep-corpus-commit", HEX40,
+                "--fre-corpus-commit", "3" * 40,
+                "--private-output", str(root / "private"),
+                "--public-output", str(root / "public"),
+                "--private-checkpoint-output", str(root / "checkpoint"),
+            ))
+            for option, value in (
+                ("--campaign-role", "reverse-row-confirmation"),
+                ("--row-traversal", "reverse-canonical"),
+                ("--primary-private-result", str(existing)),
+                ("--primary-public-result", str(existing)),
+                ("--primary-audit-result", str(existing)),
+            ):
+                stderr = io.StringIO()
+                with (
+                    mock.patch("sys.stderr", stderr),
+                    self.assertRaises(SystemExit),
+                ):
+                    RUNNER.benchmark_parser().parse_args(
+                        [*runner_args, option, value]
+                    )
+                self.assertIn("unrecognized arguments", stderr.getvalue())
+
+            audit_args = []
+            for name in (
+                "preregistration", "selection-manifest-input",
+                "old-probe-private", "old-probe-public", "new-probe-private",
+                "new-probe-public", "new-qualification-manifest",
+                "new-qualification-archive", "primary-private-result",
+                "primary-public-result",
+            ):
+                audit_args.extend((f"--{name}", str(existing)))
+            audit_args.extend(("--output", str(root / "audit")))
+            for option in (
+                "--reverse-private-result", "--reverse-public-result",
+                "--primary-authorization-audit",
+            ):
+                stderr = io.StringIO()
+                with (
+                    mock.patch("sys.stderr", stderr),
+                    self.assertRaises(SystemExit),
+                ):
+                    AUDITOR.parse_args([*audit_args, option, str(existing)])
+                self.assertIn("unrecognized arguments", stderr.getvalue())
 
 
 class FullMatrixMutationTests(unittest.TestCase):
@@ -990,7 +1060,7 @@ class FullMatrixMutationTests(unittest.TestCase):
             ),
         )
 
-    def test_full_408_row_matrix_and_reverse_traversal(self) -> None:
+    def test_full_408_row_matrix_is_primary_canonical_only(self) -> None:
         manifest = self.manifest()
         rows = self.rows(manifest)
         patches = self.digest_patches(manifest)
@@ -1000,12 +1070,12 @@ class FullMatrixMutationTests(unittest.TestCase):
                 rows, traversal="canonical", manifest=validated_manifest,
                 by_id=by_id,
             )
-            reverse = AUDITOR.validate_rows(
-                list(reversed(rows)), traversal="reverse-canonical",
-                manifest=validated_manifest, by_id=by_id,
-            )
+            with self.assertRaises(AUDITOR.AuditError):
+                AUDITOR.validate_rows(
+                    list(reversed(rows)), traversal="reverse-canonical",
+                    manifest=validated_manifest, by_id=by_id,
+                )
         self.assertEqual(408, len(canonical))
-        self.assertEqual(407, reverse[0]["canonical_row_ordinal"])
 
     def test_full_matrix_rejects_row_and_warmup_mutations(self) -> None:
         manifest = self.manifest()
@@ -1257,204 +1327,186 @@ class AggregateAndDecisionTests(unittest.TestCase):
             auditor = AUDITOR.aggregate_rows(rows, 1234)
         AUDITOR.compare_float_tree(runner, auditor, "cross implementation")
 
-    def decision_cells(self, *, direct_low: float, direct_high: float) -> dict:
-        aggregate = {
-            "patterns": 44,
-            "metrics": {
-                metric: {
-                    "point": 1.04 if metric in ("S", "D", "R1") else 1.0,
-                    "confidence_interval_95": [1.01, 1.07],
-                }
-                for metric in RUNNER.METRICS
-            },
-            "diagnostic_splits": {
-                "background_direction_S": {
-                    "A_before_B": 1.04, "B_before_A": 1.04, "ratio": 1.0,
+    def decision_cells(self) -> dict:
+        def aggregate(patterns: int) -> dict:
+            points = {"S": 1.08, "C": 1.0, "D": 1.04, "R0": 1.0, "R1": 1.04}
+            return {
+                "patterns": patterns,
+                "metrics": {
+                    metric: {
+                        "point": points[metric],
+                        "minimum_per_id": points[metric],
+                        "maximum_per_id": points[metric],
+                        "confidence_interval_95": [1.01, 1.09],
+                    }
+                    for metric in RUNNER.METRICS
                 },
-                "cycle_orientation_D": {
-                    "orders_0_3": 1.04, "orders_4_7": 1.04, "ratio": 1.0,
+                "diagnostic_splits": {
+                    "background_direction_S": {
+                        "A_before_B": 1.04,
+                        "B_before_A": 1.04,
+                        "ratio": 1.0,
+                    },
+                    "cycle_orientation_D": {
+                        "orders_0_3": 1.04,
+                        "orders_4_7": 1.04,
+                        "ratio": 1.0,
+                    },
                 },
-            },
-        }
-        aggregate["metrics"]["R1"]["confidence_interval_95"] = [
-            direct_low, direct_high
-        ]
-        selected = copy.deepcopy(aggregate)
-        selected["patterns"] = 34
-        complement = copy.deepcopy(aggregate)
-        complement["patterns"] = 10
-        complement["metrics"]["S"]["point"] = 1.0
-        complement["metrics"]["D"]["point"] = 1.0
-        return {
-            "auto": {
-                "fre-count-default-threads": {
-                    "intention_to_treat": aggregate,
+            }
+
+        cells = {}
+        for profile in RUNNER.CPU_PROFILES:
+            cells[profile] = {}
+            for panel in RUNNER.PANELS:
+                itt = aggregate(44)
+                selected = aggregate(34)
+                complement = aggregate(10)
+                complement["metrics"]["S"]["point"] = 1.0
+                complement["metrics"]["D"]["point"] = 1.0
+                if profile == "asimd":
+                    selected["metrics"]["S"]["point"] = 1.0
+                    selected["metrics"]["D"]["point"] = 1.0
+                cells[profile][panel] = {
+                    "intention_to_treat": itt,
                     "selected34": selected,
                     "complement10": complement,
                 }
-            }
-        }
+        primary = cells["auto"]["fre-count-thread1"]["selected34"]
+        primary["metrics"]["S"]["confidence_interval_95"] = [1.01, 1.10]
+        primary["metrics"]["D"]["confidence_interval_95"] = [1.01, 1.08]
+        primary["metrics"]["R1"]["confidence_interval_95"] = [1.031, 1.08]
+        primary["metrics"]["S"]["minimum_per_id"] = 0.95
+        return cells
 
-    def test_decision_clear_go_no_go_and_inconclusive(self) -> None:
-        go = RUNNER.decision_record(self.decision_cells(direct_low=1.031, direct_high=1.08))
-        self.assertEqual("go", go["overall"])
-        self.assertFalse(go["reverse_row_confirmation_required"])
-        no_go = RUNNER.decision_record(self.decision_cells(direct_low=0.98, direct_high=1.02))
-        self.assertEqual("no_go", no_go["overall"])
-        self.assertTrue(no_go["reverse_row_confirmation_required"])
-        uncertain = RUNNER.decision_record(self.decision_cells(direct_low=1.02, direct_high=1.04))
-        self.assertEqual("inconclusive", uncertain["overall"])
-        self.assertTrue(uncertain["reverse_row_confirmation_required"])
-        self.assertEqual(
-            go,
-            AUDITOR.decision(
-                self.decision_cells(direct_low=1.031, direct_high=1.08)
+    def assert_no_go(self, cells: dict, requirement: str) -> None:
+        runner = RUNNER.decision_record(cells)
+        auditor = AUDITOR.decision(cells)
+        self.assertEqual(runner, auditor)
+        self.assertEqual("no_go", runner["overall"])
+        self.assertIn(requirement, runner["advancement_gate_failures"])
+        self.assertFalse(runner["reverse_row_confirmation_required"])
+        self.assertEqual([], runner["reverse_row_confirmation_triggers"])
+
+    def test_decision_go_is_primary_only_and_independently_recomputed(self) -> None:
+        cells = self.decision_cells()
+        decision = RUNNER.decision_record(cells)
+        self.assertEqual("go", decision["overall"])
+        self.assertEqual(decision, AUDITOR.decision(cells))
+        self.assertFalse(decision["reverse_row_confirmation_required"])
+        changed = copy.deepcopy(cells)
+        for profile in RUNNER.CPU_PROFILES:
+            changed[profile]["ripgrep-default-output"]["selected34"][
+                "metrics"
+            ]["S"]["point"] = 0.1
+        self.assertEqual(decision, RUNNER.decision_record(changed))
+
+    def test_primary_gate_boundaries_are_exact_and_fail_closed(self) -> None:
+        primary_path = ("auto", "fre-count-thread1", "selected34")
+        cases = (
+            (
+                "selected34_auto_thread1_S_point_at_least_1_07",
+                ("metrics", "S", "point"), 1.07, 1.069999,
+            ),
+            (
+                "selected34_auto_thread1_S_interval_wholly_above_1",
+                ("metrics", "S", "confidence_interval_95", 0),
+                1.000001, 1.0,
+            ),
+            (
+                "selected34_auto_thread1_D_point_at_least_1_03",
+                ("metrics", "D", "point"), 1.03, 1.029999,
+            ),
+            (
+                "selected34_auto_thread1_D_interval_wholly_above_1",
+                ("metrics", "D", "confidence_interval_95", 0),
+                1.000001, 1.0,
+            ),
+            (
+                "selected34_auto_thread1_R1_point_at_least_1_03",
+                ("metrics", "R1", "point"), 1.03, 1.029999,
+            ),
+            (
+                "selected34_auto_thread1_R1_interval_wholly_above_1_03",
+                ("metrics", "R1", "confidence_interval_95", 0),
+                1.030001, 1.03,
+            ),
+            (
+                "selected34_auto_thread1_minimum_per_id_S_at_least_0_90",
+                ("metrics", "S", "minimum_per_id"), 0.90, 0.899999,
             ),
         )
 
-    def test_every_prespecified_gate_can_trigger_confirmation(self) -> None:
-        base = self.decision_cells(direct_low=1.031, direct_high=1.08)
-        mutations = (
-            ("C", "point", 1.04),
-            ("S", "confidence_interval_95", [0.99, 1.08]),
-            ("D", "confidence_interval_95", [0.99, 1.08]),
-        )
-        for metric, field, value in mutations:
-            changed = copy.deepcopy(base)
-            changed["auto"]["fre-count-default-threads"][
-                "intention_to_treat"
-            ]["metrics"][metric][field] = value
-            self.assertTrue(RUNNER.decision_record(changed)["reverse_row_confirmation_required"])
-        changed = copy.deepcopy(base)
-        changed["auto"]["fre-count-default-threads"]["selected34"][
-            "metrics"
-        ]["D"]["confidence_interval_95"][0] = 0.99
-        self.assertTrue(RUNNER.decision_record(changed)["reverse_row_confirmation_required"])
-        for metric in ("S", "D"):
-            changed = copy.deepcopy(base)
-            changed["auto"]["fre-count-default-threads"]["complement10"][
-                "metrics"
-            ][metric]["point"] = 1.04
-            self.assertTrue(RUNNER.decision_record(changed)["reverse_row_confirmation_required"])
-        for split in ("background_direction_S", "cycle_orientation_D"):
-            changed = copy.deepcopy(base)
-            changed["auto"]["fre-count-default-threads"][
-                "intention_to_treat"
-            ]["diagnostic_splits"][split]["ratio"] = 1.051
-            self.assertTrue(RUNNER.decision_record(changed)["reverse_row_confirmation_required"])
+        def assign(root: dict, path: tuple, value: float) -> None:
+            target = root
+            for key in path[:-1]:
+                target = target[key]
+            target[path[-1]] = value
 
-    def test_paired_combination_resamples_runs_jointly_and_deterministically(self) -> None:
-        primary_rows = self.matrix_rows()
-        reverse_rows = copy.deepcopy(primary_rows)
-        for row in reverse_rows:
-            scale = 1.1 if row["private_id"] in AUDITOR.SELECTED_IDS else 0.98
-            for item in row["quartets"]:
-                item["metrics"] = {
-                    metric: float(value) * scale
-                    for metric, value in item["metrics"].items()
-                }
-            row["summary"] = RUNNER.row_summary(row["quartets"])
-        with (
-            mock.patch.object(RUNNER, "BOOTSTRAP_REPLICATES", 20),
-            mock.patch.object(RUNNER, "BOOTSTRAP_LOW_INDEX", 0),
-            mock.patch.object(RUNNER, "BOOTSTRAP_HIGH_INDEX", 19),
-            mock.patch.object(AUDITOR, "BOOTSTRAP_REPLICATES", 20),
-            mock.patch.object(AUDITOR, "BOOTSTRAP_LOW_INDEX", 0),
-            mock.patch.object(AUDITOR, "BOOTSTRAP_HIGH_INDEX", 19),
+        for requirement, path, passing, failing in cases:
+            changed = self.decision_cells()
+            primary = changed
+            for key in primary_path:
+                primary = primary[key]
+            assign(primary, path, passing)
+            self.assertTrue(
+                RUNNER.decision_record(changed)["requirements"][requirement]
+            )
+            assign(primary, path, failing)
+            self.assert_no_go(changed, requirement)
+
+        for split, requirement in (
+            (
+                "background_direction_S",
+                "background_direction_ratio_in_0_95_1_05",
+            ),
+            (
+                "cycle_orientation_D",
+                "cycle_orientation_ratio_in_0_95_1_05",
+            ),
         ):
-            primary_cells = RUNNER.aggregate_rows(primary_rows, 1234)
-            reverse_cells = RUNNER.aggregate_rows(reverse_rows, 1234)
-            primary = {
-                "rows": primary_rows,
-                "cells": primary_cells,
-                "decision": RUNNER.decision_record(primary_cells),
-            }
-            reverse = {
-                "rows": reverse_rows,
-                "cells": reverse_cells,
-                "decision": RUNNER.decision_record(reverse_cells),
-            }
-            first = AUDITOR.combined_analysis(primary, reverse, 4321)
-            second = AUDITOR.combined_analysis(primary, reverse, 4321)
-        AUDITOR.compare_float_tree(first, second, "paired determinism")
-        selected_id = next(iter(AUDITOR.SELECTED_IDS & {
-            row["private_id"] for row in primary_rows
-        }))
-        p_row = next(row for row in primary_rows if row["private_id"] == selected_id)
-        r_row = next(row for row in reverse_rows if row["private_id"] == selected_id)
-        expected_selected = (
-            float(p_row["summary"]["metrics"]["S"])
-            * float(r_row["summary"]["metrics"]["S"])
-        ) ** 0.5
-        actual_selected = first["pooled_cells"]["auto"][
-            "fre-count-default-threads"
-        ]["selected34"]["metrics"]["S"]["point"]
-        self.assertAlmostEqual(expected_selected, actual_selected)
-        self.assertEqual(
-            [0, 19], first["method"]["percentile_indices"]
-        )
+            for passing in (0.95, 1.05):
+                changed = self.decision_cells()
+                primary = changed["auto"]["fre-count-thread1"]["selected34"]
+                primary["diagnostic_splits"][split]["ratio"] = passing
+                self.assertTrue(
+                    RUNNER.decision_record(changed)["requirements"][requirement]
+                )
+            for failing in (0.949999, 1.050001):
+                changed = self.decision_cells()
+                primary = changed["auto"]["fre-count-thread1"]["selected34"]
+                primary["diagnostic_splits"][split]["ratio"] = failing
+                self.assert_no_go(changed, requirement)
 
-    def test_combined_verdict_cannot_pool_away_run_failures(self) -> None:
-        cells = self.decision_cells(direct_low=1.031, direct_high=1.08)
-        primary = {
-            "cells": copy.deepcopy(cells),
-            "decision": RUNNER.decision_record(copy.deepcopy(cells)),
-        }
-        reverse = copy.deepcopy(primary)
-        pooled = copy.deepcopy(cells)
-        ratios = {
-            "auto": {
-                "fre-count-default-threads": {
-                    "intention_to_treat": {
-                        metric: 1.0 for metric in RUNNER.METRICS
-                    }
-                }
-            }
-        }
-        go = AUDITOR.combined_decision(primary, reverse, pooled, ratios)
-        self.assertEqual("go", go["overall"])
-        self.assertTrue(go["enable_new_scanner"])
-
-        run_below = copy.deepcopy(reverse)
-        run_below["cells"]["auto"]["fre-count-default-threads"][
-            "intention_to_treat"
-        ]["metrics"]["R1"]["point"] = 1.029
-        self.assertEqual(
-            "no_go",
-            AUDITOR.combined_decision(
-                primary, run_below, pooled, ratios
-            )["overall"],
+    def test_all_thread1_controls_are_blocking_with_inclusive_bounds(self) -> None:
+        mutations = (
+            (
+                "thread1_normal_C_points_in_0_99_1_03",
+                ("sve2", "intention_to_treat", "C"),
+                0.989999,
+            ),
+            (
+                "thread1_asimd_selected34_S_D_points_in_0_99_1_03",
+                ("asimd", "selected34", "S"),
+                1.030001,
+            ),
+            (
+                "thread1_complement10_S_D_points_in_0_99_1_03",
+                ("sve", "complement10", "D"),
+                1.030001,
+            ),
+            (
+                "thread1_auto_sve_sve2_selected34_S_D_points_at_least_1",
+                ("sve2", "selected34", "D"),
+                0.999999,
+            ),
         )
-        unstable = copy.deepcopy(ratios)
-        unstable["auto"]["fre-count-default-threads"][
-            "intention_to_treat"
-        ]["S"] = 1.051
-        self.assertEqual(
-            "inconclusive",
-            AUDITOR.combined_decision(
-                primary, reverse, pooled, unstable
-            )["overall"],
-        )
-        direction_failure = copy.deepcopy(primary)
-        direction_failure["decision"]["requirements"][
-            "background_direction_ratio_in_0_95_1_05"
-        ] = False
-        self.assertEqual(
-            "inconclusive",
-            AUDITOR.combined_decision(
-                direction_failure, reverse, pooled, ratios
-            )["overall"],
-        )
-        control_failure = copy.deepcopy(pooled)
-        control_failure["auto"]["fre-count-default-threads"][
-            "intention_to_treat"
-        ]["metrics"]["C"]["point"] = 1.031
-        self.assertEqual(
-            "inconclusive",
-            AUDITOR.combined_decision(
-                primary, reverse, control_failure, ratios
-            )["overall"],
-        )
+        for requirement, (profile, stratum, metric), value in mutations:
+            changed = self.decision_cells()
+            changed[profile]["fre-count-thread1"][stratum]["metrics"][metric][
+                "point"
+            ] = value
+            self.assert_no_go(changed, requirement)
 
 
 if __name__ == "__main__":

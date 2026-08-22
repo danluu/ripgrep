@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""Independently audit sealed retained-mask scanner-delta artifacts offline.
+"""Independently audit sealed SVE batch4 scanner-screen artifacts offline.
 
 This module intentionally imports neither the runner nor the representative
 harness. It duplicates the frozen protocol constants and independently
 recomputes row metrics, equal-ID aggregates, hierarchical confidence
-intervals, decision gates, reverse-run chronology, and pooled diagnostics.
+intervals, and decision gates for the sole primary canonical campaign.
 """
 
 from __future__ import annotations
@@ -25,46 +25,46 @@ from typing import Any, Iterable, Mapping, Sequence
 
 
 HERE = Path(__file__).resolve().parent
-SCHEMA = "background-aot-scanner-delta-v1"
+SCHEMA = "background-aot-sve-batch4-screen-v1"
 PREREG_SCHEMA = f"{SCHEMA}.preregistration"
 PRIVATE_SCHEMA = f"{SCHEMA}.private"
 PUBLIC_SCHEMA = f"{SCHEMA}.public"
 AUDIT_SCHEMA = f"{SCHEMA}.audit"
 HOST_CAPABILITY_SCHEMA = f"{SCHEMA}.host-capability-v1"
 PROTOCOL_SHA256 = (
-    "e244d3b79d0430994c99abc2edc3d191c7a33ab8dcd5392bd9410a8b9c1670c5"
+    "441b635f217c36209646e83e68498ee28318c0645d790826b9db8afdda6d9bd4"
 )
-OLD_SOURCE_COMMIT = "1aae40aefaab5cdf6142de0079dc51b622b4b589"
-OLD_SOURCE_TREE = "44e2c9777143f2ddc9e4da5791b741e41c6a3b48"
+OLD_SOURCE_COMMIT = "77ed5a475666d56dedd90200a8ffefeee543b949"
+OLD_SOURCE_TREE = "60b89c07fc89a5115310ca8bb6996d47d9ce9c9d"
 OLD_BINARY_SHA256 = (
-    "793d8971ea374448252e3cdbd2b22cadef99a9a9ad06acd7904aa0b3aba1e228"
-)
-OLD_FRE_COMMIT = "d2b352b7a051628bbcf8afc7f23d1362a850cb25"
-OLD_FRE_TREE = "fc129a6436035103c3f5d3c589127a08f93ab3a0"
-OLD_PROBE_PRIVATE_SHA256 = (
-    "872893a89d613a1c6c84dfbaa4037eb7925aa33dbb06c212675aa9956bca11bd"
-)
-OLD_PROBE_PUBLIC_SHA256 = (
-    "0344f0befe93289643af6ea92d2cbb82fe5793031b95058d16e18164c431d27c"
-)
-NEW_SOURCE_COMMIT = "77ed5a475666d56dedd90200a8ffefeee543b949"
-NEW_SOURCE_TREE = "60b89c07fc89a5115310ca8bb6996d47d9ce9c9d"
-NEW_BINARY_SHA256 = (
     "72009b3cc591f4da60abbaaf391de7d823f503b42c2b7ea6a87bc8b3e3d2ce87"
 )
-NEW_FRE_COMMIT = "eca0972ff205daa860ca8cd20e125910b05baa34"
-NEW_FRE_TREE = "07e72f0a7f6ade8acb15533fb041b6d60c81bc10"
-NEW_PROBE_PRIVATE_SHA256 = (
+OLD_FRE_COMMIT = "eca0972ff205daa860ca8cd20e125910b05baa34"
+OLD_FRE_TREE = "07e72f0a7f6ade8acb15533fb041b6d60c81bc10"
+OLD_PROBE_PRIVATE_SHA256 = (
     "494229fb67d4d25df4b9a161587ab9576990ac9525dda83d8909fa329ed8023c"
 )
-NEW_PROBE_PUBLIC_SHA256 = (
+OLD_PROBE_PUBLIC_SHA256 = (
     "296c5e01692a5f5f5e7a1e2631fe223103aa07aad3ce3eb8c29788273f30ec22"
 )
+NEW_SOURCE_COMMIT = "16879a181bd768e25f80af203efc5518b7ec4800"
+NEW_SOURCE_TREE = "89a4ef811c4edeb69b174f27b0b3b62a57b04a5a"
+NEW_BINARY_SHA256 = (
+    "0ed88e013674250281a493fef74b9d72e116b66a321202f68dbd56ee5f2d0168"
+)
+NEW_FRE_COMMIT = "76fc8a58e8d65007a714770fe9478e198bb88442"
+NEW_FRE_TREE = "536a45ab4c67fbb272c0788196a7b699ce2f8b9d"
+NEW_PROBE_PRIVATE_SHA256 = (
+    "cb351bbe9e7b73fa4cd2fb4e45ce1cef295e76d6e9cc074145f9359ce86d5754"
+)
+NEW_PROBE_PUBLIC_SHA256 = (
+    "0baa031d45de310d994784df87e55a17367fc5a90301e70ae96e8482b676a20a"
+)
 NEW_QUALIFICATION_MANIFEST_SHA256 = (
-    "92b7004df4d003ba9e1ee1ec60cf3ad202b799209e7d35f744db37cd3d730194"
+    "c6ff10c912f93de019b3f7d441abb63eb0a6e3cd0b4f59c817e3ae775657e273"
 )
 NEW_QUALIFICATION_ARCHIVE_SHA256 = (
-    "eb75c7fa645cfd2529bf4b1b1b6ff02a45cdfa9bd5b14f61fc724b55a89fa40b"
+    "a4a41baf9be67e7301e33c360eb761867c7bfc2dd574b8f746579c0b8808cea6"
 )
 FIXED44_MANIFEST_SHA256 = (
     "35b0037122bf2ab9a2c1641a562f23f12b88856ceb66c713ceb9403adb541823"
@@ -114,7 +114,7 @@ ORDERS = (
     ("D", "B", "A", "C"),
     ("B", "A", "C", "D"),
 )
-BOOTSTRAP_DOMAIN = b"rg-aot-retained-mask-scanner-delta-v1-bootstrap"
+BOOTSTRAP_DOMAIN = b"rg-aot-sve-batch4-screen-v1-bootstrap"
 BOOTSTRAP_REPLICATES = 10_000
 BOOTSTRAP_LOW_INDEX = 250
 BOOTSTRAP_HIGH_INDEX = 9749
@@ -363,7 +363,7 @@ def identity_record(role: str) -> dict[str, Any]:
             "binary_sha256": OLD_BINARY_SHA256,
             "fre_commit": OLD_FRE_COMMIT,
             "fre_tree": OLD_FRE_TREE,
-            "optimizer_version": 25,
+            "optimizer_version": 26,
         }
     if role == "new":
         return {
@@ -485,6 +485,122 @@ def validate_preregistration(path: Path) -> tuple[dict[str, Any], str]:
     return prereg, hashlib.sha256(raw).hexdigest()
 
 
+def batch_vector_verification(
+    private: Mapping[str, Any], *, role: str,
+) -> dict[str, Any]:
+    if role == "old":
+        return {
+            "required": False,
+            "reason": "baseline predates the authenticated batch-width field",
+        }
+    if role != "new":
+        raise AuditError("unknown batch-vector verification role")
+    rows = private.get("rows")
+    if not isinstance(rows, list):
+        raise AuditError("new probe rows are missing")
+    expected_batches = {"auto": 4, "asimd": 1, "sve": 4, "sve2": 4}
+    expected_tiers = {
+        "auto": "aarch64_sve2",
+        "asimd": "aarch64_asimd",
+        "sve": "aarch64_sve",
+        "sve2": "aarch64_sve2",
+    }
+    expected_ids_by_panel = {
+        "ripgrep-default-output": {
+            private_id for private_id in SELECTED_IDS
+            if private_id.startswith("oot-")
+        },
+        "fre-count-default-threads": set(SELECTED_IDS),
+        "fre-count-thread1": set(SELECTED_IDS),
+    }
+    expected_keys = {
+        (profile, panel, private_id)
+        for profile in CPU_PROFILES
+        for panel, private_ids in expected_ids_by_panel.items()
+        for private_id in private_ids
+    }
+    observed_keys: set[tuple[str, str, str]] = set()
+    observed = {profile: 0 for profile in CPU_PROFILES}
+    observed_by_panel = {
+        profile: {panel: 0 for panel in PANELS}
+        for profile in CPU_PROFILES
+    }
+    distributions = {profile: {} for profile in CPU_PROFILES}
+    for row in rows:
+        if (
+            not isinstance(row, Mapping)
+            or row.get("private_id") not in SELECTED_IDS
+        ):
+            continue
+        profile = row.get("cpu_profile")
+        panel = row.get("panel")
+        private_id = row.get("private_id")
+        key = (profile, panel, private_id)
+        if key not in expected_keys or key in observed_keys:
+            raise AuditError(
+                "new probe batch-vector receipt key is invalid or duplicated"
+            )
+        observed_keys.add(key)
+        background = row.get("background")
+        receipt = (
+            background.get("receipt")
+            if isinstance(background, Mapping) else None
+        )
+        compile_receipt = (
+            receipt.get("compile_receipt_v2")
+            if isinstance(receipt, Mapping) else None
+        )
+        report = (
+            compile_receipt.get("exact_finite_selected_end_teddy_aot_v2")
+            if isinstance(compile_receipt, Mapping) else None
+        )
+        lowering = report.get("lowering") if isinstance(report, Mapping) else None
+        expected_batch = expected_batches[str(profile)]
+        expected_tier = expected_tiers[str(profile)]
+        if (
+            not isinstance(lowering, Mapping)
+            or lowering.get("batch_vectors") != expected_batch
+            or lowering.get("selected_target_tier") != expected_tier
+            or lowering.get("emitted_isa")
+            != ("aarch64_asimd" if profile == "asimd" else "aarch64_sve")
+            or lowering.get("authenticated_compiler_report") is not True
+        ):
+            raise AuditError(
+                "new probe does not authenticate the selected batch width"
+        )
+        observed[str(profile)] += 1
+        observed_by_panel[str(profile)][str(panel)] += 1
+        key = str(lowering["batch_vectors"])
+        distributions[str(profile)][key] = (
+            distributions[str(profile)].get(key, 0) + 1
+        )
+    expected_counts = {profile: 79 for profile in CPU_PROFILES}
+    expected_panel_counts = {
+        panel: len(private_ids)
+        for panel, private_ids in expected_ids_by_panel.items()
+    }
+    expected_by_panel = {
+        profile: dict(expected_panel_counts) for profile in CPU_PROFILES
+    }
+    if (
+        observed_keys != expected_keys
+        or observed != expected_counts
+        or observed_by_panel != expected_by_panel
+    ):
+        raise AuditError("new probe batch-vector receipt matrix is incomplete")
+    return {
+        "required": True,
+        "expected_selected_receipts_per_profile": expected_counts,
+        "expected_selected_receipts_per_profile_by_panel": expected_by_panel,
+        "expected_batch_vectors_by_profile": expected_batches,
+        "observed_selected_receipts_per_profile": observed,
+        "observed_selected_receipts_per_profile_by_panel": observed_by_panel,
+        "observed_batch_vectors_by_profile": distributions,
+        "exact_profile_panel_private_id_coverage": True,
+        "all_passed": True,
+    }
+
+
 def verify_external_bindings(
     args: argparse.Namespace, prereg: Mapping[str, Any],
 ) -> dict[str, Any]:
@@ -567,6 +683,7 @@ def verify_external_bindings(
         if not isinstance(disposition, Mapping) or not isinstance(matrix, Mapping):
             raise AuditError(f"{role} qualification probe matrices are malformed")
         host_signature = probe_capability_signature(public)
+        batch_verification = batch_vector_verification(private, role=role)
         target_profiles = matrix.get("per_profile", {})
         target_hosts = matrix.get("global_qualified_host_feature_bits", [])
         expected_disposition = {
@@ -679,6 +796,7 @@ def verify_external_bindings(
                 "profiles": public["exact_teddy_v2_gate"]["profiles"],
                 "all_passed": public["exact_teddy_v2_gate"]["all_passed"],
             },
+            "batch_vector_verification": batch_verification,
         }
     return result
 
@@ -1153,8 +1271,10 @@ def validate_rows(
 ) -> list[dict[str, Any]]:
     if not isinstance(rows, list) or len(rows) != 408:
         raise AuditError("result row matrix is incomplete")
+    if traversal != "canonical":
+        raise AuditError("only canonical row traversal is auditable")
     specs = expected_row_specs(manifest)
-    expected_order = specs if traversal == "canonical" else list(reversed(specs))
+    expected_order = specs
     validated = []
     corpus_roots: dict[str, str] = {}
     identity_fields = (
@@ -1269,11 +1389,17 @@ def rows_for_stratum(
 def point_aggregate(rows: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
     if not rows:
         raise AuditError("aggregate stratum is empty")
+    per_id = {
+        metric: [
+            float(row["summary"]["metrics"][metric]) for row in rows
+        ]
+        for metric in METRICS
+    }
     metrics = {
         metric: {
-            "point": geometric_mean([
-                float(row["summary"]["metrics"][metric]) for row in rows
-            ])
+            "point": geometric_mean(per_id[metric]),
+            "minimum_per_id": min(per_id[metric]),
+            "maximum_per_id": max(per_id[metric]),
         }
         for metric in METRICS
     }
@@ -1364,81 +1490,94 @@ def in_range(value: float, low: float, high: float) -> bool:
 
 
 def decision(cells: Mapping[str, Any]) -> dict[str, Any]:
-    cell = cells["auto"]["fre-count-default-threads"]
-    itt = cell["intention_to_treat"]
-    selected = cell["selected34"]
-    complement = cell["complement10"]
-    r1 = itt["metrics"]["R1"]
-    low, high = r1["confidence_interval_95"]
-    classification = (
-        "clear_go" if low > 1.03
-        else "clear_no_go" if high < 1.03
-        else "inconclusive"
-    )
+    primary = cells["auto"]["fre-count-thread1"]["selected34"]
+    s = primary["metrics"]["S"]
+    d = primary["metrics"]["D"]
+    r1 = primary["metrics"]["R1"]
+    normal_controls = [
+        cells[profile]["fre-count-thread1"]["intention_to_treat"]
+        ["metrics"]["C"]["point"]
+        for profile in CPU_PROFILES
+    ]
+    asimd_controls = [
+        cells["asimd"]["fre-count-thread1"]["selected34"]
+        ["metrics"][metric]["point"]
+        for metric in ("S", "D")
+    ]
+    complement_controls = [
+        cells[profile]["fre-count-thread1"]["complement10"]
+        ["metrics"][metric]["point"]
+        for profile in CPU_PROFILES
+        for metric in ("S", "D")
+    ]
+    relevant_directions = [
+        cells[profile]["fre-count-thread1"]["selected34"]
+        ["metrics"][metric]["point"]
+        for profile in ("auto", "sve", "sve2")
+        for metric in ("S", "D")
+    ]
     requirements = {
-        "direct_R1_point_at_least_1_03": r1["point"] >= 1.03,
-        "direct_R1_interval_wholly_above_1_03": low > 1.03,
-        "ITT_S_interval_wholly_above_1": (
-            itt["metrics"]["S"]["confidence_interval_95"][0] > 1.0
+        "selected34_auto_thread1_S_point_at_least_1_07": s["point"] >= 1.07,
+        "selected34_auto_thread1_S_interval_wholly_above_1": (
+            s["confidence_interval_95"][0] > 1.0
         ),
-        "ITT_D_interval_wholly_above_1": (
-            itt["metrics"]["D"]["confidence_interval_95"][0] > 1.0
+        "selected34_auto_thread1_D_point_at_least_1_03": d["point"] >= 1.03,
+        "selected34_auto_thread1_D_interval_wholly_above_1": (
+            d["confidence_interval_95"][0] > 1.0
         ),
-        "selected34_D_interval_wholly_above_1": (
-            selected["metrics"]["D"]["confidence_interval_95"][0] > 1.0
+        "selected34_auto_thread1_R1_point_at_least_1_03": r1["point"] >= 1.03,
+        "selected34_auto_thread1_R1_interval_wholly_above_1_03": (
+            r1["confidence_interval_95"][0] > 1.03
         ),
-        "C_point_in_0_97_1_03": in_range(
-            itt["metrics"]["C"]["point"], 0.97, 1.03
-        ),
-        "complement10_S_point_in_0_97_1_03": in_range(
-            complement["metrics"]["S"]["point"], 0.97, 1.03
-        ),
-        "complement10_D_point_in_0_97_1_03": in_range(
-            complement["metrics"]["D"]["point"], 0.97, 1.03
+        "selected34_auto_thread1_minimum_per_id_S_at_least_0_90": (
+            s["minimum_per_id"] >= 0.90
         ),
         "background_direction_ratio_in_0_95_1_05": in_range(
-            itt["diagnostic_splits"]["background_direction_S"]["ratio"],
+            primary["diagnostic_splits"]["background_direction_S"]["ratio"],
             0.95, 1.05,
         ),
         "cycle_orientation_ratio_in_0_95_1_05": in_range(
-            itt["diagnostic_splits"]["cycle_orientation_D"]["ratio"],
+            primary["diagnostic_splits"]["cycle_orientation_D"]["ratio"],
             0.95, 1.05,
         ),
-        "material_D_point_at_least_1_03": (
-            itt["metrics"]["D"]["point"] >= 1.03
+        "thread1_normal_C_points_in_0_99_1_03": all(
+            in_range(value, 0.99, 1.03) for value in normal_controls
+        ),
+        "thread1_asimd_selected34_S_D_points_in_0_99_1_03": all(
+            in_range(value, 0.99, 1.03) for value in asimd_controls
+        ),
+        "thread1_complement10_S_D_points_in_0_99_1_03": all(
+            in_range(value, 0.99, 1.03) for value in complement_controls
+        ),
+        "thread1_auto_sve_sve2_selected34_S_D_points_at_least_1": all(
+            value >= 1.0 for value in relevant_directions
         ),
     }
-    triggers = [name for name, value in requirements.items() if not value]
-    scanner_gate_names = (
-        "ITT_S_interval_wholly_above_1",
-        "ITT_D_interval_wholly_above_1",
-        "selected34_D_interval_wholly_above_1",
-        "C_point_in_0_97_1_03",
-        "complement10_S_point_in_0_97_1_03",
-        "complement10_D_point_in_0_97_1_03",
-        "background_direction_ratio_in_0_95_1_05",
-        "cycle_orientation_ratio_in_0_95_1_05",
+    failures = [name for name, passed in requirements.items() if not passed]
+    direct = (
+        "clear_go"
+        if requirements["selected34_auto_thread1_R1_point_at_least_1_03"]
+        and requirements[
+            "selected34_auto_thread1_R1_interval_wholly_above_1_03"
+        ]
+        else "clear_no_go"
     )
-    scanner_win = all(requirements[name] for name in scanner_gate_names)
-    material = requirements["material_D_point_at_least_1_03"]
-    overall = (
-        "go" if classification == "clear_go" and scanner_win and material
-        else "no_go" if classification == "clear_no_go"
-        else "inconclusive"
-    )
+    scanner_win = all(requirements.values())
+    material = requirements["selected34_auto_thread1_S_point_at_least_1_07"]
     return {
         "primary_cell": {
             "profile": "auto",
-            "panel": "fre-count-default-threads",
-            "stratum": "intention_to_treat",
+            "panel": "fre-count-thread1",
+            "stratum": "selected34",
         },
-        "direct_R1_classification": classification,
+        "direct_R1_classification": direct,
         "scanner_win": scanner_win,
         "material_delta": material,
         "requirements": requirements,
-        "overall": overall,
-        "reverse_row_confirmation_required": bool(triggers),
-        "reverse_row_confirmation_triggers": triggers,
+        "overall": "go" if scanner_win else "no_go",
+        "advancement_gate_failures": failures,
+        "reverse_row_confirmation_required": False,
+        "reverse_row_confirmation_triggers": [],
     }
 
 
@@ -1567,6 +1706,7 @@ def validate_input_binding(
                 "host_capability_signature",
                 "forced_midscan_gate_verification",
                 "exact_teddy_v2_gate_verification",
+                "batch_vector_verification",
                 "untimed_reference_correctness_verified",
             ),
             f"{role} qualification binding",
@@ -1591,7 +1731,7 @@ def validate_input_binding(
         for field in (
             "selected_or_stock_disposition", "target_validation_matrix",
             "host_capability_signature", "forced_midscan_gate_verification",
-            "exact_teddy_v2_gate_verification",
+            "exact_teddy_v2_gate_verification", "batch_vector_verification",
         ):
             compare_float_tree(
                 actual[field], external[field],
@@ -1764,6 +1904,8 @@ def validate_result_pair(
     prereg_sha256: str,
     external_probes: Mapping[str, Any],
 ) -> dict[str, Any]:
+    if expected_role != "primary" or expected_traversal != "canonical":
+        raise AuditError("only the primary canonical campaign is auditable")
     private_sha = sha256_file(private_path)
     public_sha = sha256_file(public_path)
     private = load_object(private_path, f"{expected_role} private result")
@@ -1856,29 +1998,8 @@ def validate_result_pair(
         public["confirmation_of"], private["confirmation_of"],
         f"{expected_role} confirmation binding",
     )
-    if expected_role == "primary" and private["confirmation_of"] is not None:
+    if private["confirmation_of"] is not None:
         raise AuditError("primary result unexpectedly confirms another result")
-    if expected_role == "reverse-row-confirmation":
-        confirmation = exact_keys(
-            private["confirmation_of"],
-            (
-                "primary_private_sha256", "primary_public_sha256",
-                "primary_audit_sha256", "auditor_sha256",
-                "primary_audit_unix_ns", "primary_workload_end", "triggers",
-            ),
-            "reverse primary authorization",
-        )
-        if (
-            not all(is_sha256(confirmation[field]) for field in (
-                "primary_private_sha256", "primary_public_sha256",
-                "primary_audit_sha256", "auditor_sha256",
-            ))
-            or not positive_int(confirmation["primary_audit_unix_ns"])
-            or not isinstance(confirmation["primary_workload_end"], Mapping)
-            or not isinstance(confirmation["triggers"], list)
-            or any(not isinstance(item, str) for item in confirmation["triggers"])
-        ):
-            raise AuditError("reverse result lacks valid primary authorization")
     workload = exact_keys(
         private["workload_environment"], ("start", "end"),
         f"{expected_role} workload environment",
@@ -1968,6 +2089,8 @@ def validate_result_pair(
 def combined_analysis(
     primary: Mapping[str, Any], reverse: Mapping[str, Any], seed: int,
 ) -> dict[str, Any]:
+    del primary, reverse, seed
+    raise AuditError("reverse and combined analysis are unsupported")
     primary_rows = {
         (row["cpu_profile"], row["panel"], row["private_id"]): row
         for row in primary["rows"]
@@ -2136,6 +2259,8 @@ def combined_decision(
     pooled_cells: Mapping[str, Any],
     ratios: Mapping[str, Any],
 ) -> dict[str, Any]:
+    del primary, reverse, pooled_cells, ratios
+    raise AuditError("reverse and combined analysis are unsupported")
     primary_cell = primary["cells"]["auto"]["fre-count-default-threads"]
     reverse_cell = reverse["cells"]["auto"]["fre-count-default-threads"]
     pooled = pooled_cells["auto"]["fre-count-default-threads"]
@@ -2260,6 +2385,8 @@ def validate_primary_authorization_audit(
     primary: Mapping[str, Any],
     confirmation: Mapping[str, Any],
 ) -> int:
+    del path, prereg_sha256, primary, confirmation
+    raise AuditError("reverse authorization evidence is unsupported")
     audit = load_object(path, "primary authorization audit")
     exact_keys(
         audit,
@@ -2351,75 +2478,17 @@ def build_audit(args: argparse.Namespace) -> dict[str, Any]:
         prereg_sha256=prereg_sha256,
         external_probes=external_probes,
     )
-    reverse = None
-    chronology: dict[str, Any] = {
+    audit_unix_ns = time.time_ns()
+    if audit_unix_ns <= primary["end"]["unix_ns"]:
+        raise AuditError("audit timestamp does not follow audited workloads")
+    chronology = {
         "primary_start_unix_ns": primary["start"]["unix_ns"],
         "primary_end_unix_ns": primary["end"]["unix_ns"],
-        "primary_authorization_audit_unix_ns": None,
+        "primary_authorization_audit_unix_ns": audit_unix_ns,
         "reverse_start_unix_ns": None,
         "reverse_end_unix_ns": None,
         "non_overlapping": None,
     }
-    combined = None
-    if args.reverse_private_result is not None:
-        assert args.reverse_public_result is not None
-        assert args.primary_authorization_audit is not None
-        reverse = validate_result_pair(
-            private_path=args.reverse_private_result,
-            public_path=args.reverse_public_result,
-            expected_role="reverse-row-confirmation",
-            expected_traversal="reverse-canonical",
-            prereg=prereg,
-            prereg_sha256=prereg_sha256,
-            external_probes=external_probes,
-        )
-        confirmation = reverse["private"]["confirmation_of"]
-        assert isinstance(confirmation, Mapping)
-        authorization_audit_unix_ns = validate_primary_authorization_audit(
-            args.primary_authorization_audit,
-            prereg_sha256=prereg_sha256,
-            primary=primary,
-            confirmation=confirmation,
-        )
-        compare_float_tree(
-            confirmation.get("primary_workload_end"), primary["end"],
-            "reverse confirmation primary workload end",
-        )
-        compare_float_tree(
-            reverse["binding"], primary["binding"],
-            "primary/reverse input binding",
-        )
-        if (
-            primary["decision"]["reverse_row_confirmation_required"] is not True
-            or confirmation.get("primary_private_sha256")
-            != primary["private_sha256"]
-            or confirmation.get("primary_public_sha256")
-            != primary["public_sha256"]
-            or confirmation.get("triggers")
-            != primary["decision"]["reverse_row_confirmation_triggers"]
-            or reverse["start"]["unix_ns"] <= authorization_audit_unix_ns
-            or reverse["private_sha256"] == primary["private_sha256"]
-            or reverse["public_sha256"] == primary["public_sha256"]
-        ):
-            raise AuditError("reverse chronology or primary binding is invalid")
-        chronology.update({
-            "primary_authorization_audit_unix_ns": authorization_audit_unix_ns,
-            "reverse_start_unix_ns": reverse["start"]["unix_ns"],
-            "reverse_end_unix_ns": reverse["end"]["unix_ns"],
-            "non_overlapping": True,
-        })
-        combined = combined_analysis(
-            primary, reverse, int(bootstrap_seed(prereg)["u64_big_endian_first8"])
-        )
-    elif args.primary_authorization_audit is not None:
-        raise AuditError("authorization audit supplied without reverse result")
-    audit_unix_ns = time.time_ns()
-    if audit_unix_ns <= primary["end"]["unix_ns"] or (
-        reverse is not None and audit_unix_ns <= reverse["end"]["unix_ns"]
-    ):
-        raise AuditError("audit timestamp does not follow audited workloads")
-    if reverse is None:
-        chronology["primary_authorization_audit_unix_ns"] = audit_unix_ns
     return {
         "schema": AUDIT_SCHEMA,
         "verified": True,
@@ -2432,12 +2501,8 @@ def build_audit(args: argparse.Namespace) -> dict[str, Any]:
         "preregistration_sha256": prereg_sha256,
         "primary_private_sha256": primary["private_sha256"],
         "primary_public_sha256": primary["public_sha256"],
-        "reverse_private_sha256": (
-            reverse["private_sha256"] if reverse is not None else None
-        ),
-        "reverse_public_sha256": (
-            reverse["public_sha256"] if reverse is not None else None
-        ),
+        "reverse_private_sha256": None,
+        "reverse_public_sha256": None,
         "reverse_row_confirmation_required": primary["decision"][
             "reverse_row_confirmation_required"
         ],
@@ -2449,11 +2514,8 @@ def build_audit(args: argparse.Namespace) -> dict[str, Any]:
             "decision": primary["decision"],
             "cells": primary["cells"],
         },
-        "reverse": (
-            {"decision": reverse["decision"], "cells": reverse["cells"]}
-            if reverse is not None else None
-        ),
-        "combined_analysis": combined,
+        "reverse": None,
+        "combined_analysis": None,
     }
 
 
@@ -2485,23 +2547,8 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     )
     for name in required:
         parser.add_argument(f"--{name}", type=existing_path, required=True)
-    parser.add_argument("--reverse-private-result", type=existing_path)
-    parser.add_argument("--reverse-public-result", type=existing_path)
-    parser.add_argument("--primary-authorization-audit", type=existing_path)
     parser.add_argument("--output", required=True)
     args = parser.parse_args(argv)
-    reverse_fields = (
-        args.reverse_private_result,
-        args.reverse_public_result,
-        args.primary_authorization_audit,
-    )
-    if any(value is not None for value in reverse_fields) and not all(
-        value is not None for value in reverse_fields
-    ):
-        parser.error(
-            "reverse private/public results and primary authorization audit "
-            "must be supplied together"
-        )
     args.output = Path(args.output).expanduser().resolve()
     if args.output.exists():
         parser.error("audit output must be new")
