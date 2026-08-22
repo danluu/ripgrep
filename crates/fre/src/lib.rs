@@ -942,6 +942,25 @@ mod tests {
     }
 
     #[test]
+    fn required_literal_fast_line_candidate_uses_the_first_acceptance() {
+        let factory = RegexMatcher::new(r"(?-u:[a-z]+ZQ)").unwrap();
+        assert_eq!(
+            factory.regex.build_report().plan,
+            PlanKind::RequiredLiteral
+        );
+        let worker = factory.worker().unwrap();
+        let haystack = b"!ZQ!aaaaZQ!xZQ\n";
+
+        let selected = worker.find(haystack).unwrap().unwrap();
+        assert_eq!((selected.start(), selected.end()), (4, 10));
+        assert_eq!(worker.shortest_match_at(haystack, 0).unwrap(), Some(10));
+        assert!(matches!(
+            worker.find_candidate_line(haystack).unwrap(),
+            Some(LineMatchKind::Confirmed(10))
+        ));
+    }
+
+    #[test]
     fn count_matches_continues_after_the_selected_end() {
         assert_eq!(count_matches("a+", b"aaaa aa\nbaaa\nnone\n"), b"3\n");
         assert_eq!(count_matches("a+$", b"zaaa\nnone\na\n"), b"2\n");
