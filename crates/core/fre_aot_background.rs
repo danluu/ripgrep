@@ -1783,6 +1783,7 @@ fn exact_finite_selected_end_teddy_receipt_json(
         "plan_scan_instruction_units": report.plan_scan_instruction_units,
         "emitted_scan_instruction_units": report.emitted_scan_instruction_units,
         "guaranteed_vector_bytes": report.guaranteed_vector_bytes,
+        "batch_vectors": report.batch_vectors,
         "gate_table_bytes": u64_len(report.gate_table_bytes),
         "selected_target_tier": exact_finite_selected_end_teddy_target_tier_name(report.selected_target_tier),
         "emitted_isa": exact_finite_selected_end_teddy_isa_name(report.emitted_isa),
@@ -1895,6 +1896,7 @@ struct ExactTeddyTierGeometry {
     plan_scan_instruction_units: u16,
     emitted_scan_instruction_units: u16,
     guaranteed_vector_bytes: u16,
+    batch_vectors: u8,
     table_alignment: usize,
     table_extent_bytes: usize,
     gate_table_bytes: usize,
@@ -1939,6 +1941,7 @@ fn exact_teddy_tier_geometry(
         scanner,
         emitted_scan_instruction_units,
         guaranteed_vector_bytes,
+        batch_vectors,
         table_alignment,
         table_extent_bytes,
         gate_table_bytes,
@@ -1952,6 +1955,7 @@ fn exact_teddy_tier_geometry(
             StartAccelerator::X86Avx2,
             plan_scan_instruction_units,
             32,
+            1,
             32,
             logical_table_bytes.checked_mul(2)?.checked_add(32)?,
             logical_table_bytes.checked_mul(2)?.checked_add(32)?,
@@ -1966,6 +1970,7 @@ fn exact_teddy_tier_geometry(
             StartAccelerator::X86Avx2,
             plan_scan_instruction_units,
             32,
+            1,
             32,
             logical_table_bytes.checked_mul(2)?.checked_add(32)?,
             logical_table_bytes.checked_mul(2)?.checked_add(32)?,
@@ -1980,6 +1985,7 @@ fn exact_teddy_tier_geometry(
             StartAccelerator::Aarch64Asimd,
             aarch64_scan_instruction_units,
             16,
+            1,
             16,
             logical_table_bytes,
             logical_table_bytes.checked_add(16)?,
@@ -1994,6 +2000,7 @@ fn exact_teddy_tier_geometry(
             StartAccelerator::Aarch64Sve,
             aarch64_scan_instruction_units,
             16,
+            4,
             16,
             logical_table_bytes,
             logical_table_bytes,
@@ -2008,6 +2015,7 @@ fn exact_teddy_tier_geometry(
             StartAccelerator::Aarch64Sve,
             aarch64_scan_instruction_units,
             16,
+            4,
             16,
             logical_table_bytes,
             logical_table_bytes,
@@ -2024,6 +2032,7 @@ fn exact_teddy_tier_geometry(
         plan_scan_instruction_units,
         emitted_scan_instruction_units,
         guaranteed_vector_bytes,
+        batch_vectors,
         table_alignment,
         table_extent_bytes,
         gate_table_bytes,
@@ -2202,6 +2211,7 @@ fn exact_teddy_report_invariants_authenticate_with_basis(
                     == geometry.emitted_scan_instruction_units
                 && report.guaranteed_vector_bytes
                     == geometry.guaranteed_vector_bytes
+                && report.batch_vectors == geometry.batch_vectors
                 && report.gate_table_bytes == geometry.gate_table_bytes
                 && report.input_floor_bytes == EXACT_TEDDY_INPUT_FLOOR_BYTES
                 && report.selection_horizon_bytes
@@ -3512,6 +3522,7 @@ mod tests {
         assert_eq!(json["selected_target_tier"], "aarch64_asimd");
         assert_eq!(json["emitted_isa"], "aarch64_asimd");
         assert_eq!(json["scanner"], "aarch64_asimd");
+        assert_eq!(json["batch_vectors"], 1);
         assert_eq!(
             json["incumbent"]["semantic_dfa_sha256"].as_str().map(str::len),
             Some(64)
@@ -3548,6 +3559,11 @@ mod tests {
             {
                 let mut changed = report;
                 changed.runtime_verification_budget = 63;
+                changed
+            },
+            {
+                let mut changed = report;
+                changed.batch_vectors = 4;
                 changed
             },
             {
@@ -3700,6 +3716,7 @@ mod tests {
             report_json["lowering"]["incumbent"]["has_accelerator"],
             true
         );
+        assert_eq!(report_json["lowering"]["batch_vectors"], 1);
 
         let mut classification = classification_for_profile_and_policy(
             TargetFeatureProfile::Asimd,
@@ -3742,6 +3759,49 @@ mod tests {
             &changed.lowering,
             Basis::ForcedStructuralEligibility,
         ));
+
+        for features in [
+            FeatureSet::of(CpuFeature::Aarch64Sve),
+            FeatureSet::of(CpuFeature::Aarch64Sve)
+                .with(CpuFeature::Aarch64Sve2),
+        ] {
+            let sve_target =
+                Target::aarch64_linux().with_features(features).unwrap();
+            let sve_forced = compile_v2(
+                CompileRequestV2::new(
+                    CompileRequest::new(
+                        "samwise|samw|frodo|pippin",
+                        sve_target,
+                    )
+                    .mode(CompileMode::Optimizing)
+                    .output(OutputContract::SelectedEnd),
+                )
+                .exact_finite_selected_end_teddy(
+                    Policy::ForceStructurallyEligible,
+                ),
+            )
+            .unwrap();
+            let sve_receipt =
+                copy_authenticated_exact_finite_selected_end_teddy_v2(
+                    &sve_forced,
+                    Policy::ForceStructurallyEligible,
+                )
+                .unwrap();
+            let sve_report = sve_receipt
+                .exact_finite_selected_end_teddy_aot
+                .expect("forced SVE report");
+            assert_eq!(sve_report.lowering.batch_vectors, 4);
+            assert!(exact_teddy_report_invariants_authenticate_with_basis(
+                &sve_report.lowering,
+                sve_forced.receipt(),
+                Basis::ForcedStructuralEligibility,
+            ));
+            assert_eq!(
+                compile_receipt_v2_json(&sve_receipt)["exact_finite_selected_end_teddy_aot_v2"]
+                    ["lowering"]["batch_vectors"],
+                4,
+            );
+        }
 
         let stable = forced.into_compiled();
         assert_eq!(
