@@ -596,8 +596,10 @@ pub trait Matcher {
     ///
     /// This identity must remain stable for the life of the matcher. A
     /// searcher only passes a selected-match hint to a sink when both expose
-    /// the same identity. The default implementation disables this optional
-    /// optimization.
+    /// the same identity. Matchers sharing an identity must have identical
+    /// matching semantics; sharing one identity between matchers that can
+    /// select different first matches violates this contract. The default
+    /// implementation disables this optional optimization.
     #[inline]
     fn selected_match_owner(&self) -> Option<&SelectedMatchOwner> {
         None
@@ -1178,10 +1180,18 @@ pub trait Matcher {
     /// selected match used to confirm the line.
     ///
     /// The selected match, when present, uses offsets into `haystack`. It must
-    /// be the same first match that [`Matcher::find`] would return, and the
-    /// accompanying line match kind must be confirmed. Callers may use the
-    /// selected match to continue non-overlapping iteration without searching
-    /// for it again. A searcher must not expose the match to a sink unless the
+    /// be non-empty, lie wholly within `haystack`, be the same first match that
+    /// [`Matcher::find`] would return, and accompany a confirmed line match.
+    /// It must not refer to left context preceding `haystack`. If
+    /// [`Matcher::line_terminator`] is present, removing the confirmed line's
+    /// trailing terminator must not change this selected first match; an
+    /// implementation that cannot guarantee this must return no selected
+    /// match.
+    ///
+    /// Callers may use the selected match to continue non-overlapping
+    /// iteration without searching for it again. Consumers must still reject
+    /// empty or out-of-window hints and use the ordinary full-iteration
+    /// fallback. A searcher must not expose the match to a sink unless the
     /// identities returned by their `selected_match_owner` methods are equal.
     ///
     /// By default, this preserves `find_candidate_line` behavior and does not

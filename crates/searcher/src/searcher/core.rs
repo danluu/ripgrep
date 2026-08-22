@@ -529,8 +529,13 @@ impl<'s, M: Matcher, S: Sink> Core<'s, M, S> {
                         pos = buf.len();
                         continue;
                     }
+                    debug_assert!(pos <= line.start());
                     let selected_match = selected_match.and_then(|m| {
                         let m = m.offset(pos);
+                        // The matcher selected over `&buf[pos..]`, so a usable
+                        // hint cannot consume left context before `pos`. The
+                        // line containment checks establish that invariant
+                        // while also binding the hint to the confirmed line.
                         if m.start() < m.end()
                             && pos <= line.start()
                             && line.start() <= m.start()

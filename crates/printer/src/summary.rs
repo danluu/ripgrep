@@ -17,7 +17,7 @@ use crate::{
     counter::CounterWriter,
     hyperlink::{self, HyperlinkConfig},
     stats::Stats,
-    util::{PrinterPath, find_iter_at_in_context_from},
+    util::{PrinterPath, find_iter_at_in_context_with_seed},
 };
 
 /// The configuration for the summary printer.
@@ -655,27 +655,18 @@ impl<'p, 's, M: Matcher, W: WriteColor> Sink for SummarySink<'p, 's, M, W> {
             let buf = mat.buffer();
             let range = mat.bytes_range_in_buffer();
             let mut count = 0;
-            let selected_match = mat.selected_match().filter(|m| {
-                m.start() < m.end()
-                    && range.start <= m.start()
-                    && m.end() <= range.end
-            });
-            let at = selected_match.map_or(range.start, |m| {
-                count = 1;
-                m.end()
-            });
-            find_iter_at_in_context_from(
+            find_iter_at_in_context_with_seed(
                 searcher,
                 &self.matcher,
                 buf,
                 range,
-                at,
+                mat.selected_match(),
                 |_| {
                     count += 1;
                     true
                 },
             )?;
-            // Because of `find_iter_at_in_context` being a giant
+            // Because of context-bounded iteration being a giant
             // kludge internally, it's possible that it won't find
             // *any* matches even though we clearly know that there is
             // at least one. So make sure we record at least one here.
@@ -814,6 +805,7 @@ mod tests {
     use termcolor::NoColor;
 
     use super::{Summary, SummaryBuilder, SummaryKind};
+    use crate::util::{SeededRegexHint, SeededRegexMatcher};
 
     const SHERLOCK: &'static [u8] = b"\
 For the Doctor Watsons of this world, as opposed to the Sherlock
@@ -826,6 +818,28 @@ and exhibited clearly, with a label attached.
 
     fn printer_contents(printer: &mut Summary<NoColor<Vec<u8>>>) -> String {
         String::from_utf8(printer.get_mut().get_ref().to_owned()).unwrap()
+    }
+
+    fn count_matches_with<
+        M: grep_matcher::Matcher,
+        N: grep_matcher::Matcher,
+    >(
+        search_matcher: &M,
+        sink_matcher: &N,
+        haystack: &[u8],
+    ) -> String {
+        let mut printer = SummaryBuilder::new()
+            .kind(SummaryKind::CountMatches)
+            .build_no_color(vec![]);
+        SearcherBuilder::new()
+            .build()
+            .search_reader(
+                search_matcher,
+                haystack,
+                printer.sink_with_path(sink_matcher, "fixture"),
+            )
+            .unwrap();
+        printer_contents(&mut printer)
     }
 
     #[test]
@@ -1043,6 +1057,51 @@ and exhibited clearly, with a label attached.
 
         let got = printer_contents(&mut printer);
         assert_eq_printed!("sherlock:4\n", got);
+    }
+
+    #[test]
+    fn count_matches_seed_preserves_nullable_adjacent_empty_progress() {
+        let matcher = SeededRegexMatcher::new("a|");
+        let got = count_matches_with(&matcher, &matcher, b"a\n");
+        assert_eq_printed!("fixture:1\n", got);
+        assert!(matcher.selected_calls() > 0);
+        assert_eq!(matcher.iter_at(), Some(1));
+    }
+
+    #[test]
+    fn count_matches_rejects_seed_in_trimmed_terminator() {
+        let matcher =
+            SeededRegexMatcher::with_hint("a", SeededRegexHint::TrailingByte);
+        let got = count_matches_with(&matcher, &matcher, b"a\n");
+        assert_eq_printed!("fixture:1\n", got);
+        assert!(matcher.selected_calls() > 0);
+        assert_eq!(matcher.iter_at(), Some(0));
+    }
+
+    #[test]
+    fn count_matches_invalid_hints_use_full_iteration_fallback() {
+        for hint in [
+            SeededRegexHint::None,
+            SeededRegexHint::Empty,
+            SeededRegexHint::OutOfBounds,
+            SeededRegexHint::Candidate,
+        ] {
+            let matcher = SeededRegexMatcher::with_hint("a", hint);
+            let got = count_matches_with(&matcher, &matcher, b"a\n");
+            assert_eq_printed!("fixture:1\n", got);
+            assert!(matcher.selected_calls() > 0, "{hint:?}");
+            assert_eq!(matcher.iter_at(), Some(0), "{hint:?}");
+        }
+    }
+
+    #[test]
+    fn count_matches_rejects_seed_from_another_owner() {
+        let search = SeededRegexMatcher::new("aa");
+        let sink = SeededRegexMatcher::new("a");
+        let got = count_matches_with(&search, &sink, b"aa\n");
+        assert_eq_printed!("fixture:2\n", got);
+        assert_eq!(search.selected_calls(), 0);
+        assert_eq!(sink.iter_at(), Some(0));
     }
 
     #[test]

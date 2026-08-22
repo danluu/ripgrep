@@ -56,8 +56,8 @@ impl<M: Matcher> Replacer<M> {
         range: std::ops::Range<usize>,
         replacement: &[u8],
     ) -> io::Result<()> {
-        // See the giant comment in 'find_iter_at_in_context_from' below for
-        // why we do this dance.
+        // See the giant comment in 'context_haystack' below for why we do
+        // this dance.
         let is_multi_line = searcher.multi_line_with_matcher(&matcher);
         // Get the line_terminator that was removed (if any) so we can add it
         // back.
@@ -521,26 +521,6 @@ where
     )
 }
 
-pub(crate) fn find_iter_at_in_context_from<M, F>(
-    searcher: &Searcher,
-    matcher: M,
-    bytes: &[u8],
-    range: std::ops::Range<usize>,
-    at: usize,
-    matched: F,
-) -> io::Result<()>
-where
-    M: Matcher,
-    F: FnMut(Match) -> bool,
-{
-    debug_assert!(range.start <= at);
-    debug_assert!(at <= range.end);
-    let bytes = context_haystack(searcher, &matcher, bytes, &range);
-    find_iter_at_in_prepared_context(
-        matcher, bytes, range.end, at, None, matched,
-    )
-}
-
 fn context_haystack<'b, M: Matcher>(
     searcher: &Searcher,
     matcher: M,
@@ -642,7 +622,7 @@ pub(crate) fn trim_line_terminator<'b>(
 
 /// Like `Matcher::replace_with_captures_at`, but accepts an end bound.
 ///
-/// See also: `find_iter_at_in_context_from` for why we need this.
+/// See also: `context_haystack` for why we need this.
 fn replace_with_captures_in_context<M, F>(
     matcher: M,
     bytes: &[u8],
@@ -678,10 +658,23 @@ where
 }
 
 #[cfg(test)]
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum SeededRegexHint {
+    First,
+    None,
+    Empty,
+    TrailingByte,
+    OutOfBounds,
+    Candidate,
+}
+
+#[cfg(test)]
 pub(crate) struct SeededRegexMatcher {
     inner: grep_regex::RegexMatcher,
     owner: grep_matcher::SelectedMatchOwner,
+    hint: SeededRegexHint,
     selected_calls: std::cell::Cell<usize>,
+    iter_at: std::cell::Cell<Option<usize>>,
 }
 
 #[cfg(test)]
@@ -691,12 +684,25 @@ impl SeededRegexMatcher {
             inner: grep_regex::RegexMatcher::new_line_matcher(pattern)
                 .unwrap(),
             owner: grep_matcher::SelectedMatchOwner::new(),
+            hint: SeededRegexHint::First,
             selected_calls: std::cell::Cell::new(0),
+            iter_at: std::cell::Cell::new(None),
         }
+    }
+
+    pub(crate) fn with_hint(
+        pattern: &str,
+        hint: SeededRegexHint,
+    ) -> SeededRegexMatcher {
+        SeededRegexMatcher { hint, ..SeededRegexMatcher::new(pattern) }
     }
 
     pub(crate) fn selected_calls(&self) -> usize {
         self.selected_calls.get()
+    }
+
+    pub(crate) fn iter_at(&self) -> Option<usize> {
+        self.iter_at.get()
     }
 }
 
@@ -717,6 +723,19 @@ impl Matcher for SeededRegexMatcher {
         at: usize,
     ) -> Result<Option<Match>, Self::Error> {
         self.inner.find_at(haystack, at)
+    }
+
+    fn find_iter_at<F>(
+        &self,
+        haystack: &[u8],
+        at: usize,
+        matched: F,
+    ) -> Result<(), Self::Error>
+    where
+        F: FnMut(Match) -> bool,
+    {
+        self.iter_at.set(Some(at));
+        self.inner.find_iter_at(haystack, at, matched)
     }
 
     fn new_captures(&self) -> Result<Self::Captures, Self::Error> {
@@ -772,7 +791,25 @@ impl Matcher for SeededRegexMatcher {
     > {
         self.selected_calls.set(self.selected_calls.get() + 1);
         Ok(self.inner.find(haystack)?.map(|m| {
-            (grep_matcher::LineMatchKind::Confirmed(m.end()), Some(m))
+            let kind = match self.hint {
+                SeededRegexHint::Candidate => {
+                    grep_matcher::LineMatchKind::Candidate(m.end())
+                }
+                _ => grep_matcher::LineMatchKind::Confirmed(m.end()),
+            };
+            let selected = match self.hint {
+                SeededRegexHint::First | SeededRegexHint::Candidate => Some(m),
+                SeededRegexHint::None => None,
+                SeededRegexHint::Empty => Some(Match::zero(m.start())),
+                SeededRegexHint::TrailingByte => haystack
+                    .len()
+                    .checked_sub(1)
+                    .map(|start| Match::new(start, start + 1)),
+                SeededRegexHint::OutOfBounds => {
+                    Some(Match::new(haystack.len(), haystack.len() + 1))
+                }
+            };
+            (kind, selected)
         }))
     }
 }
