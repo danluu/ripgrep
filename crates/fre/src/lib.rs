@@ -146,23 +146,45 @@ impl RegexMatcherBuilder {
             .properties()
             .minimum_len()
             .map_or(false, |len| len > 0);
-        let source = canonical_hir_pattern(
-            configured.hir(),
-            self.max_canonical_pattern_bytes,
-        )?;
-
-        let mut builder =
-            PortableBuilder::new(source).retained_find_iter(true);
-        if let Some(line_terminator) = line_terminator {
-            builder = builder.line_terminator(line_terminator.as_byte());
-        }
-        if let Some(limit) = self.size_limit {
-            builder = builder.size_limit(limit);
-        }
-        if let Some(limit) = self.dfa_size_limit {
-            builder = builder.dfa_size_limit(limit);
-        }
-        let regex = builder.build()?;
+        let configure_portable = |source: String, direct_hir: bool| {
+            let mut builder =
+                PortableBuilder::new(source).retained_find_iter(true);
+            if direct_hir {
+                builder = builder
+                    .multi_line(true)
+                    .unicode(true)
+                    .octal(false)
+                    .dot_matches_new_line(false);
+            }
+            if let Some(line_terminator) = line_terminator {
+                builder = builder.line_terminator(line_terminator.as_byte());
+            }
+            if let Some(limit) = self.size_limit {
+                builder = builder.size_limit(limit);
+            }
+            if let Some(limit) = self.dfa_size_limit {
+                builder = builder.dfa_size_limit(limit);
+            }
+            builder
+        };
+        let direct = if configured.is_fre_standard_literal_handoff_config() {
+            configure_portable(String::new(), true)
+                .build_ripgrep_standard_literal_hir(
+                    configured.hir(),
+                    self.max_canonical_pattern_bytes,
+                )?
+        } else {
+            None
+        };
+        let regex = if let Some(regex) = direct {
+            regex
+        } else {
+            let source = canonical_hir_pattern(
+                configured.hir(),
+                self.max_canonical_pattern_bytes,
+            )?;
+            configure_portable(source, false).build()?
+        };
         Ok(RegexMatcher {
             regex: Arc::new(regex),
             line_terminator,
@@ -555,7 +577,10 @@ impl Matcher for RegexMatcherWorker<'_> {
 mod tests {
     use std::cell::Cell;
 
-    use fre::PortableFindIterError;
+    use fre::{
+        BuildLimits, PlanKind, PlanSelection, PortableBuilder,
+        PortableFindIterError,
+    };
     use grep_matcher::{
         LineMatchKind, LineTerminator, Match as GrepMatch, Matcher,
         NoCaptures, SelectedMatchOwner,
@@ -564,6 +589,7 @@ mod tests {
         JSONBuilder, StandardBuilder, SummaryBuilder, SummaryKind,
     };
     use grep_searcher::SearcherBuilder;
+    use regex_syntax::hir::Hir;
 
     use super::{Error, MatchError, RegexMatcher, RegexMatcherBuilder};
 
@@ -1362,13 +1388,193 @@ mod tests {
     }
 
     #[test]
+    fn standard_literal_hir_uses_the_narrow_direct_fre_profile() {
+        let mut builder = RegexMatcherBuilder::new();
+        builder.multi_line(true);
+        let literal = builder.build(r"nee\x64le").expect("literal matcher");
+        let alternatives = builder
+            .build_many(&["needle", "thread", "fiber"])
+            .expect("literal alternatives matcher");
+        for matcher in [&literal, &alternatives] {
+            let fre::CompatibilityProfile::RustBytes(profile) =
+                &matcher.regex.build_report().profile
+            else {
+                panic!("portable byte matcher retained a non-byte profile");
+            };
+            assert!(profile.options.multi_line);
+            assert!(profile.options.unicode);
+            assert!(!profile.options.case_insensitive);
+            assert!(!profile.options.dot_matches_new_line);
+            assert_eq!(profile.options.line_terminator, b'\n');
+        }
+        assert_eq!(literal.regex.as_str(), "needle");
+        assert_eq!(alternatives.regex.as_str(), "needle|thread|fiber");
+
+        let reference = grep_regex::RegexMatcherBuilder::new()
+            .multi_line(true)
+            .line_terminator(Some(b'\n'))
+            .build(r"nee\x64le")
+            .expect("reference matcher");
+        assert_find_parity(
+            &literal.worker().unwrap(),
+            &reference,
+            &[b"needle", b"a needle here", b"thread", b"absent"],
+        );
+    }
+
+    #[test]
+    fn direct_literal_handoff_reauthenticates_values_profiles_and_limits() {
+        let literal = PortableBuilder::new("")
+            .multi_line(true)
+            .retained_find_iter(true)
+            .build_ripgrep_standard_literal_hir(
+                &Hir::literal(b"a|b".to_vec()),
+                usize::MAX,
+            )
+            .expect("direct literal construction completes")
+            .expect("standard literal HIR is admitted");
+        assert_eq!(literal.as_str(), r"a\|b");
+        assert_eq!(literal.build_report().plan, PlanKind::ExactLiteral);
+        assert_eq!(
+            literal
+                .find(b"xxa|byy")
+                .map(|matched| (matched.start(), matched.end())),
+            Some((2, 5))
+        );
+        assert_eq!(literal.clone().find(b"xxa|byy"), literal.find(b"xxa|byy"));
+
+        let alternatives = Hir::alternation(vec![
+            Hir::literal(b"needle".to_vec()),
+            Hir::literal(b"thread".to_vec()),
+            Hir::literal(b"fiber".to_vec()),
+        ]);
+        let alternatives = PortableBuilder::new("")
+            .multi_line(true)
+            .retained_find_iter(true)
+            .build_ripgrep_standard_literal_hir(&alternatives, usize::MAX)
+            .expect("direct literal-set construction completes")
+            .expect("flat literal alternation is admitted");
+        assert_eq!(alternatives.as_str(), "needle|thread|fiber");
+        assert!(matches!(
+            alternatives.build_report().plan,
+            PlanKind::PackedLiteralSet | PlanKind::LiteralSetDfa
+        ));
+        assert_eq!(
+            alternatives
+                .clone()
+                .find(b"a fiber then needle")
+                .map(|matched| (matched.start(), matched.end())),
+            Some((2, 7))
+        );
+
+        for refused in [
+            Hir::empty(),
+            Hir::literal(Vec::<u8>::new()),
+            Hir::literal(b"line\nfeed".to_vec()),
+            Hir::literal([0xFF]),
+            Hir::concat(vec![
+                Hir::literal([b'a']),
+                Hir::look(regex_syntax::hir::Look::End),
+            ]),
+            Hir::alternation(vec![Hir::literal([b'a']), Hir::empty()]),
+        ] {
+            assert!(
+                PortableBuilder::new("")
+                    .multi_line(true)
+                    .build_ripgrep_standard_literal_hir(&refused, usize::MAX)
+                    .expect("shape refusal is not a construction error")
+                    .is_none()
+            );
+        }
+        for builder in [
+            PortableBuilder::new(""),
+            PortableBuilder::new("not-empty").multi_line(true),
+            PortableBuilder::new("").multi_line(true).unicode(false),
+            PortableBuilder::new("").multi_line(true).case_insensitive(true),
+            PortableBuilder::new("")
+                .multi_line(true)
+                .dot_matches_new_line(true),
+            PortableBuilder::new("").multi_line(true).crlf(true),
+            PortableBuilder::new("").multi_line(true).swap_greed(true),
+            PortableBuilder::new("").multi_line(true).ignore_whitespace(true),
+            PortableBuilder::new("").multi_line(true).line_terminator(0),
+            PortableBuilder::new("").multi_line(true).nest_limit(249),
+            PortableBuilder::new("").multi_line(true).octal(true),
+            PortableBuilder::new("")
+                .multi_line(true)
+                .plan_selection(PlanSelection::ForceK0),
+        ] {
+            assert!(
+                builder
+                    .build_ripgrep_standard_literal_hir(
+                        &Hir::literal(b"needle".to_vec()),
+                        usize::MAX,
+                    )
+                    .expect("profile refusal is not a construction error")
+                    .is_none()
+            );
+        }
+
+        let mut limits = BuildLimits::default();
+        limits.syntax_safety.max_hir_nodes = 2;
+        assert!(
+            PortableBuilder::new("")
+                .multi_line(true)
+                .limits(limits)
+                .build_ripgrep_standard_literal_hir(
+                    &Hir::alternation(vec![
+                        Hir::literal(b"one".to_vec()),
+                        Hir::literal(b"two".to_vec()),
+                    ]),
+                    usize::MAX,
+                )
+                .expect("admission refusal is not a construction error")
+                .is_none()
+        );
+        assert!(
+            PortableBuilder::new("")
+                .multi_line(true)
+                .build_ripgrep_standard_literal_hir(
+                    &Hir::literal(b"a|b".to_vec()),
+                    3,
+                )
+                .expect("source-envelope refusal is not a construction error")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn standard_hir_handoff_fails_closed_for_other_shapes_and_transforms() {
+        let mut structural = RegexMatcherBuilder::new();
+        structural.multi_line(true);
+        let structural =
+            structural.build(r"nee.+le").expect("generic matcher");
+        let fre::CompatibilityProfile::RustBytes(profile) =
+            &structural.regex.build_report().profile
+        else {
+            panic!("portable byte matcher retained a non-byte profile");
+        };
+        assert!(!profile.options.multi_line);
+
+        let mut fixed = RegexMatcherBuilder::new();
+        fixed.multi_line(true).fixed_strings(true);
+        let fixed = fixed.build("needle").expect("fixed-string matcher");
+        let fre::CompatibilityProfile::RustBytes(profile) =
+            &fixed.regex.build_report().profile
+        else {
+            panic!("portable byte matcher retained a non-byte profile");
+        };
+        assert!(!profile.options.multi_line);
+    }
+
+    #[test]
     fn multiple_pattern_order_matches_grep_regex() {
         for patterns in [["a", "ab"], ["ab", "a"]] {
-            let fre = RegexMatcherBuilder::new()
-                .build_many(&patterns)
-                .expect("FRE matcher");
+            let mut fre_builder = RegexMatcherBuilder::new();
+            fre_builder.multi_line(true);
+            let fre = fre_builder.build_many(&patterns).expect("FRE matcher");
             let mut reference_builder = grep_regex::RegexMatcherBuilder::new();
-            reference_builder.line_terminator(Some(b'\n'));
+            reference_builder.multi_line(true).line_terminator(Some(b'\n'));
             let reference = reference_builder
                 .build_many(&patterns)
                 .expect("reference matcher");

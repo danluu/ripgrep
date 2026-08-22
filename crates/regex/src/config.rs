@@ -230,6 +230,33 @@ impl ConfiguredHIR {
         &self.hir
     }
 
+    /// Whether this HIR came from ripgrep's narrow ordinary literal handoff
+    /// configuration for FRE.
+    ///
+    /// This is only a configuration predicate, not semantic authority. FRE
+    /// independently validates the owned HIR and recomputes its accounting.
+    /// Size/cache limits may vary and are forwarded separately. The optional
+    /// ordinary NUL ban is input validation, not an HIR transform.
+    #[doc(hidden)]
+    pub fn is_fre_standard_literal_handoff_config(&self) -> bool {
+        let config = &self.config;
+        !config.case_insensitive
+            && !config.case_smart
+            && config.multi_line
+            && !config.dot_matches_new_line
+            && !config.swap_greed
+            && !config.ignore_whitespace
+            && config.unicode
+            && !config.octal
+            && config.nest_limit == Config::default().nest_limit
+            && config.line_terminator == Some(LineTerminator::byte(b'\n'))
+            && matches!(config.ban, None | Some(b'\x00'))
+            && !config.crlf
+            && !config.word
+            && !config.fixed_strings
+            && !config.whole_line
+    }
+
     /// Convert this HIR to a regex that can be used for matching.
     pub(crate) fn to_regex(&self) -> Result<Regex, Error> {
         let meta = Regex::config()
@@ -516,5 +543,77 @@ mod tests {
         let actual =
             ConfiguredHIR::new(config, &patterns).unwrap_err().to_string();
         assert_eq!(expected, actual);
+    }
+
+    fn standard() -> Config {
+        let mut config = Config::default();
+        config.multi_line = true;
+        config.line_terminator = Some(LineTerminator::byte(b'\n'));
+        config
+    }
+
+    fn eligible(config: Config) -> bool {
+        config
+            .build_many(&["needle"])
+            .expect("focused configuration builds")
+            .is_fre_standard_literal_handoff_config()
+    }
+
+    #[test]
+    fn fre_standard_literal_handoff_configuration_is_exact() {
+        assert!(eligible(standard()));
+        let mut binary_standard = standard();
+        binary_standard.ban = Some(b'\x00');
+        assert!(eligible(binary_standard));
+        let mut bounded_standard = standard();
+        bounded_standard.size_limit = 1 << 20;
+        bounded_standard.dfa_size_limit = 2 << 20;
+        assert!(eligible(bounded_standard));
+
+        let mut changed = standard();
+        changed.case_insensitive = true;
+        assert!(!eligible(changed));
+        let mut changed = standard();
+        changed.case_smart = true;
+        assert!(!eligible(changed));
+        let mut changed = standard();
+        changed.multi_line = false;
+        assert!(!eligible(changed));
+        let mut changed = standard();
+        changed.dot_matches_new_line = true;
+        assert!(!eligible(changed));
+        let mut changed = standard();
+        changed.unicode = false;
+        assert!(!eligible(changed));
+        let mut changed = standard();
+        changed.octal = true;
+        assert!(!eligible(changed));
+        let mut changed = standard();
+        changed.swap_greed = true;
+        assert!(!eligible(changed));
+        let mut changed = standard();
+        changed.ignore_whitespace = true;
+        assert!(!eligible(changed));
+        let mut changed = standard();
+        changed.nest_limit -= 1;
+        assert!(!eligible(changed));
+        let mut changed = standard();
+        changed.fixed_strings = true;
+        assert!(!eligible(changed));
+        let mut changed = standard();
+        changed.line_terminator = Some(LineTerminator::byte(b'\x00'));
+        assert!(!eligible(changed));
+        let mut changed = standard();
+        changed.word = true;
+        assert!(!eligible(changed));
+        let mut changed = standard();
+        changed.whole_line = true;
+        assert!(!eligible(changed));
+        let mut changed = standard();
+        changed.crlf = true;
+        assert!(!eligible(changed));
+        let mut changed = standard();
+        changed.ban = Some(b'x');
+        assert!(!eligible(changed));
     }
 }
