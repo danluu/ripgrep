@@ -145,30 +145,10 @@ impl RegexMatcherBuilder {
             ..=STANDARD_LITERAL_BYTES_MAX_PATTERNS)
             .contains(&patterns.len())
         {
-            let mut borrowed = [""; STANDARD_LITERAL_BYTES_MAX_PATTERNS];
-            for (slot, pattern) in borrowed.iter_mut().zip(patterns) {
-                *slot = pattern.as_ref();
-            }
-            if let Some(literals) = self
-                .configured
-                .fre_standard_literals_many(&borrowed[..patterns.len()])
+            if let Some(matcher) =
+                self.try_build_ripgrep_standard_literals_many(patterns)?
             {
-                let line_terminator = Some(literals.line_terminator());
-                if let Some(regex) = self
-                    .portable_builder(String::new(), true, line_terminator)
-                    .build_ripgrep_standard_literals(
-                        literals.patterns(),
-                        self.max_canonical_pattern_bytes,
-                    )?
-                {
-                    return Ok(RegexMatcher {
-                        regex: Arc::new(regex),
-                        line_terminator,
-                        non_matching_bytes: literals.non_matching_bytes(),
-                        matches_are_nonempty: true,
-                        selected_match_owner: SelectedMatchOwner::new(),
-                    });
-                }
+                return Ok(matcher);
             }
         }
         let configured = self.configured.configured_hir_many(patterns)?;
@@ -223,6 +203,46 @@ impl RegexMatcherBuilder {
             matches_are_nonempty,
             selected_match_owner: SelectedMatchOwner::new(),
         })
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn try_build_ripgrep_standard_literals_many<P: AsRef<str>>(
+        &self,
+        patterns: &[P],
+    ) -> Result<Option<RegexMatcher>, Error> {
+        debug_assert!(
+            (STANDARD_LITERAL_BYTES_MIN_PATTERNS
+                ..=STANDARD_LITERAL_BYTES_MAX_PATTERNS)
+                .contains(&patterns.len())
+        );
+        let mut borrowed = [""; STANDARD_LITERAL_BYTES_MAX_PATTERNS];
+        for (slot, pattern) in borrowed.iter_mut().zip(patterns) {
+            *slot = pattern.as_ref();
+        }
+        let Some(literals) = self
+            .configured
+            .fre_standard_literals_many(&borrowed[..patterns.len()])
+        else {
+            return Ok(None);
+        };
+        let line_terminator = Some(literals.line_terminator());
+        let Some(regex) = self
+            .portable_builder(String::new(), true, line_terminator)
+            .build_ripgrep_standard_literals(
+                literals.patterns(),
+                self.max_canonical_pattern_bytes,
+            )?
+        else {
+            return Ok(None);
+        };
+        Ok(Some(RegexMatcher {
+            regex: Arc::new(regex),
+            line_terminator,
+            non_matching_bytes: literals.non_matching_bytes(),
+            matches_are_nonempty: true,
+            selected_match_owner: SelectedMatchOwner::new(),
+        }))
     }
 
     fn portable_builder(
