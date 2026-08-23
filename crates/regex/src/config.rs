@@ -12,6 +12,9 @@ use crate::{
     strip::strip_from_match,
 };
 
+const FRE_STANDARD_LITERAL_MIN_PATTERNS: usize = 129;
+const FRE_STANDARD_LITERAL_MAX_PATTERNS: usize = 256;
+
 /// Config represents the configuration of a regex matcher in this crate.
 /// The configuration is itself a rough combination of the knobs found in
 /// the `regex` crate itself, along with additional `grep-matcher` specific
@@ -141,6 +144,102 @@ impl Config {
         }
         true
     }
+
+    fn is_fre_standard_literal_handoff_config(&self) -> bool {
+        !self.case_insensitive
+            && !self.case_smart
+            && self.multi_line
+            && !self.dot_matches_new_line
+            && !self.swap_greed
+            && !self.ignore_whitespace
+            && self.unicode
+            && !self.octal
+            && self.nest_limit == Config::default().nest_limit
+            && self.line_terminator == Some(LineTerminator::byte(b'\n'))
+            && matches!(self.ban, None | Some(b'\x00'))
+            && !self.crlf
+            && !self.word
+            && !self.fixed_strings
+            && !self.whole_line
+    }
+
+    pub(crate) fn fre_standard_literals<'a>(
+        &self,
+        patterns: &'a [&'a str],
+    ) -> Option<FreStandardLiterals<'a>> {
+        if !(FRE_STANDARD_LITERAL_MIN_PATTERNS
+            ..=FRE_STANDARD_LITERAL_MAX_PATTERNS)
+            .contains(&patterns.len())
+            || !self.is_fre_standard_literal_handoff_config()
+        {
+            return None;
+        }
+        let mut non_matching_bytes = ByteSet::full();
+        let mut all_single_character = true;
+        for &pattern in patterns {
+            let bytes = pattern.as_bytes();
+            if bytes.is_empty() {
+                return None;
+            }
+            let mut characters = pattern.chars();
+            let _first = characters.next()?;
+            all_single_character &= characters.next().is_none();
+            for &byte in bytes {
+                // All regex meta characters are ASCII, so this byte test is
+                // equivalent to the character test in `is_fixed_strings`.
+                if byte.is_ascii()
+                    && regex_syntax::is_meta_character(char::from(byte))
+                {
+                    return None;
+                }
+                if self
+                    .line_terminator
+                    .is_some_and(|term| term.as_bytes().contains(&byte))
+                    || self.ban == Some(byte)
+                {
+                    // Preserve the configured-HIR error path for forbidden
+                    // bytes rather than reproducing its diagnostic here.
+                    return None;
+                }
+                non_matching_bytes.remove(byte);
+            }
+        }
+        if all_single_character {
+            // `Hir::alternation` collapses this exact shape into one Unicode
+            // class. Preserve that configured-HIR route and its report.
+            return None;
+        }
+        Some(FreStandardLiterals { patterns, non_matching_bytes })
+    }
+}
+
+/// Borrowed fixed strings certified for ripgrep's standard FRE integration.
+///
+/// This value is deliberately tied to the original pattern slice. It is only
+/// produced for nonempty, metacharacter-free strings under the exact ordinary
+/// case-sensitive LF configuration used by `grep-fre`.
+#[doc(hidden)]
+#[derive(Debug)]
+pub struct FreStandardLiterals<'a> {
+    patterns: &'a [&'a str],
+    non_matching_bytes: ByteSet,
+}
+
+impl<'a> FreStandardLiterals<'a> {
+    /// Return the original patterns in their source-priority order.
+    pub fn patterns(&self) -> &'a [&'a str] {
+        self.patterns
+    }
+
+    /// Return the exact bytes that cannot occur in any literal match.
+    pub fn non_matching_bytes(&self) -> ByteSet {
+        self.non_matching_bytes.clone()
+    }
+
+    /// Return the LF line terminator certified by this handoff.
+    pub fn line_terminator(&self) -> LineTerminator {
+        LineTerminator::byte(b'\n')
+    }
 }
 
 /// A "configured" HIR expression, which is aware of the configuration which
@@ -252,22 +351,7 @@ impl ConfiguredHIR {
     /// ordinary NUL ban is input validation, not an HIR transform.
     #[doc(hidden)]
     pub fn is_fre_standard_literal_handoff_config(&self) -> bool {
-        let config = &self.config;
-        !config.case_insensitive
-            && !config.case_smart
-            && config.multi_line
-            && !config.dot_matches_new_line
-            && !config.swap_greed
-            && !config.ignore_whitespace
-            && config.unicode
-            && !config.octal
-            && config.nest_limit == Config::default().nest_limit
-            && config.line_terminator == Some(LineTerminator::byte(b'\n'))
-            && matches!(config.ban, None | Some(b'\x00'))
-            && !config.crlf
-            && !config.word
-            && !config.fixed_strings
-            && !config.whole_line
+        self.config.is_fre_standard_literal_handoff_config()
     }
 
     /// Convert this HIR to a regex that can be used for matching.
@@ -631,6 +715,91 @@ mod tests {
         let mut changed = standard();
         changed.ban = Some(b'x');
         assert!(!eligible(changed));
+    }
+
+    #[test]
+    fn fre_standard_literal_bytes_are_borrowed_and_censused_once() {
+        let owned = (0..FRE_STANDARD_LITERAL_MIN_PATTERNS)
+            .map(|index| format!("value{index:04}"))
+            .collect::<Vec<_>>();
+        let patterns = owned.iter().map(String::as_str).collect::<Vec<_>>();
+        let certified = standard()
+            .fre_standard_literals(&patterns)
+            .expect("standard fixed strings are certified");
+        assert!(core::ptr::eq(certified.patterns(), patterns.as_slice()));
+        assert_eq!(certified.line_terminator(), LineTerminator::byte(b'\n'));
+
+        let configured = standard().build_many(&patterns).unwrap();
+        let selected = certified.non_matching_bytes();
+        let walked = configured.non_matching_bytes();
+        for byte in 0..=u8::MAX {
+            assert_eq!(
+                selected.contains(byte),
+                walked.contains(byte),
+                "literal census differs for {byte:#04x}",
+            );
+        }
+    }
+
+    #[test]
+    fn fre_standard_literal_bytes_decline_to_every_existing_fallback() {
+        let standard_patterns = (0..FRE_STANDARD_LITERAL_MIN_PATTERNS)
+            .map(|index| format!("value{index:04}"))
+            .collect::<Vec<_>>();
+        assert!(
+            standard()
+                .fre_standard_literals(&[] as &[&str])
+                .is_none()
+        );
+        let too_small = standard_patterns[..128]
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>();
+        assert!(standard().fre_standard_literals(&too_small).is_none());
+        let too_large = (0..=FRE_STANDARD_LITERAL_MAX_PATTERNS)
+            .map(|_| "twobytes")
+            .collect::<Vec<_>>();
+        assert!(standard().fre_standard_literals(&too_large).is_none());
+        assert!(
+            standard()
+                .fre_standard_literals(&vec!["x"; FRE_STANDARD_LITERAL_MIN_PATTERNS])
+                .is_none()
+        );
+        for replacement in ["", "a.b", "line\nfeed"] {
+            let mut refused = standard_patterns.clone();
+            refused[17] = replacement.to_owned();
+            let refused = refused.iter().map(String::as_str).collect::<Vec<_>>();
+            assert!(standard().fre_standard_literals(&refused).is_none());
+        }
+
+        let mut banned = standard();
+        banned.ban = Some(b'\0');
+        let mut banned_patterns = standard_patterns.clone();
+        banned_patterns[17] = "a\0b".to_owned();
+        let banned_patterns = banned_patterns
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>();
+        assert!(banned.fre_standard_literals(&banned_patterns).is_none());
+        assert!(banned.build_many(&["a\0b"]).is_err());
+
+        let patterns = standard_patterns
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>();
+
+        let mut changed = standard();
+        changed.whole_line = true;
+        assert!(changed.fre_standard_literals(&patterns).is_none());
+        let mut changed = standard();
+        changed.word = true;
+        assert!(changed.fre_standard_literals(&patterns).is_none());
+        let mut changed = standard();
+        changed.fixed_strings = true;
+        assert!(changed.fre_standard_literals(&patterns).is_none());
+        let mut changed = standard();
+        changed.line_terminator = None;
+        assert!(changed.fre_standard_literals(&patterns).is_none());
     }
 
     #[test]

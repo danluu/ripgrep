@@ -16,6 +16,10 @@ use grep_matcher::{
 use regex_syntax::hir::{Hir, HirKind};
 
 const DEFAULT_CANONICAL_PATTERN_LIMIT: usize = 8 * (1 << 20);
+// This is the exact current gap between FRE's packed ceiling and its bounded
+// flat-literal stack handoff. FRE independently refuses any drift.
+const STANDARD_LITERAL_BYTES_MIN_PATTERNS: usize = 129;
+const STANDARD_LITERAL_BYTES_MAX_PATTERNS: usize = 256;
 
 #[inline(always)]
 fn grep_match_from_fre(matched: fre::Match) -> GrepMatch {
@@ -137,6 +141,36 @@ impl RegexMatcherBuilder {
         if patterns.is_empty() {
             return Err(Error::EmptyPatternSet);
         }
+        if (STANDARD_LITERAL_BYTES_MIN_PATTERNS
+            ..=STANDARD_LITERAL_BYTES_MAX_PATTERNS)
+            .contains(&patterns.len())
+        {
+            let mut borrowed = [""; STANDARD_LITERAL_BYTES_MAX_PATTERNS];
+            for (slot, pattern) in borrowed.iter_mut().zip(patterns) {
+                *slot = pattern.as_ref();
+            }
+            if let Some(literals) = self
+                .configured
+                .fre_standard_literals_many(&borrowed[..patterns.len()])
+            {
+                let line_terminator = Some(literals.line_terminator());
+                if let Some(regex) = self
+                    .portable_builder(String::new(), true, line_terminator)
+                    .build_ripgrep_standard_literals(
+                        literals.patterns(),
+                        self.max_canonical_pattern_bytes,
+                    )?
+                {
+                    return Ok(RegexMatcher {
+                        regex: Arc::new(regex),
+                        line_terminator,
+                        non_matching_bytes: literals.non_matching_bytes(),
+                        matches_are_nonempty: true,
+                        selected_match_owner: SelectedMatchOwner::new(),
+                    });
+                }
+            }
+        }
         let configured = self.configured.configured_hir_many(patterns)?;
         let line_terminator = configured.line_terminator();
         let non_matching_bytes = configured.non_matching_bytes();
@@ -157,30 +191,10 @@ impl RegexMatcherBuilder {
             .properties()
             .minimum_len()
             .map_or(false, |len| len > 0);
-        let configure_portable = |source: String, direct_hir: bool| {
-            let mut builder =
-                PortableBuilder::new(source).retained_find_iter(true);
-            if direct_hir {
-                builder = builder
-                    .multi_line(true)
-                    .unicode(true)
-                    .octal(false)
-                    .dot_matches_new_line(false);
-            }
-            if let Some(line_terminator) = line_terminator {
-                builder = builder.line_terminator(line_terminator.as_byte());
-            }
-            if let Some(limit) = self.size_limit {
-                builder = builder.size_limit(limit);
-            }
-            if let Some(limit) = self.dfa_size_limit {
-                builder = builder.dfa_size_limit(limit);
-            }
-            builder
-        };
         let regex = if configured.is_fre_standard_literal_handoff_config() {
             let hir = configured.into_hir();
-            match configure_portable(String::new(), true)
+            match self
+                .portable_builder(String::new(), true, line_terminator)
                 .build_ripgrep_standard_literal_hir_owned(
                     hir,
                     self.max_canonical_pattern_bytes,
@@ -191,7 +205,8 @@ impl RegexMatcherBuilder {
                         &hir,
                         self.max_canonical_pattern_bytes,
                     )?;
-                    configure_portable(source, false).build()?
+                    self.portable_builder(source, false, line_terminator)
+                        .build()?
                 }
             }
         } else {
@@ -199,7 +214,7 @@ impl RegexMatcherBuilder {
                 configured.hir(),
                 self.max_canonical_pattern_bytes,
             )?;
-            configure_portable(source, false).build()?
+            self.portable_builder(source, false, line_terminator).build()?
         };
         Ok(RegexMatcher {
             regex: Arc::new(regex),
@@ -208,6 +223,32 @@ impl RegexMatcherBuilder {
             matches_are_nonempty,
             selected_match_owner: SelectedMatchOwner::new(),
         })
+    }
+
+    fn portable_builder(
+        &self,
+        source: String,
+        direct_hir: bool,
+        line_terminator: Option<LineTerminator>,
+    ) -> PortableBuilder {
+        let mut builder = PortableBuilder::new(source).retained_find_iter(true);
+        if direct_hir {
+            builder = builder
+                .multi_line(true)
+                .unicode(true)
+                .octal(false)
+                .dot_matches_new_line(false);
+        }
+        if let Some(line_terminator) = line_terminator {
+            builder = builder.line_terminator(line_terminator.as_byte());
+        }
+        if let Some(limit) = self.size_limit {
+            builder = builder.size_limit(limit);
+        }
+        if let Some(limit) = self.dfa_size_limit {
+            builder = builder.dfa_size_limit(limit);
+        }
+        builder
     }
 
     pub fn case_insensitive(&mut self, yes: bool) -> &mut Self {
@@ -1465,6 +1506,125 @@ mod tests {
             &alternatives_reference,
             &[b"needle", b"a fiber then needle", b"thread", b"absent"],
         );
+    }
+
+    #[test]
+    fn standard_literal_bytes_bridge_preserves_dense_span_iteration() {
+        let patterns = (0..256_u16)
+            .map(|bits| {
+                String::from_utf8(
+                    (0..8)
+                        .map(|shift| {
+                            if bits & (1 << shift) == 0 { b'q' } else { b'z' }
+                        })
+                        .collect::<Vec<_>>(),
+                )
+                .expect("focused literals are UTF-8")
+            })
+            .collect::<Vec<_>>();
+        let mut fre_builder = RegexMatcherBuilder::new();
+        fre_builder.multi_line(true);
+        let fre = fre_builder
+            .build_many(&patterns)
+            .expect("borrowed literal matcher");
+        let report = fre.regex.build_report();
+        assert_eq!(report.plan, PlanKind::LiteralSetDfa);
+        assert_eq!(report.syntax.hir_nodes, 257);
+        assert_eq!(report.syntax.literal_bytes, 2_048);
+        assert_eq!(report.planner_work, 2_563);
+
+        let mut reference_builder = grep_regex::RegexMatcherBuilder::new();
+        reference_builder.multi_line(true).line_terminator(Some(b'\n'));
+        let reference = reference_builder
+            .build_many(&patterns)
+            .expect("reference literal matcher");
+        let haystack = format!(
+            "xx{}/{}/{}yy\n",
+            patterns[57], patterns[1], patterns[211]
+        )
+        .into_bytes();
+        let worker = fre.worker().unwrap();
+        assert_find_parity(
+            &worker,
+            &reference,
+            &[haystack.as_slice(), b"xxxxxxxx", patterns[255].as_bytes()],
+        );
+        assert_eq!(
+            standard_only_matches_with(&worker, &worker, &haystack),
+            standard_only_matches_with(&reference, &reference, &haystack),
+        );
+
+        let mut spans = Vec::new();
+        worker
+            .try_find_iter(&haystack, |matched| {
+                spans.push((matched.start(), matched.end()));
+                Ok::<bool, ()>(true)
+            })
+            .unwrap()
+            .unwrap();
+        assert_eq!(spans, [(2, 10), (11, 19), (20, 28)]);
+    }
+
+    #[test]
+    fn standard_literal_bytes_bridge_retains_source_priority() {
+        let mut patterns = (0..129)
+            .map(|index| format!("value{index:04}"))
+            .collect::<Vec<_>>();
+        patterns[0] = "ab".to_owned();
+        patterns[1] = "a".to_owned();
+        let mut fre_builder = RegexMatcherBuilder::new();
+        fre_builder.multi_line(true);
+        let fre = fre_builder.build_many(&patterns).expect("FRE matcher");
+        let mut reference_builder = grep_regex::RegexMatcherBuilder::new();
+        reference_builder.multi_line(true).line_terminator(Some(b'\n'));
+        let reference = reference_builder
+            .build_many(&patterns)
+            .expect("reference matcher");
+        assert_find_parity(
+            &fre.worker().unwrap(),
+            &reference,
+            &[b"ab", b"zab", b"a", b"value0128"],
+        );
+        assert_eq!(
+            fre.worker()
+                .unwrap()
+                .find(b"ab")
+                .unwrap()
+                .map(|matched| (matched.start(), matched.end())),
+            Some((0, 2)),
+        );
+    }
+
+    #[test]
+    fn standard_literal_bytes_snapshot_arbitrary_as_ref_once() {
+        struct AlternatingPattern {
+            calls: Cell<usize>,
+        }
+
+        impl AsRef<str> for AlternatingPattern {
+            fn as_ref(&self) -> &str {
+                let call = self.calls.get();
+                self.calls.set(call + 1);
+                if call == 0 { "abcdefgh" } else { "ZZZZZZZZ" }
+            }
+        }
+
+        let patterns = (0..super::STANDARD_LITERAL_BYTES_MIN_PATTERNS)
+            .map(|_| AlternatingPattern { calls: Cell::new(0) })
+            .collect::<Vec<_>>();
+        let mut builder = RegexMatcherBuilder::new();
+        builder.multi_line(true);
+        let matcher = builder
+            .build_many(&patterns)
+            .expect("snapshotted literal matcher");
+        assert!(patterns.iter().all(|pattern| pattern.calls.get() == 1));
+
+        let worker = matcher.worker().unwrap();
+        assert!(worker.is_match(b"abcdefgh").unwrap());
+        assert!(!worker.is_match(b"ZZZZZZZZ").unwrap());
+        let non_matching = worker.non_matching_bytes().unwrap();
+        assert!(!non_matching.contains(b'a'));
+        assert!(non_matching.contains(b'Z'));
     }
 
     #[test]

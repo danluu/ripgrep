@@ -10,7 +10,7 @@ use {
 };
 
 use crate::{
-    config::{Config, ConfiguredHIR},
+    config::{Config, ConfiguredHIR, FreStandardLiterals},
     error::Error,
     literal::InnerLiterals,
 };
@@ -100,6 +100,19 @@ impl RegexMatcherBuilder {
             chir = chir.into_word();
         }
         Ok(chir)
+    }
+
+    /// Certify the original strings for ripgrep's standard FRE handoff.
+    ///
+    /// This narrow integration seam does not construct an HIR. A refusal is
+    /// silent so the caller can use [`Self::configured_hir_many`] and preserve
+    /// the ordinary parser, transformation and diagnostic paths.
+    #[doc(hidden)]
+    pub fn fre_standard_literals_many<'a>(
+        &self,
+        patterns: &'a [&'a str],
+    ) -> Option<FreStandardLiterals<'a>> {
+        self.config.fre_standard_literals(patterns)
     }
 
     /// Build a new matcher from a plain alternation of literals.
