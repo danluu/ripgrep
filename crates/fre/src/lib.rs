@@ -474,11 +474,7 @@ impl Matcher for RegexMatcherWorker<'_> {
             .map_err(|_| MatchError::Reentrant)?;
         session
             .find_at(haystack, at)
-            .map(|matched| {
-                matched.map(|matched| {
-                    GrepMatch::new(matched.start(), matched.end())
-                })
-            })
+            .map(|matched| matched.map(grep_match_from_fre))
             .map_err(MatchError::from)
     }
 
