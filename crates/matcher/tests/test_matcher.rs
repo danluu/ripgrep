@@ -18,6 +18,15 @@ fn m(start: usize, end: usize) -> Match {
 }
 
 #[test]
+fn match_new_unchecked_preserves_ordered_offsets() {
+    // SAFETY: these endpoints satisfy Match's documented ordering invariant.
+    let matched = unsafe { Match::new_unchecked(2, 5) };
+    assert_eq!(matched, Match::new(2, 5));
+    assert_eq!(matched.start(), 2);
+    assert_eq!(matched.end(), 5);
+}
+
+#[test]
 fn find() {
     let matcher = matcher(r"(\w+)\s+(\w+)");
     assert_eq!(matcher.find(b" homer simpson ").unwrap(), Some(m(1, 14)));

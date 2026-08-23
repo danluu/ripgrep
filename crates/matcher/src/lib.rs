@@ -117,6 +117,17 @@ impl Match {
         Match { start, end }
     }
 
+    /// Creates a new match without checking that its offsets are ordered.
+    ///
+    /// # Safety
+    ///
+    /// The caller must ensure that `start <= end`.
+    #[doc(hidden)]
+    #[inline]
+    pub unsafe fn new_unchecked(start: usize, end: usize) -> Match {
+        Match { start, end }
+    }
+
     /// Creates a zero width match at the given offset.
     #[inline]
     pub fn zero(offset: usize) -> Match {

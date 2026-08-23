@@ -17,6 +17,16 @@ use regex_syntax::hir::{Hir, HirKind};
 
 const DEFAULT_CANONICAL_PATTERN_LIMIT: usize = 8 * (1 << 20);
 
+#[inline(always)]
+fn grep_match_from_fre(matched: fre::Match) -> GrepMatch {
+    let start = matched.start();
+    let end = matched.end();
+    debug_assert!(start <= end);
+    // SAFETY: FRE constructs selected spans with ordered endpoints, and its
+    // private Match fields prevent callers from violating that invariant.
+    unsafe { GrepMatch::new_unchecked(start, end) }
+}
+
 /// Construction failure for the conservative ripgrep adapter.
 #[derive(Debug)]
 pub enum Error {
@@ -513,7 +523,7 @@ impl Matcher for RegexMatcherWorker<'_> {
             .map_err(|_| MatchError::Reentrant)?;
         session
             .try_visit_spans_at(haystack, at, |found| {
-                matched(GrepMatch::new(found.start(), found.end()))
+                matched(grep_match_from_fre(found))
             })
             .map_err(MatchError::from)
     }
