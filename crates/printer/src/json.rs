@@ -15,7 +15,10 @@ use crate::{
     counter::CounterWriter,
     jsont,
     stats::Stats,
-    util::{Replacer, find_iter_at_in_context_with_seed},
+    util::{
+        Replacer, find_iter_at_in_context_with_seed,
+        match_relative_to_unchecked,
+    },
 };
 
 /// The configuration for the JSON printer.
@@ -668,8 +671,13 @@ impl<'p, 's, M: Matcher, W: io::Write> JSONSink<'p, 's, M, W> {
             range.clone(),
             selected_match,
             |m| {
-                let (s, e) = (m.start() - range.start, m.end() - range.start);
-                matches.push(Match::new(s, e));
+                // SAFETY: a validated seed starts within `range`; without a
+                // seed iteration starts at `range.start`; and Matcher's
+                // ranged iteration reports only matches at or after its
+                // starting offset.
+                matches.push(unsafe {
+                    match_relative_to_unchecked(m, range.start)
+                });
                 true
             },
         )?;

@@ -23,8 +23,8 @@ use crate::{
     stats::Stats,
     util::{
         DecimalFormatter, PrinterPath, Replacer, Sunk,
-        find_iter_at_in_context_with_seed, trim_ascii_prefix,
-        trim_line_terminator,
+        find_iter_at_in_context_with_seed, match_relative_to_unchecked,
+        trim_ascii_prefix, trim_line_terminator,
     },
 };
 
@@ -722,8 +722,13 @@ impl<'p, 's, M: Matcher, W: WriteColor> StandardSink<'p, 's, M, W> {
             range.clone(),
             selected_match,
             |m| {
-                let (s, e) = (m.start() - range.start, m.end() - range.start);
-                matches.push(Match::new(s, e));
+                // SAFETY: a validated seed starts within `range`; without a
+                // seed iteration starts at `range.start`; and Matcher's
+                // ranged iteration reports only matches at or after its
+                // starting offset.
+                matches.push(unsafe {
+                    match_relative_to_unchecked(m, range.start)
+                });
                 true
             },
         )?;

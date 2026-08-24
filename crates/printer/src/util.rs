@@ -10,6 +10,25 @@ use {
 
 use crate::{MAX_LOOK_AHEAD, hyperlink::HyperlinkPath};
 
+/// Translate an ordered match by subtracting the same base from both ends.
+///
+/// # Safety
+///
+/// `base` must not exceed `matched.start()`.
+#[inline(always)]
+pub(crate) unsafe fn match_relative_to_unchecked(
+    matched: Match,
+    base: usize,
+) -> Match {
+    debug_assert!(base <= matched.start());
+    let start = matched.start() - base;
+    let end = matched.end() - base;
+    debug_assert!(start <= end);
+    // SAFETY: `Match` guarantees ordered endpoints, and subtracting the same
+    // in-bounds base from both endpoints preserves their order.
+    unsafe { Match::new_unchecked(start, end) }
+}
+
 /// A type for handling replacements while amortizing allocation.
 pub(crate) struct Replacer<M: Matcher> {
     space: Option<Space<M>>,
@@ -865,6 +884,15 @@ mod tests {
     use grep_searcher::SearcherBuilder;
 
     use super::*;
+
+    #[test]
+    fn relative_match_preserves_order_and_width() {
+        let matched = Match::new(11, 17);
+        // SAFETY: 7 does not exceed the match's start offset of 11.
+        let relative = unsafe { match_relative_to_unchecked(matched, 7) };
+        assert_eq!(relative, Match::new(4, 10));
+        assert_eq!(relative.len(), matched.len());
+    }
 
     #[test]
     fn custom_decimal_format() {
