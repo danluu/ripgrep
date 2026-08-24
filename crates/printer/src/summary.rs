@@ -715,7 +715,11 @@ impl<'p, 's, M: Matcher, W: WriteColor> Sink for SummarySink<'p, 's, M, W> {
         }
         if let Some(ref mut stats) = self.stats {
             stats.add_matches(sink_match_count);
-            stats.add_matched_lines(mat.lines().count() as u64);
+            stats.add_matched_lines(if is_multi_line {
+                mat.lines().count() as u64
+            } else {
+                1
+            });
         } else if self.summary.config.kind.quit_early() {
             return Ok(false);
         }
@@ -836,12 +840,16 @@ impl<'p, 's, M: Matcher, W: WriteColor> Sink for SummarySink<'p, 's, M, W> {
 
 #[cfg(test)]
 mod tests {
-    use grep_regex::RegexMatcher;
-    use grep_searcher::SearcherBuilder;
+    use grep_matcher::LineTerminator;
+    use grep_regex::{RegexMatcher, RegexMatcherBuilder};
+    use grep_searcher::{Searcher, SearcherBuilder};
     use termcolor::NoColor;
 
     use super::{Summary, SummaryBuilder, SummaryKind};
-    use crate::util::{SeededRegexHint, SeededRegexMatcher};
+    use crate::{
+        Stats,
+        util::{SeededRegexHint, SeededRegexMatcher},
+    };
 
     const SHERLOCK: &'static [u8] = b"\
 For the Doctor Watsons of this world, as opposed to the Sherlock
@@ -876,6 +884,22 @@ and exhibited clearly, with a label attached.
             )
             .unwrap();
         printer_contents(&mut printer)
+    }
+
+    fn count_matches_stats<M: grep_matcher::Matcher>(
+        matcher: &M,
+        mut searcher: Searcher,
+        haystack: &[u8],
+    ) -> (String, Stats) {
+        let mut printer = SummaryBuilder::new()
+            .kind(SummaryKind::CountMatches)
+            .build_no_color(vec![]);
+        let stats = {
+            let mut sink = printer.sink(matcher);
+            searcher.search_reader(matcher, haystack, &mut sink).unwrap();
+            sink.stats().unwrap().clone()
+        };
+        (printer_contents(&mut printer), stats)
     }
 
     #[test]
@@ -1093,6 +1117,55 @@ and exhibited clearly, with a label attached.
 
         let got = printer_contents(&mut printer);
         assert_eq_printed!("sherlock:4\n", got);
+    }
+
+    #[test]
+    fn count_matches_stats_single_line() {
+        let matcher = RegexMatcher::new("a").unwrap();
+        let (got, stats) = count_matches_stats(
+            &matcher,
+            SearcherBuilder::new().build(),
+            b"aa\nb\na\n",
+        );
+        assert_eq_printed!("3\n", got);
+        assert_eq!(stats.matches(), 3);
+        assert_eq!(stats.matched_lines(), 2);
+    }
+
+    #[test]
+    fn count_matches_stats_single_line_crlf() {
+        let matcher =
+            RegexMatcherBuilder::new().crlf(true).build("a").unwrap();
+        let searcher = SearcherBuilder::new()
+            .line_terminator(LineTerminator::crlf())
+            .build();
+        let (got, stats) =
+            count_matches_stats(&matcher, searcher, b"aa\r\nb\r\na\r\n");
+        assert_eq_printed!("3\r\n", got);
+        assert_eq!(stats.matches(), 3);
+        assert_eq!(stats.matched_lines(), 2);
+    }
+
+    #[test]
+    fn count_matches_stats_single_line_inverted() {
+        let matcher = RegexMatcher::new("x").unwrap();
+        let searcher = SearcherBuilder::new().invert_match(true).build();
+        let (got, stats) =
+            count_matches_stats(&matcher, searcher, b"x\nno\nstill no\nx\n");
+        assert_eq_printed!("2\n", got);
+        assert_eq!(stats.matches(), 2);
+        assert_eq!(stats.matched_lines(), 2);
+    }
+
+    #[test]
+    fn count_matches_stats_multi_line() {
+        let matcher = RegexMatcher::new("(?s:a.*b)").unwrap();
+        let searcher = SearcherBuilder::new().multi_line(true).build();
+        let (got, stats) =
+            count_matches_stats(&matcher, searcher, b"a\nmiddle\nb\n");
+        assert_eq_printed!("1\n", got);
+        assert_eq!(stats.matches(), 1);
+        assert_eq!(stats.matched_lines(), 3);
     }
 
     #[test]
