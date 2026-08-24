@@ -151,7 +151,6 @@ impl RegexMatcherBuilder {
         self.build_configured_hir(configured)
     }
 
-    #[cold]
     #[inline(never)]
     fn build_configured_hir(
         &self,
