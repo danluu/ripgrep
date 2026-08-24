@@ -704,6 +704,7 @@ pub(crate) struct SeededRegexMatcher {
     hint: SeededRegexHint,
     selected_calls: std::cell::Cell<usize>,
     iter_at: std::cell::Cell<Option<usize>>,
+    iter_match_calls: std::cell::Cell<usize>,
     selected_end_count: bool,
     selected_end_count_calls: std::cell::Cell<usize>,
 }
@@ -718,6 +719,7 @@ impl SeededRegexMatcher {
             hint: SeededRegexHint::First,
             selected_calls: std::cell::Cell::new(0),
             iter_at: std::cell::Cell::new(None),
+            iter_match_calls: std::cell::Cell::new(0),
             selected_end_count: false,
             selected_end_count_calls: std::cell::Cell::new(0),
         }
@@ -745,6 +747,10 @@ impl SeededRegexMatcher {
 
     pub(crate) fn iter_at(&self) -> Option<usize> {
         self.iter_at.get()
+    }
+
+    pub(crate) fn iter_match_calls(&self) -> usize {
+        self.iter_match_calls.get()
     }
 
     pub(crate) fn selected_end_count_calls(&self) -> usize {
@@ -793,13 +799,16 @@ impl Matcher for SeededRegexMatcher {
         &self,
         haystack: &[u8],
         at: usize,
-        matched: F,
+        mut matched: F,
     ) -> Result<(), Self::Error>
     where
         F: FnMut(Match) -> bool,
     {
         self.iter_at.set(Some(at));
-        self.inner.find_iter_at(haystack, at, matched)
+        self.inner.find_iter_at(haystack, at, |m| {
+            self.iter_match_calls.set(self.iter_match_calls.get() + 1);
+            matched(m)
+        })
     }
 
     fn new_captures(&self) -> Result<Self::Captures, Self::Error> {

@@ -571,6 +571,45 @@ impl<W: WriteColor> Standard<W> {
         }
     }
 
+    /// Returns true when this printer needs only the first match in each
+    /// matching line.
+    ///
+    /// Callers may use this to select [`StandardFirstMatchSink`]. The regular
+    /// [`StandardSink`] remains appropriate for every other configuration.
+    pub fn needs_only_first_match(&self) -> bool {
+        if !self.config.column || self.config.max_columns.is_some() {
+            return false;
+        }
+        let supports_color = self.wtr.borrow().supports_color();
+        let match_colored = !self.config.colors.matched().is_none();
+        !(supports_color && match_colored)
+            && self.config.replacement.is_none()
+            && !self.config.per_match
+            && !self.config.only_matching
+            && !self.config.stats
+    }
+
+    /// Return a sink that records only the first match in each matching line.
+    ///
+    /// This is intended for a plain column prefix, where later matches cannot
+    /// affect output. Callers should select it only when
+    /// [`Standard::needs_only_first_match`] returns true.
+    pub fn sink_with_path_first_match<'p, 's, M, P>(
+        &'s mut self,
+        matcher: M,
+        path: &'p P,
+    ) -> StandardFirstMatchSink<'p, 's, M, W>
+    where
+        M: Matcher,
+        P: ?Sized + AsRef<Path>,
+    {
+        assert!(
+            self.needs_only_first_match(),
+            "first-match sink requires plain column-only output",
+        );
+        StandardFirstMatchSink { inner: self.sink_with_path(matcher, path) }
+    }
+
     /// Returns true if and only if the configuration of the printer requires
     /// us to find each individual match in the lines reported by the searcher.
     ///
@@ -887,6 +926,145 @@ impl<'p, 's, M: Matcher, W: WriteColor> Sink for StandardSink<'p, 's, M, W> {
             stats.add_bytes_printed(self.standard.wtr.borrow().count());
         }
         Ok(())
+    }
+}
+
+/// A standard-printer sink specialized for output that consumes only the
+/// first match in each matching line.
+///
+/// This keeps the ordinary all-match sink on its existing execution path and
+/// gives plain column output a separate callback with early termination.
+#[derive(Debug)]
+pub struct StandardFirstMatchSink<'p, 's, M: Matcher, W> {
+    inner: StandardSink<'p, 's, M, W>,
+}
+
+impl<'p, 's, M: Matcher, W: WriteColor>
+    StandardFirstMatchSink<'p, 's, M, W>
+{
+    /// Returns true if this printer received a match in the previous search.
+    pub fn has_match(&self) -> bool {
+        self.inner.has_match()
+    }
+
+    /// Return the statistics produced by this printer, when enabled.
+    pub fn stats(&self) -> Option<&Stats> {
+        self.inner.stats()
+    }
+
+    fn record_first_match(
+        &mut self,
+        searcher: &Searcher,
+        bytes: &[u8],
+        range: std::ops::Range<usize>,
+        selected_match: Option<Match>,
+    ) -> io::Result<()> {
+        let matches = &mut self.inner.standard.matches;
+        matches.clear();
+        find_iter_at_in_context_with_seed(
+            searcher,
+            &self.inner.matcher,
+            bytes,
+            range.clone(),
+            selected_match,
+            |m| {
+                // SAFETY: this has the same ranged-iteration invariants as
+                // StandardSink::record_matches.
+                matches.push(unsafe {
+                    match_relative_to_unchecked(m, range.start)
+                });
+                false
+            },
+        )?;
+        if !matches.is_empty()
+            && matches.last().unwrap().is_empty()
+            && matches.last().unwrap().start() >= range.end
+        {
+            matches.pop().unwrap();
+        }
+        Ok(())
+    }
+}
+
+impl<'p, 's, M: Matcher, W: WriteColor> Sink
+    for StandardFirstMatchSink<'p, 's, M, W>
+{
+    type Error = io::Error;
+
+    #[inline]
+    fn selected_match_owner(&self) -> Option<&SelectedMatchOwner> {
+        self.inner.selected_match_owner()
+    }
+
+    fn matched(
+        &mut self,
+        searcher: &Searcher,
+        mat: &SinkMatch<'_>,
+    ) -> Result<bool, io::Error> {
+        self.inner.match_count += 1;
+        self.record_first_match(
+            searcher,
+            mat.buffer(),
+            mat.bytes_range_in_buffer(),
+            mat.selected_match(),
+        )?;
+        self.inner.replace(
+            searcher,
+            mat.buffer(),
+            mat.bytes_range_in_buffer(),
+        )?;
+
+        if let Some(ref mut stats) = self.inner.stats {
+            stats.add_matches(self.inner.standard.matches.len() as u64);
+            stats.add_matched_lines(mat.lines().count() as u64);
+        }
+        if searcher.binary_detection().convert_byte().is_some()
+            && self.inner.binary_byte_offset.is_some()
+        {
+            return Ok(false);
+        }
+        StandardImpl::from_match(searcher, &self.inner, mat).sink()?;
+        Ok(true)
+    }
+
+    #[inline]
+    fn context(
+        &mut self,
+        searcher: &Searcher,
+        ctx: &SinkContext<'_>,
+    ) -> Result<bool, io::Error> {
+        self.inner.context(searcher, ctx)
+    }
+
+    #[inline]
+    fn context_break(
+        &mut self,
+        searcher: &Searcher,
+    ) -> Result<bool, io::Error> {
+        self.inner.context_break(searcher)
+    }
+
+    #[inline]
+    fn binary_data(
+        &mut self,
+        searcher: &Searcher,
+        binary_byte_offset: u64,
+    ) -> Result<bool, io::Error> {
+        self.inner.binary_data(searcher, binary_byte_offset)
+    }
+
+    #[inline]
+    fn begin(&mut self, searcher: &Searcher) -> Result<bool, io::Error> {
+        self.inner.begin(searcher)
+    }
+
+    #[inline]
+    fn finish(
+        &mut self,
+        searcher: &Searcher,
+        finish: &SinkFinish,
+    ) -> Result<(), io::Error> {
+        self.inner.finish(searcher, finish)
     }
 }
 
@@ -1772,7 +1950,7 @@ mod tests {
     use termcolor::{Ansi, NoColor};
 
     use super::{ColorSpecs, Standard, StandardBuilder};
-    use crate::util::SeededRegexMatcher;
+    use crate::util::{SeededRegexHint, SeededRegexMatcher};
 
     const SHERLOCK: &'static str = "\
 For the Doctor Watsons of this world, as opposed to the Sherlock
@@ -1837,6 +2015,312 @@ and exhibited clearly, with a label attached.\
             .unwrap();
         assert!(matcher.selected_calls() > 0);
         assert_eq!(printer_contents(&mut printer), "a\n");
+    }
+
+    #[test]
+    fn first_match_sink_selection_follows_output_consumers() {
+        let printer = StandardBuilder::new().build(NoColor::new(vec![]));
+        assert!(!printer.needs_only_first_match());
+
+        let mut builder = StandardBuilder::new();
+        builder.column(true);
+        let printer = builder.build(NoColor::new(vec![]));
+        assert!(printer.needs_only_first_match());
+
+        builder.max_columns_preview(true);
+        let printer = builder.build(NoColor::new(vec![]));
+        assert!(printer.needs_only_first_match());
+
+        for preview in [false, true] {
+            let mut builder = StandardBuilder::new();
+            builder
+                .column(true)
+                .max_columns(Some(10))
+                .max_columns_preview(preview);
+            let printer = builder.build(NoColor::new(vec![]));
+            assert!(!printer.needs_only_first_match());
+        }
+
+        let mut builder = StandardBuilder::new();
+        builder.column(true).replacement(Some(b"x".to_vec()));
+        assert!(!builder
+            .build(NoColor::new(vec![]))
+            .needs_only_first_match());
+
+        let mut builder = StandardBuilder::new();
+        builder.column(true).per_match(true);
+        assert!(!builder
+            .build(NoColor::new(vec![]))
+            .needs_only_first_match());
+
+        let mut builder = StandardBuilder::new();
+        builder.column(true).only_matching(true);
+        assert!(!builder
+            .build(NoColor::new(vec![]))
+            .needs_only_first_match());
+
+        let mut builder = StandardBuilder::new();
+        builder.column(true).stats(true);
+        assert!(!builder
+            .build(NoColor::new(vec![]))
+            .needs_only_first_match());
+
+        let mut builder = StandardBuilder::new();
+        builder
+            .column(true)
+            .color_specs(ColorSpecs::default_with_color());
+        assert!(builder
+            .build(NoColor::new(vec![]))
+            .needs_only_first_match());
+        assert!(!builder.build(Ansi::new(vec![])).needs_only_first_match());
+    }
+
+    #[test]
+    fn first_match_sink_stops_match_iteration_after_first() {
+        let search_matcher = SeededRegexMatcher::new("foo");
+        let sink_matcher = SeededRegexMatcher::new("foo");
+        let mut builder = StandardBuilder::new();
+        builder.column(true).path(false);
+        let mut printer = builder.build_no_color(vec![]);
+        SearcherBuilder::new()
+            .line_number(false)
+            .build()
+            .search_reader(
+                &search_matcher,
+                &b"foo foo foo\n"[..],
+                printer.sink_with_path_first_match(
+                    &sink_matcher,
+                    "fixture",
+                ),
+            )
+            .unwrap();
+
+        assert_eq!(sink_matcher.iter_at(), Some(0));
+        assert_eq!(sink_matcher.iter_match_calls(), 1);
+        assert_eq!(printer_contents(&mut printer), "1:foo foo foo\n");
+    }
+
+    #[test]
+    fn first_match_sink_stops_after_selected_seed() {
+        let matcher = SeededRegexMatcher::new("foo");
+        let mut builder = StandardBuilder::new();
+        builder.column(true).path(false);
+        let mut printer = builder.build_no_color(vec![]);
+        SearcherBuilder::new()
+            .line_number(false)
+            .build()
+            .search_reader(
+                &matcher,
+                &b"zz foo foo\n"[..],
+                printer.sink_with_path_first_match(&matcher, "fixture"),
+            )
+            .unwrap();
+
+        assert!(matcher.selected_calls() > 0);
+        assert_eq!(matcher.iter_at(), None);
+        assert_eq!(matcher.iter_match_calls(), 0);
+        assert_eq!(printer_contents(&mut printer), "4:zz foo foo\n");
+    }
+
+    #[test]
+    fn first_match_sink_falls_back_for_invalid_seeds() {
+        for hint in [
+            SeededRegexHint::None,
+            SeededRegexHint::Empty,
+            SeededRegexHint::TrailingByte,
+            SeededRegexHint::OutOfBounds,
+        ] {
+            let matcher = SeededRegexMatcher::with_hint("foo", hint);
+            let mut builder = StandardBuilder::new();
+            builder.column(true).path(false);
+            let mut printer = builder.build_no_color(vec![]);
+            SearcherBuilder::new()
+                .line_number(false)
+                .build()
+                .search_reader(
+                    &matcher,
+                    &b"zz foo foo\n"[..],
+                    printer
+                        .sink_with_path_first_match(&matcher, "fixture"),
+                )
+                .unwrap();
+
+            assert!(matcher.selected_calls() > 0);
+            assert_eq!(matcher.iter_at(), Some(0));
+            assert_eq!(matcher.iter_match_calls(), 1);
+            assert_eq!(printer_contents(&mut printer), "4:zz foo foo\n");
+        }
+    }
+
+    #[test]
+    fn first_match_sink_preserves_empty_match_output() {
+        for pattern in ["", "$", "\\z"] {
+            let matcher = RegexMatcher::new(pattern).unwrap();
+            let mut ordinary_builder = StandardBuilder::new();
+            ordinary_builder.column(true).path(false);
+            let mut ordinary = ordinary_builder.build_no_color(vec![]);
+            SearcherBuilder::new()
+                .line_number(false)
+                .build()
+                .search_reader(
+                    &matcher,
+                    &b"a\n"[..],
+                    ordinary.sink(&matcher),
+                )
+                .unwrap();
+
+            let mut first_builder = StandardBuilder::new();
+            first_builder.column(true).path(false);
+            let mut first = first_builder.build_no_color(vec![]);
+            SearcherBuilder::new()
+                .line_number(false)
+                .build()
+                .search_reader(
+                    &matcher,
+                    &b"a\n"[..],
+                    first.sink_with_path_first_match(&matcher, "fixture"),
+                )
+                .unwrap();
+            assert_eq!(
+                printer_contents(&mut first),
+                printer_contents(&mut ordinary),
+                "pattern {pattern:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn first_match_sink_preserves_multiline_column_output() {
+        let matcher = RegexMatcher::new("foo\\nbar|bar").unwrap();
+        let haystack = &b"xx foo\nbar bar\n"[..];
+
+        let mut ordinary_builder = StandardBuilder::new();
+        ordinary_builder.column(true).path(false);
+        let mut ordinary = ordinary_builder.build_no_color(vec![]);
+        SearcherBuilder::new()
+            .line_number(false)
+            .multi_line(true)
+            .build()
+            .search_reader(&matcher, haystack, ordinary.sink(&matcher))
+            .unwrap();
+
+        let mut first_builder = StandardBuilder::new();
+        first_builder.column(true).path(false);
+        let mut first = first_builder.build_no_color(vec![]);
+        SearcherBuilder::new()
+            .line_number(false)
+            .multi_line(true)
+            .build()
+            .search_reader(
+                &matcher,
+                haystack,
+                first.sink_with_path_first_match(&matcher, "fixture"),
+            )
+            .unwrap();
+        assert_eq!(
+            printer_contents(&mut first),
+            printer_contents(&mut ordinary),
+        );
+    }
+
+    #[test]
+    fn first_match_sink_preserves_invert_context_output() {
+        let matcher = RegexMatcher::new("foo").unwrap();
+        let haystack = &b"before\nfoo\nafter\nother\n"[..];
+
+        let mut ordinary_builder = StandardBuilder::new();
+        ordinary_builder.column(true).path(false);
+        let mut ordinary = ordinary_builder.build_no_color(vec![]);
+        SearcherBuilder::new()
+            .line_number(false)
+            .invert_match(true)
+            .before_context(1)
+            .after_context(1)
+            .build()
+            .search_reader(&matcher, haystack, ordinary.sink(&matcher))
+            .unwrap();
+
+        let mut first_builder = StandardBuilder::new();
+        first_builder.column(true).path(false);
+        let mut first = first_builder.build_no_color(vec![]);
+        SearcherBuilder::new()
+            .line_number(false)
+            .invert_match(true)
+            .before_context(1)
+            .after_context(1)
+            .build()
+            .search_reader(
+                &matcher,
+                haystack,
+                first.sink_with_path_first_match(&matcher, "fixture"),
+            )
+            .unwrap();
+        assert_eq!(
+            printer_contents(&mut first),
+            printer_contents(&mut ordinary),
+        );
+    }
+
+    #[test]
+    #[should_panic(
+        expected = "first-match sink requires plain column-only output"
+    )]
+    fn first_match_sink_rejects_ineligible_configuration() {
+        let matcher = RegexMatcher::new("foo").unwrap();
+        let mut builder = StandardBuilder::new();
+        builder.column(true).only_matching(true);
+        let mut printer = builder.build_no_color(vec![]);
+        let _ = printer.sink_with_path_first_match(&matcher, "fixture");
+    }
+
+    #[test]
+    fn ordinary_sink_still_records_all_matches() {
+        let matcher = SeededRegexMatcher::new("foo");
+        let mut printer =
+            StandardBuilder::new().only_matching(true).build_no_color(vec![]);
+        SearcherBuilder::new()
+            .line_number(false)
+            .build()
+            .search_reader(
+                &matcher,
+                &b"foo foo foo\n"[..],
+                printer.sink(&matcher),
+            )
+            .unwrap();
+
+        assert!(matcher.selected_calls() > 0);
+        assert_eq!(matcher.iter_at(), Some(3));
+        assert_eq!(matcher.iter_match_calls(), 2);
+        assert_eq!(printer_contents(&mut printer), "foo\nfoo\nfoo\n");
+    }
+
+    #[test]
+    fn column_with_max_columns_retains_later_match_counts() {
+        for (preview, expected) in [
+            (false, "1:[Omitted long line with 3 matches]\n"),
+            (true, "1:f [... 2 more matches]\n"),
+        ] {
+            let matcher = SeededRegexMatcher::new("foo");
+            let mut builder = StandardBuilder::new();
+            builder
+                .column(true)
+                .max_columns(Some(1))
+                .max_columns_preview(preview);
+            let mut printer = builder.build_no_color(vec![]);
+            assert!(!printer.needs_only_first_match());
+            SearcherBuilder::new()
+                .line_number(false)
+                .build()
+                .search_reader(
+                    &matcher,
+                    &b"foo foo foo\n"[..],
+                    printer.sink(&matcher),
+                )
+                .unwrap();
+
+            assert_eq!(matcher.iter_match_calls(), 2);
+            assert_eq!(printer_contents(&mut printer), expected);
+        }
     }
 
     #[test]
