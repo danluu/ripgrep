@@ -6,8 +6,8 @@ use std::{
 
 use fre::{
     BuildError, PortableBuilder, PortableFindIterError,
-    PortableOrdinarySession, PortableRegex, RipgrepStandardLiteralHirBuild,
-    SearchError,
+    PortableOrdinarySession, PortableRegex, RipgrepOrdinaryRegex,
+    RipgrepStandardLiteralHirBuild, RipgrepStandardLiteralsBuild, SearchError,
 };
 use grep_matcher::{
     ByteSet, LineMatchKind, LineTerminator, Match as GrepMatch, Matcher,
@@ -197,7 +197,7 @@ impl RegexMatcherBuilder {
             self.portable_builder(source, false, line_terminator).build()?
         };
         Ok(RegexMatcher {
-            regex: Arc::new(regex),
+            regex: Arc::new(RegexProgram::Portable(regex)),
             line_terminator,
             non_matching_bytes,
             matches_are_nonempty,
@@ -225,15 +225,23 @@ impl RegexMatcherBuilder {
             self.configured.fre_standard_literals_many(snapshot)
         {
             let line_terminator = Some(literals.line_terminator());
-            if let Some(regex) = self
+            if let Some(built) = self
                 .portable_builder(String::new(), true, line_terminator)
-                .build_ripgrep_standard_literals(
+                .build_ripgrep_standard_literals_ordinary(
                     literals.patterns(),
                     self.max_canonical_pattern_bytes,
                 )?
             {
+                let program = match built {
+                    RipgrepStandardLiteralsBuild::Ordinary(regex) => {
+                        RegexProgram::RipgrepLiteral(regex)
+                    }
+                    RipgrepStandardLiteralsBuild::Portable(regex) => {
+                        RegexProgram::Portable(regex)
+                    }
+                };
                 return Ok(RegexMatcher {
-                    regex: Arc::new(regex),
+                    regex: Arc::new(program),
                     line_terminator,
                     non_matching_bytes: literals.non_matching_bytes(),
                     matches_are_nonempty: true,
@@ -404,10 +412,50 @@ fn hir_can_consume_ascii(hir: &Hir, byte: u8) -> bool {
     }
 }
 
+enum RegexProgram {
+    Portable(PortableRegex),
+    RipgrepLiteral(RipgrepOrdinaryRegex),
+}
+
+impl RegexProgram {
+    #[cfg(test)]
+    fn as_str(&self) -> &str {
+        match self {
+            Self::Portable(regex) => regex.as_str(),
+            Self::RipgrepLiteral(regex) => regex.as_str(),
+        }
+    }
+
+    #[cfg(test)]
+    fn build_report(&self) -> &fre::BuildReport {
+        match self {
+            Self::Portable(regex) => regex.build_report(),
+            Self::RipgrepLiteral(regex) => regex.build_report(),
+        }
+    }
+
+    #[cfg(test)]
+    fn runtime_implementation_id(&self) -> &'static str {
+        match self {
+            Self::Portable(regex) => regex.runtime_implementation_id(),
+            Self::RipgrepLiteral(regex) => regex.runtime_implementation_id(),
+        }
+    }
+
+    fn ordinary_session(
+        &self,
+    ) -> Result<PortableOrdinarySession<'_>, SearchError> {
+        match self {
+            Self::Portable(regex) => regex.ordinary_session(),
+            Self::RipgrepLiteral(regex) => Ok(regex.ordinary_session()),
+        }
+    }
+}
+
 /// A clonable immutable FRE matcher using the portable non-AOT runtime.
 #[derive(Clone)]
 pub struct RegexMatcher {
-    regex: Arc<PortableRegex>,
+    regex: Arc<RegexProgram>,
     line_terminator: Option<LineTerminator>,
     non_matching_bytes: ByteSet,
     matches_are_nonempty: bool,
@@ -1681,14 +1729,89 @@ mod tests {
         let matcher = builder
             .build_many(&patterns)
             .expect("wide borrowed literal matcher");
+        assert!(matches!(
+            matcher.regex.as_ref(),
+            super::RegexProgram::RipgrepLiteral(_),
+        ));
         assert_eq!(
             matcher.regex.build_report().persistent_byte_limit,
             100 * (1 << 20),
+        );
+        assert!(
+            matcher.regex.build_report().plan_storage_bytes < 2 * (1 << 20)
         );
         assert_eq!(
             matcher.regex.runtime_implementation_id(),
             "literal-set-compact-nfa",
         );
+
+        let mut reference_builder = grep_regex::RegexMatcherBuilder::new();
+        reference_builder.multi_line(true).line_terminator(Some(b'\n'));
+        let reference = reference_builder
+            .build_many(&patterns)
+            .expect("wide reference literal matcher");
+        let haystack =
+            format!("xx{}/{}{}yy", patterns[7], patterns[255], patterns[19],)
+                .into_bytes();
+        let worker = matcher.worker().unwrap();
+        let cloned = matcher.clone();
+        let cloned_worker = cloned.worker().unwrap();
+        assert_find_parity(
+            &worker,
+            &reference,
+            &[haystack.as_slice(), b"absent", patterns[91].as_bytes()],
+        );
+        assert_find_parity(&cloned_worker, &reference, &[haystack.as_slice()]);
+        assert_eq!(
+            worker.is_match(&haystack).unwrap(),
+            reference.is_match(&haystack).unwrap(),
+        );
+        assert_eq!(
+            worker.shortest_match_at(&haystack, 1).unwrap(),
+            reference.shortest_match_at(&haystack, 1).unwrap(),
+        );
+        let mut actual = Vec::new();
+        worker
+            .try_find_iter(&haystack, |matched| {
+                actual.push((matched.start(), matched.end()));
+                Ok::<bool, ()>(true)
+            })
+            .unwrap()
+            .unwrap();
+        let mut expected = Vec::new();
+        reference
+            .try_find_iter(&haystack, |matched| {
+                expected.push((matched.start(), matched.end()));
+                Ok::<bool, ()>(true)
+            })
+            .unwrap()
+            .unwrap();
+        assert_eq!(actual, expected);
+        assert_eq!(
+            count_matches_with(&worker, &worker, &haystack),
+            count_matches_with(&reference, &reference, &haystack),
+        );
+    }
+
+    #[test]
+    fn short_uniform_literal_set_keeps_the_portable_owner() {
+        let patterns = (0..256)
+            .map(|index| {
+                let prefix = format!("public{index:04}");
+                let mut pattern = prefix;
+                pattern.extend(core::iter::repeat_n('q', 127 - pattern.len()));
+                pattern
+            })
+            .collect::<Vec<_>>();
+        let mut builder = RegexMatcherBuilder::new();
+        builder.multi_line(true);
+        let matcher = builder
+            .build_many(&patterns)
+            .expect("short borrowed literal matcher");
+        assert!(matches!(
+            matcher.regex.as_ref(),
+            super::RegexProgram::Portable(_),
+        ));
     }
 
     #[test]
