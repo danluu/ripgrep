@@ -1070,6 +1070,60 @@ struct Patterns {
     patterns: Vec<String>,
 }
 
+/// Read all patterns from one -f/--file source.
+fn patterns_from_file(
+    state: &mut State,
+    path: &Path,
+) -> anyhow::Result<Vec<String>> {
+    if path != Path::new("-") {
+        return Ok(grep::cli::patterns_from_path(path)?);
+    }
+    anyhow::ensure!(
+        !state.stdin_consumed,
+        "error reading -f/--file from stdin: stdin has already been consumed"
+    );
+    let patterns = grep::cli::patterns_from_stdin()?;
+    state.stdin_consumed = true;
+    Ok(patterns)
+}
+
+/// De-duplicate patterns while retaining their first-occurrence order and
+/// their original string allocations.
+#[inline]
+fn deduplicate_patterns(patterns: Vec<String>) -> Vec<String> {
+    if patterns.len() <= 1 {
+        return patterns;
+    }
+    deduplicate_patterns_many(patterns)
+}
+
+#[inline(never)]
+fn deduplicate_patterns_many(mut patterns: Vec<String>) -> Vec<String> {
+    let mut duplicates = vec![];
+    let mut seen = HashSet::new();
+    for (index, pattern) in patterns.iter().enumerate() {
+        if !seen.insert(pattern.as_str()) {
+            duplicates.push(index);
+        }
+    }
+    drop(seen);
+    if duplicates.is_empty() {
+        return patterns;
+    }
+    let mut duplicates = duplicates.into_iter().peekable();
+    let mut index = 0;
+    patterns.retain(|_| {
+        let keep = duplicates.peek().copied() != Some(index);
+        if !keep {
+            duplicates.next();
+        }
+        index += 1;
+        keep
+    });
+    debug_assert!(duplicates.next().is_none());
+    patterns
+}
+
 impl Patterns {
     /// Pulls the patterns out of the low arguments.
     ///
@@ -1104,6 +1158,19 @@ impl Patterns {
                 anyhow::bail!("pattern given is not valid UTF-8")
             };
             return Ok(Patterns { patterns: vec![pat] });
+        }
+        // A sole -e/--regexp can move directly into the result. A sole
+        // -f/--file can de-duplicate the Vec returned by grep-cli directly.
+        // Keep both out of the general collector.
+        if low.patterns.len() == 1 {
+            let source = low.patterns.pop().expect("one pattern source");
+            let patterns = match source {
+                PatternSource::Regexp(pat) => vec![pat],
+                PatternSource::File(path) => {
+                    deduplicate_patterns(patterns_from_file(state, &path)?)
+                }
+            };
+            return Ok(Patterns { patterns });
         }
         // Otherwise, we need to slurp up our patterns from -e/--regexp and
         // -f/--file. We de-duplicate as we go. If we don't de-duplicate,
@@ -1146,6 +1213,111 @@ impl Patterns {
             }
         }
         Ok(Patterns { patterns })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+
+    use crate::flags::lowargs::{LowArgs, PatternSource};
+
+    use super::{Patterns, State, deduplicate_patterns};
+
+    fn deduplicated(patterns: &[&str]) -> Vec<String> {
+        deduplicate_patterns(
+            patterns.iter().map(|pattern| pattern.to_string()).collect(),
+        )
+    }
+
+    #[test]
+    fn patterns_deduplicate_adjacent_and_nonadjacent_values() {
+        assert_eq!(
+            deduplicated(&["alpha", "alpha", "beta", "alpha", "beta"]),
+            ["alpha", "beta"],
+        );
+    }
+
+    #[test]
+    fn patterns_preserve_first_occurrence_and_exact_equality() {
+        assert_eq!(
+            deduplicated(&[
+                "third", "first", "second", "first", "third", "", "E", "e",
+                "E",
+            ]),
+            ["third", "first", "second", "", "E", "e"],
+        );
+    }
+
+    #[test]
+    fn patterns_leave_zero_or_one_value_unchanged() {
+        let empty = Vec::<String>::new();
+        let empty_pointer = empty.as_ptr();
+        let empty = deduplicate_patterns(empty);
+        assert!(empty.is_empty());
+        assert_eq!(empty_pointer, empty.as_ptr());
+
+        let one = vec!["alpha".to_string()];
+        let vector_pointer = one.as_ptr();
+        let string_pointer = one[0].as_ptr();
+        let one = deduplicate_patterns(one);
+        assert_eq!(["alpha"], one.as_slice());
+        assert_eq!(vector_pointer, one.as_ptr());
+        assert_eq!(string_pointer, one[0].as_ptr());
+    }
+
+    #[test]
+    fn patterns_compact_the_reader_vector_in_place() {
+        let patterns =
+            grep::cli::patterns_from_reader("alpha\nalpha\nbeta\n".as_bytes())
+                .unwrap();
+        let first_string_pointer = patterns[0].as_ptr();
+        let original_pointer = patterns.as_ptr();
+        let original_capacity = patterns.capacity();
+        let patterns = deduplicate_patterns(patterns);
+        assert_eq!(["alpha", "beta"], patterns.as_slice());
+        assert_eq!(original_pointer, patterns.as_ptr());
+        assert_eq!(original_capacity, patterns.capacity());
+        assert_eq!(first_string_pointer, patterns[0].as_ptr());
+    }
+
+    #[test]
+    fn patterns_leave_unique_reader_values_in_place() {
+        let patterns =
+            grep::cli::patterns_from_reader("alpha\nbeta\ngamma\n".as_bytes())
+                .unwrap();
+        let string_pointers: Vec<_> =
+            patterns.iter().map(|pattern| pattern.as_ptr()).collect();
+        let original_pointer = patterns.as_ptr();
+        let original_capacity = patterns.capacity();
+        let patterns = deduplicate_patterns(patterns);
+        assert_eq!(["alpha", "beta", "gamma"], patterns.as_slice());
+        assert_eq!(original_pointer, patterns.as_ptr());
+        assert_eq!(original_capacity, patterns.capacity());
+        assert_eq!(
+            string_pointers,
+            patterns
+                .iter()
+                .map(|pattern| pattern.as_ptr())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn patterns_move_the_single_regexp_allocation() {
+        let mut state = State {
+            is_terminal_stdout: false,
+            stdin_consumed: false,
+            cwd: PathBuf::new(),
+        };
+        let mut low = LowArgs::default();
+        let pattern = "alpha".to_string();
+        let pattern_pointer = pattern.as_ptr();
+        low.patterns.push(PatternSource::Regexp(pattern));
+        let patterns = Patterns::from_low_args(&mut state, &mut low).unwrap();
+        assert_eq!(["alpha"], patterns.patterns.as_slice());
+        assert_eq!(pattern_pointer, patterns.patterns[0].as_ptr());
+        assert!(low.patterns.is_empty());
     }
 }
 
