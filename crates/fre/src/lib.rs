@@ -1090,14 +1090,19 @@ mod tests {
     }
 
     #[test]
-    fn canonical_selected_end_count_declines_before_start_validation() {
+    fn exact_selected_end_count_validates_and_drives_summary_tail() {
         let factory = RegexMatcher::new("literal").unwrap();
         let worker = factory.worker().unwrap();
-        assert_eq!(
+        assert!(
             worker
                 .count_positive_width_selected_ends_at(b"literal", usize::MAX,)
+                .is_err(),
+        );
+        assert_eq!(
+            worker
+                .count_positive_width_selected_ends_at(b"literal literal", 0)
                 .unwrap(),
-            None,
+            Some(2),
         );
 
         let matcher = ProbeMatcher::new(&worker, SelectedHint::Forward);
@@ -1106,7 +1111,7 @@ mod tests {
             b"2\n",
         );
         assert!(matcher.selected_end_count_calls.get() > 0);
-        assert_eq!(matcher.iter_at.get(), Some(7));
+        assert_eq!(matcher.iter_at.get(), None);
     }
 
     #[test]
