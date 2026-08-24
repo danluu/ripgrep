@@ -657,7 +657,7 @@ mod tests {
 
     use fre::{
         BuildLimits, PlanKind, PlanSelection, PortableBuilder,
-        PortableFindIterError, RipgrepStandardLiteralHirBuild,
+        PortableFindIterError, RipgrepStandardLiteralHirBuild, SearchError,
     };
     use grep_matcher::{
         LineMatchKind, LineTerminator, Match as GrepMatch, Matcher,
@@ -1142,6 +1142,87 @@ mod tests {
         assert!(matcher.selected_calls.get() > 0);
         assert_eq!(matcher.selected_end_count_calls.get(), 1);
         assert_eq!(matcher.iter_at.get(), None);
+    }
+
+    #[test]
+    fn direct_literal_set_count_engine_matches_span_iteration() {
+        let patterns = (0_usize..256)
+            .map(|index| {
+                let family =
+                    char::from(b'A' + u8::try_from(index / 16).unwrap());
+                let width = index % 16;
+                let tail = char::from(b'a' + u8::try_from(width).unwrap());
+                format!("{family}{index:04}{}{tail}", "q".repeat(width))
+            })
+            .collect::<Vec<_>>();
+        let builder = RegexMatcherBuilder::new();
+        let factory = builder.build_many(&patterns).unwrap();
+        assert_eq!(factory.regex.build_report().plan, PlanKind::LiteralSetDfa);
+        let worker = factory.worker().unwrap();
+
+        let cases = [
+            (b"no public fixture literal is present".to_vec(), 0),
+            (patterns[0].repeat(6).into_bytes(), 0),
+            (
+                format!("{}{}{}", patterns[2], patterns[15], patterns[31])
+                    .into_bytes(),
+                0,
+            ),
+            (format!("xx{}{}", patterns[0], patterns[1]).into_bytes(), 2),
+            (patterns[3].as_bytes().to_vec(), patterns[3].len()),
+        ];
+        for (haystack, at) in &cases {
+            let mut expected = 0_u64;
+            assert_eq!(
+                worker
+                    .try_find_iter_at(haystack, *at, |_| {
+                        expected += 1;
+                        Ok::<bool, ()>(true)
+                    })
+                    .unwrap(),
+                Ok(()),
+            );
+            assert_eq!(
+                worker
+                    .count_positive_width_selected_ends_at(haystack, *at)
+                    .unwrap(),
+                Some(expected),
+                "haystack={haystack:?}, at={at}",
+            );
+        }
+
+        assert!(matches!(
+            worker.count_positive_width_selected_ends_at(b"\x00", 2),
+            Err(MatchError::Search(SearchError::LiteralSetDfa(_))),
+        ));
+
+        let mut priority_patterns = patterns;
+        priority_patterns[0] = "abcd".to_owned();
+        priority_patterns[1] = "a".to_owned();
+        priority_patterns[2] = "b".to_owned();
+        let priority_factory = builder.build_many(&priority_patterns).unwrap();
+        assert_eq!(
+            priority_factory.regex.build_report().plan,
+            PlanKind::LiteralSetDfa,
+        );
+        let priority_worker = priority_factory.worker().unwrap();
+        let mut spans = Vec::new();
+        assert_eq!(
+            priority_worker
+                .try_find_iter(b"abcd", |matched| {
+                    spans.push((matched.start(), matched.end()));
+                    Ok::<bool, ()>(true)
+                })
+                .unwrap(),
+            Ok(()),
+        );
+        assert_eq!(spans, [(0, 4)]);
+        assert_eq!(
+            priority_worker
+                .count_positive_width_selected_ends_at(b"abcd", 0)
+                .unwrap(),
+            Some(1),
+        );
     }
 
     #[test]
