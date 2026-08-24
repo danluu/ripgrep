@@ -635,7 +635,9 @@ impl<'p, 's, M: Matcher, W: WriteColor> Sink for SummarySink<'p, 's, M, W> {
 
     #[inline]
     fn selected_match_owner(&self) -> Option<&SelectedMatchOwner> {
-        if self.summary.config.kind == SummaryKind::CountMatches {
+        if self.summary.config.kind == SummaryKind::CountMatches
+            || self.stats.is_some()
+        {
             self.matcher.selected_match_owner()
         } else {
             None
@@ -897,6 +899,24 @@ and exhibited clearly, with a label attached.
         let stats = {
             let mut sink = printer.sink(matcher);
             searcher.search_reader(matcher, haystack, &mut sink).unwrap();
+            sink.stats().unwrap().clone()
+        };
+        (printer_contents(&mut printer), stats)
+    }
+
+    fn count_lines_stats<M: grep_matcher::Matcher>(
+        matcher: &M,
+        haystack: &[u8],
+    ) -> (String, Stats) {
+        let mut builder = SummaryBuilder::new();
+        builder.kind(SummaryKind::Count).stats(true);
+        let mut printer = builder.build_no_color(vec![]);
+        let stats = {
+            let mut sink = printer.sink(matcher);
+            SearcherBuilder::new()
+                .build()
+                .search_reader(matcher, haystack, &mut sink)
+                .unwrap();
             sink.stats().unwrap().clone()
         };
         (printer_contents(&mut printer), stats)
@@ -1173,6 +1193,18 @@ and exhibited clearly, with a label attached.
         let matcher = SeededRegexMatcher::with_selected_end_count("ab|a");
         let got = count_matches_with(&matcher, &matcher, b"ababa\n");
         assert_eq_printed!("fixture:3\n", got);
+        assert!(matcher.selected_calls() > 0);
+        assert_eq!(matcher.selected_end_count_calls(), 1);
+        assert_eq!(matcher.iter_at(), None);
+    }
+
+    #[test]
+    fn count_lines_stats_uses_positive_selected_end_tail_after_valid_seed() {
+        let matcher = SeededRegexMatcher::with_selected_end_count("ab|a");
+        let (got, stats) = count_lines_stats(&matcher, b"ababa\n");
+        assert_eq_printed!("1\n", got);
+        assert_eq!(stats.matches(), 3);
+        assert_eq!(stats.matched_lines(), 1);
         assert!(matcher.selected_calls() > 0);
         assert_eq!(matcher.selected_end_count_calls(), 1);
         assert_eq!(matcher.iter_at(), None);
