@@ -107,9 +107,7 @@ impl From<grep_regex::Error> for Error {
 #[derive(Clone, Debug)]
 pub struct RegexMatcherBuilder {
     configured: grep_regex::RegexMatcherBuilder,
-    dfa_size_limit: Option<usize>,
     max_canonical_pattern_bytes: usize,
-    size_limit: Option<usize>,
 }
 
 impl Default for RegexMatcherBuilder {
@@ -124,9 +122,7 @@ impl RegexMatcherBuilder {
         configured.line_terminator(Some(b'\n'));
         Self {
             configured,
-            dfa_size_limit: None,
             max_canonical_pattern_bytes: DEFAULT_CANONICAL_PATTERN_LIMIT,
-            size_limit: None,
         }
     }
 
@@ -267,13 +263,9 @@ impl RegexMatcherBuilder {
         if let Some(line_terminator) = line_terminator {
             builder = builder.line_terminator(line_terminator.as_byte());
         }
-        if let Some(limit) = self.size_limit {
-            builder = builder.size_limit(limit);
-        }
-        if let Some(limit) = self.dfa_size_limit {
-            builder = builder.dfa_size_limit(limit);
-        }
-        builder
+        let (size_limit, dfa_size_limit) =
+            self.configured.fre_resource_limits();
+        builder.size_limit(size_limit).dfa_size_limit(dfa_size_limit)
     }
 
     pub fn case_insensitive(&mut self, yes: bool) -> &mut Self {
@@ -292,7 +284,6 @@ impl RegexMatcherBuilder {
     }
 
     pub fn dfa_size_limit(&mut self, bytes: usize) -> &mut Self {
-        self.dfa_size_limit = Some(bytes);
         self.configured.dfa_size_limit(bytes);
         self
     }
@@ -323,7 +314,6 @@ impl RegexMatcherBuilder {
     }
 
     pub fn size_limit(&mut self, bytes: usize) -> &mut Self {
-        self.size_limit = Some(bytes);
         self.configured.size_limit(bytes);
         self
     }
@@ -1674,6 +1664,31 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(spans, [(2, 10), (11, 19), (20, 28)]);
+    }
+
+    #[test]
+    fn default_regex_limits_admit_the_wide_compact_literal_owner() {
+        let patterns = (0..256)
+            .map(|index| {
+                let prefix = format!("public{index:04}");
+                let mut pattern = prefix;
+                pattern.extend(core::iter::repeat_n('q', 256 - pattern.len()));
+                pattern
+            })
+            .collect::<Vec<_>>();
+        let mut builder = RegexMatcherBuilder::new();
+        builder.multi_line(true);
+        let matcher = builder
+            .build_many(&patterns)
+            .expect("wide borrowed literal matcher");
+        assert_eq!(
+            matcher.regex.build_report().persistent_byte_limit,
+            100 * (1 << 20),
+        );
+        assert_eq!(
+            matcher.regex.runtime_implementation_id(),
+            "literal-set-compact-nfa",
+        );
     }
 
     #[test]

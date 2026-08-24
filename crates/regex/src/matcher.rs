@@ -115,6 +115,15 @@ impl RegexMatcherBuilder {
         self.config.fre_standard_literals(patterns)
     }
 
+    /// Return the configured regex program and lazy-DFA cache limits.
+    ///
+    /// This narrow integration receipt lets alternate execution engines use
+    /// the same effective defaults and explicit overrides as grep-regex.
+    #[doc(hidden)]
+    pub fn fre_resource_limits(&self) -> (usize, usize) {
+        (self.config.size_limit, self.config.dfa_size_limit)
+    }
+
     /// Build a new matcher from a plain alternation of literals.
     ///
     /// Depending on the configuration set by the builder, this may be able to
@@ -584,6 +593,17 @@ impl RegexCaptures {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fre_resource_limit_receipt_tracks_defaults_and_overrides() {
+        let mut builder = RegexMatcherBuilder::new();
+        assert_eq!(
+            builder.fre_resource_limits(),
+            (100 * (1 << 20), 1000 * (1 << 20)),
+        );
+        builder.size_limit(17).dfa_size_limit(29);
+        assert_eq!(builder.fre_resource_limits(), (17, 29));
+    }
 
     // Test that enabling word matches does the right thing and demonstrate
     // the difference between it and surrounding the regex in `\b`.
