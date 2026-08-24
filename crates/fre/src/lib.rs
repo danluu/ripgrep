@@ -145,13 +145,18 @@ impl RegexMatcherBuilder {
             ..=STANDARD_LITERAL_BYTES_MAX_PATTERNS)
             .contains(&patterns.len())
         {
-            if let Some(matcher) =
-                self.try_build_ripgrep_standard_literals_many(patterns)?
-            {
-                return Ok(matcher);
-            }
+            return self.build_ripgrep_standard_literals_many(patterns);
         }
         let configured = self.configured.configured_hir_many(patterns)?;
+        self.build_configured_hir(configured)
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn build_configured_hir(
+        &self,
+        configured: grep_regex::ConfiguredHIR,
+    ) -> Result<RegexMatcher, Error> {
         let line_terminator = configured.line_terminator();
         let non_matching_bytes = configured.non_matching_bytes();
         if let Some(line_terminator) = line_terminator {
@@ -207,10 +212,10 @@ impl RegexMatcherBuilder {
 
     #[cold]
     #[inline(never)]
-    fn try_build_ripgrep_standard_literals_many<P: AsRef<str>>(
+    fn build_ripgrep_standard_literals_many<P: AsRef<str>>(
         &self,
         patterns: &[P],
-    ) -> Result<Option<RegexMatcher>, Error> {
+    ) -> Result<RegexMatcher, Error> {
         debug_assert!(
             (STANDARD_LITERAL_BYTES_MIN_PATTERNS
                 ..=STANDARD_LITERAL_BYTES_MAX_PATTERNS)
@@ -220,29 +225,29 @@ impl RegexMatcherBuilder {
         for (slot, pattern) in borrowed.iter_mut().zip(patterns) {
             *slot = pattern.as_ref();
         }
-        let Some(literals) = self
-            .configured
-            .fre_standard_literals_many(&borrowed[..patterns.len()])
-        else {
-            return Ok(None);
-        };
-        let line_terminator = Some(literals.line_terminator());
-        let Some(regex) = self
-            .portable_builder(String::new(), true, line_terminator)
-            .build_ripgrep_standard_literals(
-                literals.patterns(),
-                self.max_canonical_pattern_bytes,
-            )?
-        else {
-            return Ok(None);
-        };
-        Ok(Some(RegexMatcher {
-            regex: Arc::new(regex),
-            line_terminator,
-            non_matching_bytes: literals.non_matching_bytes(),
-            matches_are_nonempty: true,
-            selected_match_owner: SelectedMatchOwner::new(),
-        }))
+        let snapshot = &borrowed[..patterns.len()];
+        if let Some(literals) =
+            self.configured.fre_standard_literals_many(snapshot)
+        {
+            let line_terminator = Some(literals.line_terminator());
+            if let Some(regex) = self
+                .portable_builder(String::new(), true, line_terminator)
+                .build_ripgrep_standard_literals(
+                    literals.patterns(),
+                    self.max_canonical_pattern_bytes,
+                )?
+            {
+                return Ok(RegexMatcher {
+                    regex: Arc::new(regex),
+                    line_terminator,
+                    non_matching_bytes: literals.non_matching_bytes(),
+                    matches_are_nonempty: true,
+                    selected_match_owner: SelectedMatchOwner::new(),
+                });
+            }
+        }
+        let configured = self.configured.configured_hir_many(snapshot)?;
+        self.build_configured_hir(configured)
     }
 
     fn portable_builder(
@@ -1645,6 +1650,68 @@ mod tests {
         let non_matching = worker.non_matching_bytes().unwrap();
         assert!(!non_matching.contains(b'a'));
         assert!(non_matching.contains(b'Z'));
+    }
+
+    #[test]
+    fn standard_literal_refusals_reuse_arbitrary_as_ref_snapshot() {
+        struct AlternatingPattern {
+            calls: Cell<usize>,
+            first: String,
+            later: String,
+        }
+
+        impl AsRef<str> for AlternatingPattern {
+            fn as_ref(&self) -> &str {
+                let call = self.calls.get();
+                self.calls.set(call + 1);
+                if call == 0 { &self.first } else { &self.later }
+            }
+        }
+
+        // The dot makes grep-regex decline literal certification. Its normal
+        // configured-HIR route must consume the already captured values.
+        let patterns = (0..super::STANDARD_LITERAL_BYTES_MIN_PATTERNS)
+            .map(|index| AlternatingPattern {
+                calls: Cell::new(0),
+                first: if index == 17 {
+                    "a.b".to_owned()
+                } else {
+                    format!("value{index:04}")
+                },
+                later: "ZZZZZZZZ".to_owned(),
+            })
+            .collect::<Vec<_>>();
+        let mut builder = RegexMatcherBuilder::new();
+        builder.multi_line(true);
+        let matcher = builder
+            .build_many(&patterns)
+            .expect("configured-HIR refusal fallback");
+        assert!(patterns.iter().all(|pattern| pattern.calls.get() == 1));
+        let worker = matcher.worker().unwrap();
+        assert!(worker.is_match(b"aXb").unwrap());
+        assert!(!worker.is_match(b"ZZZZZZZZ").unwrap());
+
+        // The first values exceed this canonical-source boundary, making FRE
+        // decline its raw handoff. The second values would fit after HIR
+        // simplification, so the incumbent error proves fallback used the
+        // original snapshot instead of asking AsRef for another value.
+        let patterns = (0..super::STANDARD_LITERAL_BYTES_MIN_PATTERNS)
+            .map(|index| AlternatingPattern {
+                calls: Cell::new(0),
+                first: format!("value{index:04}"),
+                later: "x".to_owned(),
+            })
+            .collect::<Vec<_>>();
+        let mut builder = RegexMatcherBuilder::new();
+        builder
+            .multi_line(true)
+            .canonical_pattern_size_limit(1);
+        let error = builder.build_many(&patterns).unwrap_err();
+        assert!(patterns.iter().all(|pattern| pattern.calls.get() == 1));
+        assert!(matches!(
+            error,
+            Error::CanonicalPatternLimit { limit: 1, .. }
+        ));
     }
 
     #[test]
