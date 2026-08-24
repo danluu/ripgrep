@@ -180,9 +180,9 @@ impl RegexMatcherBuilder {
             match self
                 .portable_builder(String::new(), true, line_terminator)
                 .build_ripgrep_standard_literal_hir_owned(
-                    hir,
-                    self.max_canonical_pattern_bytes,
-                )? {
+                hir,
+                self.max_canonical_pattern_bytes,
+            )? {
                 RipgrepStandardLiteralHirBuild::Built(regex) => regex,
                 RipgrepStandardLiteralHirBuild::Refused(hir) => {
                     let source = canonical_hir_pattern(
@@ -255,7 +255,8 @@ impl RegexMatcherBuilder {
         direct_hir: bool,
         line_terminator: Option<LineTerminator>,
     ) -> PortableBuilder {
-        let mut builder = PortableBuilder::new(source).retained_find_iter(true);
+        let mut builder =
+            PortableBuilder::new(source).retained_find_iter(true);
         if direct_hir {
             builder = builder
                 .multi_line(true)
@@ -1702,9 +1703,7 @@ mod tests {
             })
             .collect::<Vec<_>>();
         let mut builder = RegexMatcherBuilder::new();
-        builder
-            .multi_line(true)
-            .canonical_pattern_size_limit(1);
+        builder.multi_line(true).canonical_pattern_size_limit(1);
         let error = builder.build_many(&patterns).unwrap_err();
         assert!(patterns.iter().all(|pattern| pattern.calls.get() == 1));
         assert!(matches!(

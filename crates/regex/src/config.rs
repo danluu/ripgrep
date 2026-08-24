@@ -746,11 +746,7 @@ mod tests {
         let standard_patterns = (0..FRE_STANDARD_LITERAL_MIN_PATTERNS)
             .map(|index| format!("value{index:04}"))
             .collect::<Vec<_>>();
-        assert!(
-            standard()
-                .fre_standard_literals(&[] as &[&str])
-                .is_none()
-        );
+        assert!(standard().fre_standard_literals(&[] as &[&str]).is_none());
         let too_small = standard_patterns[..128]
             .iter()
             .map(String::as_str)
@@ -762,13 +758,17 @@ mod tests {
         assert!(standard().fre_standard_literals(&too_large).is_none());
         assert!(
             standard()
-                .fre_standard_literals(&vec!["x"; FRE_STANDARD_LITERAL_MIN_PATTERNS])
+                .fre_standard_literals(&vec![
+                    "x";
+                    FRE_STANDARD_LITERAL_MIN_PATTERNS
+                ])
                 .is_none()
         );
         for replacement in ["", "a.b", "line\nfeed"] {
             let mut refused = standard_patterns.clone();
             refused[17] = replacement.to_owned();
-            let refused = refused.iter().map(String::as_str).collect::<Vec<_>>();
+            let refused =
+                refused.iter().map(String::as_str).collect::<Vec<_>>();
             assert!(standard().fre_standard_literals(&refused).is_none());
         }
 
@@ -776,17 +776,13 @@ mod tests {
         banned.ban = Some(b'\0');
         let mut banned_patterns = standard_patterns.clone();
         banned_patterns[17] = "a\0b".to_owned();
-        let banned_patterns = banned_patterns
-            .iter()
-            .map(String::as_str)
-            .collect::<Vec<_>>();
+        let banned_patterns =
+            banned_patterns.iter().map(String::as_str).collect::<Vec<_>>();
         assert!(banned.fre_standard_literals(&banned_patterns).is_none());
         assert!(banned.build_many(&["a\0b"]).is_err());
 
-        let patterns = standard_patterns
-            .iter()
-            .map(String::as_str)
-            .collect::<Vec<_>>();
+        let patterns =
+            standard_patterns.iter().map(String::as_str).collect::<Vec<_>>();
 
         let mut changed = standard();
         changed.whole_line = true;
