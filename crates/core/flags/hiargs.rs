@@ -699,6 +699,11 @@ impl HiArgs {
             .hyperlink(self.hyperlink_config.clone())
             .max_columns_preview(self.max_columns_preview)
             .max_columns(self.max_columns)
+            .only_matching_line_terminator_is_absent(
+                self.only_matching
+                    && !self.multiline
+                    && self.replace.is_none(),
+            )
             .only_matching(self.only_matching)
             .path(self.with_filename)
             .path_terminator(self.path_terminator.clone())

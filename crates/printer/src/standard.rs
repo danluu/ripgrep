@@ -37,6 +37,7 @@ use crate::{
 struct Config {
     colors: ColorSpecs,
     color_support_is_stable: bool,
+    only_matching_line_terminator_is_absent: bool,
     hyperlink: HyperlinkConfig,
     stats: bool,
     heading: bool,
@@ -63,6 +64,7 @@ impl Default for Config {
         Config {
             colors: ColorSpecs::default(),
             color_support_is_stable: false,
+            only_matching_line_terminator_is_absent: false,
             hyperlink: HyperlinkConfig::default(),
             stats: false,
             heading: false,
@@ -186,6 +188,25 @@ impl StandardBuilder {
         yes: bool,
     ) -> &mut StandardBuilder {
         self.config.color_support_is_stable = yes;
+        self
+    }
+
+    /// Declare that bytes selected for `only_matching` output never end in
+    /// the searcher's configured line terminator.
+    ///
+    /// When enabled, stable uncolored `only_matching` output omits its
+    /// per-match suffix probe and appends one line terminator directly.
+    /// Replacement output retains the suffix probe regardless of this
+    /// setting. Callers should only enable this when the guarantee holds for
+    /// every selected match over the lifetime of the printer.
+    ///
+    /// This is disabled by default, preserving the ordinary behavior for
+    /// arbitrary matcher and writer implementations.
+    pub fn only_matching_line_terminator_is_absent(
+        &mut self,
+        yes: bool,
+    ) -> &mut StandardBuilder {
+        self.config.only_matching_line_terminator_is_absent = yes;
         self
     }
 
@@ -1234,6 +1255,10 @@ impl<'a, M: Matcher, W: WriteColor> StandardImpl<'a, M, W> {
         debug_assert!(!self.multi_line() || self.is_context());
 
         if self.config().only_matching {
+            let uncolored_without_terminator_probe =
+                self.config().only_matching_line_terminator_is_absent
+                    && self.config().replacement.is_none()
+                    && self.sink.stable_matches_are_colored == Some(false);
             for &m in self.sunk.matches() {
                 self.write_prelude(
                     self.sunk.absolute_byte_offset() + m.start() as u64,
@@ -1242,7 +1267,11 @@ impl<'a, M: Matcher, W: WriteColor> StandardImpl<'a, M, W> {
                 )?;
 
                 let buf = &self.sunk.bytes()[m];
-                self.write_colored_line(&[Match::new(0, buf.len())], buf)?;
+                if uncolored_without_terminator_probe {
+                    self.write_uncolored_line_without_terminator_probe(buf)?;
+                } else {
+                    self.write_colored_line(&[Match::new(0, buf.len())], buf)?;
+                }
             }
         } else if self.config().per_match {
             for &m in self.sunk.matches() {
@@ -1450,6 +1479,44 @@ impl<'a, M: Matcher, W: WriteColor> StandardImpl<'a, M, W> {
             if !self.has_line_terminator(line) {
                 self.write_line_term()?;
             }
+        }
+        Ok(())
+    }
+
+    /// Write a line known not to end in the configured line terminator.
+    ///
+    /// This is the stable-uncolored specialization of `write_line` for the
+    /// `only_matching` path. Keeping it separate leaves the generic line and
+    /// colored-line routines unchanged.
+    #[inline(always)]
+    fn write_uncolored_line_without_terminator_probe(
+        &self,
+        line: &[u8],
+    ) -> io::Result<()> {
+        debug_assert_eq!(Some(false), self.sink.stable_matches_are_colored);
+        debug_assert!(self.config().only_matching_line_terminator_is_absent);
+        debug_assert!(self.config().replacement.is_none());
+
+        let line = if !self.config().trim_ascii {
+            line
+        } else {
+            let lineterm = self.searcher.line_terminator();
+            let full_range = Match::new(0, line.len());
+            let range = trim_ascii_prefix(lineterm, line, full_range);
+            &line[range]
+        };
+        if self.exceeds_max_columns(line) {
+            let range = Match::new(0, line.len());
+            self.write_exceeded_line(
+                line,
+                range,
+                self.sunk.matches(),
+                &mut 0,
+            )?;
+        } else {
+            // self.write_trim(line)?;
+            self.write(line)?;
+            self.write_line_term()?;
         }
         Ok(())
     }
@@ -2122,6 +2189,105 @@ and exhibited clearly, with a label attached.\
         assert_eq!(2, probe.support_calls.get());
         assert_eq!(2, probe.set_color_calls);
         assert_eq!(2, probe.reset_calls);
+    }
+
+    #[test]
+    fn terminator_hint_preserves_dynamic_color_support() {
+        let matcher = RegexMatcher::new("foo").unwrap();
+        let mut printer = StandardBuilder::new()
+            .color_specs(ColorSpecs::default_with_color())
+            .only_matching(true)
+            .only_matching_line_terminator_is_absent(true)
+            .build(TogglingColorWriter::new(vec![true, false, true]));
+        SearcherBuilder::new()
+            .line_number(false)
+            .build()
+            .search_reader(&matcher, &b"foo foo\n"[..], printer.sink(&matcher))
+            .unwrap();
+
+        let probe = printer.get_mut();
+        assert_eq!(&b"foo\nfoo\n"[..], probe.bytes);
+        assert_eq!(3, probe.support_calls.get());
+        assert_eq!(1, probe.set_color_calls);
+        assert_eq!(1, probe.reset_calls);
+    }
+
+    #[test]
+    fn terminator_hint_preserves_stable_colored_output() {
+        let matcher = RegexMatcher::new("foo").unwrap();
+        let mut printer = StandardBuilder::new()
+            .color_specs(ColorSpecs::default_with_color())
+            .only_matching(true)
+            .color_support_is_stable(true)
+            .only_matching_line_terminator_is_absent(true)
+            .build(TogglingColorWriter::new(vec![true]));
+        SearcherBuilder::new()
+            .line_number(false)
+            .build()
+            .search_reader(&matcher, &b"foo\n"[..], printer.sink(&matcher))
+            .unwrap();
+
+        let probe = printer.get_mut();
+        assert_eq!(&b"foo\n"[..], probe.bytes);
+        assert_eq!(1, probe.support_calls.get());
+        assert_eq!(1, probe.set_color_calls);
+        assert_eq!(1, probe.reset_calls);
+    }
+
+    #[test]
+    fn default_line_terminator_probe_preserves_multiline_suffix() {
+        let matcher = RegexMatcher::new("foo\\n").unwrap();
+        let mut printer = StandardBuilder::new()
+            .only_matching(true)
+            .build(NoColor::new(vec![]));
+        SearcherBuilder::new()
+            .line_number(false)
+            .multi_line(true)
+            .build()
+            .search_reader(
+                &matcher,
+                &b"foo\nbar\n"[..],
+                printer.sink(&matcher),
+            )
+            .unwrap();
+        assert_eq!(printer_contents(&mut printer), "foo\n");
+    }
+
+    #[test]
+    fn terminator_hint_preserves_line_oriented_matches() {
+        let mut matcher_builder = RegexMatcherBuilder::new();
+        matcher_builder.line_terminator(Some(b'\n'));
+        let matcher = matcher_builder.build("foo").unwrap();
+        let mut printer = StandardBuilder::new()
+            .only_matching(true)
+            .color_support_is_stable(true)
+            .only_matching_line_terminator_is_absent(true)
+            .build(NoColor::new(vec![]));
+        SearcherBuilder::new()
+            .line_number(false)
+            .build()
+            .search_reader(&matcher, &b"foo foo\n"[..], printer.sink(&matcher))
+            .unwrap();
+        assert_eq!(printer_contents(&mut printer), "foo\nfoo\n");
+    }
+
+    #[test]
+    fn terminator_hint_does_not_apply_to_replacement() {
+        let mut matcher_builder = RegexMatcherBuilder::new();
+        matcher_builder.line_terminator(Some(b'\n'));
+        let matcher = matcher_builder.build("foo").unwrap();
+        let mut printer = StandardBuilder::new()
+            .only_matching(true)
+            .color_support_is_stable(true)
+            .replacement(Some(b"x\n".to_vec()))
+            .only_matching_line_terminator_is_absent(true)
+            .build(NoColor::new(vec![]));
+        SearcherBuilder::new()
+            .line_number(false)
+            .build()
+            .search_reader(&matcher, &b"foo\n"[..], printer.sink(&matcher))
+            .unwrap();
+        assert_eq!(printer_contents(&mut printer), "x\n");
     }
 
     #[test]
