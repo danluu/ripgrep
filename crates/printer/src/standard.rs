@@ -1259,6 +1259,28 @@ impl<'a, M: Matcher, W: WriteColor> StandardImpl<'a, M, W> {
                 self.config().only_matching_line_terminator_is_absent
                     && self.config().replacement.is_none()
                     && self.sink.stable_matches_are_colored == Some(false);
+            let prelude_is_empty = self.path().is_none()
+                && self.sunk.line_number().is_none()
+                && !self.config().column
+                && !self.config().byte_offset;
+            let write_matches_directly = prelude_is_empty
+                && uncolored_without_terminator_probe
+                && !self.config().trim_ascii
+                && self.config().max_columns.is_none();
+            if write_matches_directly {
+                let bytes = self.sunk.bytes();
+                let matches = self.sunk.matches();
+                let line_term = self.searcher.line_terminator();
+                let line_term_bytes = line_term.as_bytes();
+                let mut wtr = self.wtr().borrow_mut();
+                for &m in matches {
+                    // Preserve the fallback's write and error ordering while
+                    // leasing the checked writer only once for this line.
+                    wtr.write_all(&bytes[m])?;
+                    wtr.write_all(line_term_bytes)?;
+                }
+                return Ok(());
+            }
             for &m in self.sunk.matches() {
                 self.write_prelude(
                     self.sunk.absolute_byte_offset() + m.start() as u64,
@@ -2091,6 +2113,77 @@ and exhibited clearly, with a label attached.\
         String::from_utf8(printer.get_mut().get_ref().to_owned()).unwrap()
     }
 
+    fn direct_only_matching_builder() -> StandardBuilder {
+        let mut builder = StandardBuilder::new();
+        builder
+            .only_matching(true)
+            .color_support_is_stable(true)
+            .only_matching_line_terminator_is_absent(true);
+        builder
+    }
+
+    fn direct_only_matching_output(
+        configure: impl FnOnce(&mut StandardBuilder),
+        pattern: &str,
+        haystack: &[u8],
+        path: Option<&str>,
+    ) -> String {
+        let matcher = RegexMatcher::new(pattern).unwrap();
+        let mut builder = direct_only_matching_builder();
+        configure(&mut builder);
+        let mut printer = builder.build(NoColor::new(vec![]));
+        let mut searcher =
+            SearcherBuilder::new().line_number(false).build();
+        if let Some(path) = path {
+            searcher
+                .search_reader(
+                    &matcher,
+                    haystack,
+                    printer.sink_with_path(&matcher, path),
+                )
+                .unwrap();
+        } else {
+            searcher
+                .search_reader(
+                    &matcher,
+                    haystack,
+                    printer.sink(&matcher),
+                )
+                .unwrap();
+        }
+        printer_contents(&mut printer)
+    }
+
+    #[derive(Debug)]
+    struct OrderedWriter {
+        attempts: Vec<Vec<u8>>,
+        fail_at: Option<usize>,
+    }
+
+    impl OrderedWriter {
+        fn new(fail_at: Option<usize>) -> OrderedWriter {
+            OrderedWriter { attempts: vec![], fail_at }
+        }
+    }
+
+    impl Write for OrderedWriter {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            let at = self.attempts.len();
+            self.attempts.push(buf.to_vec());
+            if self.fail_at == Some(at) {
+                return Err(io::Error::new(
+                    io::ErrorKind::Other,
+                    "ordered writer failure",
+                ));
+            }
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
     #[derive(Debug)]
     struct TogglingColorWriter {
         bytes: Vec<u8>,
@@ -2232,6 +2325,112 @@ and exhibited clearly, with a label attached.\
         assert_eq!(1, probe.support_calls.get());
         assert_eq!(1, probe.set_color_calls);
         assert_eq!(1, probe.reset_calls);
+    }
+
+    #[test]
+    fn direct_only_matching_preserves_write_order() {
+        let matcher = RegexMatcher::new("foo").unwrap();
+        let mut printer = direct_only_matching_builder()
+            .build(NoColor::new(OrderedWriter::new(None)));
+        SearcherBuilder::new()
+            .line_number(false)
+            .build()
+            .search_reader(&matcher, &b"foo foo\n"[..], printer.sink(&matcher))
+            .unwrap();
+
+        assert_eq!(
+            vec![
+                b"foo".to_vec(),
+                b"\n".to_vec(),
+                b"foo".to_vec(),
+                b"\n".to_vec(),
+            ],
+            printer.get_mut().get_ref().attempts,
+        );
+    }
+
+    #[test]
+    fn direct_only_matching_preserves_crlf_terminator() {
+        let matcher =
+            RegexMatcherBuilder::new().crlf(true).build("foo").unwrap();
+        let mut printer = direct_only_matching_builder()
+            .build(NoColor::new(vec![]));
+        SearcherBuilder::new()
+            .line_number(false)
+            .line_terminator(LineTerminator::crlf())
+            .build()
+            .search_reader(
+                &matcher,
+                &b"foo foo\r\n"[..],
+                printer.sink(&matcher),
+            )
+            .unwrap();
+
+        assert_eq!(printer_contents(&mut printer), "foo\r\nfoo\r\n");
+    }
+
+    #[test]
+    fn direct_only_matching_preserves_error_order() {
+        let matcher = RegexMatcher::new("foo").unwrap();
+        let mut printer = direct_only_matching_builder()
+            .build(NoColor::new(OrderedWriter::new(Some(2))));
+        let err = SearcherBuilder::new()
+            .line_number(false)
+            .build()
+            .search_reader(&matcher, &b"foo foo\n"[..], printer.sink(&matcher))
+            .unwrap_err();
+
+        assert_eq!(io::ErrorKind::Other, err.kind());
+        assert_eq!(
+            vec![b"foo".to_vec(), b"\n".to_vec(), b"foo".to_vec()],
+            printer.get_mut().get_ref().attempts,
+        );
+    }
+
+    #[test]
+    fn direct_only_matching_preserves_formatting_fallbacks() {
+        assert_eq!(
+            "2:foo\n6:foo\n",
+            direct_only_matching_output(
+                |builder| {
+                    builder.column(true);
+                },
+                "foo",
+                b"xfoo foo\n",
+                None,
+            ),
+        );
+        assert_eq!(
+            "fixture:foo\nfixture:foo\n",
+            direct_only_matching_output(
+                |_| {},
+                "foo",
+                b"foo foo\n",
+                Some("fixture"),
+            ),
+        );
+        assert_eq!(
+            "foo\n",
+            direct_only_matching_output(
+                |builder| {
+                    builder.trim_ascii(true);
+                },
+                r" +foo",
+                b"  foo\n",
+                None,
+            ),
+        );
+        assert_eq!(
+            "[Omitted long matching line]\n",
+            direct_only_matching_output(
+                |builder| {
+                    builder.max_columns(Some(2));
+                },
+                "foo",
+                b"foo\n",
+                None,
+            ),
+        );
     }
 
     #[test]
