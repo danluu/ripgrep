@@ -1281,6 +1281,18 @@ impl<'a, M: Matcher, W: WriteColor> StandardImpl<'a, M, W> {
                 }
                 return Ok(());
             }
+            let write_matches_with_plain_prelude =
+                uncolored_without_terminator_probe
+                    && !self.config().column
+                    && !self.config().byte_offset
+                    && !self.config().trim_ascii
+                    && self.config().max_columns.is_none()
+                    && self.path().map_or(true, |_| {
+                        self.config().hyperlink.format().is_empty()
+                    });
+            if write_matches_with_plain_prelude {
+                return self.write_only_matching_with_plain_prelude();
+            }
             for &m in self.sunk.matches() {
                 self.write_prelude(
                     self.sunk.absolute_byte_offset() + m.start() as u64,
@@ -1311,6 +1323,65 @@ impl<'a, M: Matcher, W: WriteColor> StandardImpl<'a, M, W> {
                 Some(self.sunk.matches()[0].start() as u64 + 1),
             )?;
             self.write_colored_line(self.sunk.matches(), self.sunk.bytes())?;
+        }
+        Ok(())
+    }
+
+    /// Write stable, uncolored matches whose prelude contains only a path
+    /// and/or line number. This is kept out of line so that the no-prelude
+    /// loop above remains small.
+    #[inline(never)]
+    fn write_only_matching_with_plain_prelude(&self) -> io::Result<()> {
+        debug_assert_eq!(Some(false), self.sink.stable_matches_are_colored);
+        debug_assert!(self.config().only_matching_line_terminator_is_absent);
+        debug_assert!(self.config().replacement.is_none());
+        debug_assert!(!self.config().column);
+        debug_assert!(!self.config().byte_offset);
+        debug_assert!(!self.config().trim_ascii);
+        debug_assert!(self.config().max_columns.is_none());
+        debug_assert!(self.path().map_or(true, |_| {
+            self.config().hyperlink.format().is_empty()
+        }));
+
+        let path = self.path();
+        if let Some(path) = path {
+            if !self.config().heading {
+                // PreludeWriter::start resolves the hyperlink path before it
+                // discovers that an empty format emits no hyperlink. Keep
+                // that OnceCell initialization (and its logged failure) ahead
+                // of the writer lease.
+                let _ = path.as_hyperlink();
+            }
+        }
+        let line_number = self.sunk.line_number().map(DecimalFormatter::new);
+        let field_separator = self.separator_field();
+        let path_terminator = self.config().path_terminator;
+        let line_term = self.searcher.line_terminator();
+        let line_term_bytes = line_term.as_bytes();
+        let bytes = self.sunk.bytes();
+        let matches = self.sunk.matches();
+        let mut wtr = self.wtr().borrow_mut();
+        for &m in matches {
+            if !self.config().heading {
+                if let Some(path) = path {
+                    wtr.set_color(self.config().colors.path())?;
+                    wtr.write_all(path.as_bytes())?;
+                    wtr.reset()?;
+                    if let Some(term) = path_terminator {
+                        wtr.write_all(&[term])?;
+                    } else {
+                        wtr.write_all(field_separator)?;
+                    }
+                }
+            }
+            if let Some(ref line_number) = line_number {
+                wtr.set_color(self.config().colors.line())?;
+                wtr.write_all(line_number.as_bytes())?;
+                wtr.reset()?;
+                wtr.write_all(field_separator)?;
+            }
+            wtr.write_all(&bytes[m])?;
+            wtr.write_all(line_term_bytes)?;
         }
         Ok(())
     }
@@ -2081,9 +2152,12 @@ mod tests {
     use grep_matcher::LineTerminator;
     use grep_regex::{RegexMatcher, RegexMatcherBuilder};
     use grep_searcher::SearcherBuilder;
-    use termcolor::{Ansi, ColorSpec, NoColor, WriteColor};
+    use termcolor::{
+        Ansi, ColorSpec, HyperlinkSpec, NoColor, WriteColor,
+    };
 
     use super::{ColorSpecs, Standard, StandardBuilder};
+    use crate::hyperlink::{HyperlinkEnvironment, HyperlinkFormat};
     use crate::util::{SeededRegexHint, SeededRegexMatcher};
 
     const SHERLOCK: &'static str = "\
@@ -2182,6 +2256,112 @@ and exhibited clearly, with a label attached.\
         fn flush(&mut self) -> io::Result<()> {
             Ok(())
         }
+    }
+
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    enum OrderedColorOp {
+        Write(Vec<u8>),
+        SetColor(ColorSpec),
+        Reset,
+        SetHyperlink,
+    }
+
+    #[derive(Debug)]
+    struct OrderedColorWriter {
+        ops: Vec<OrderedColorOp>,
+        fail_at: Option<usize>,
+        supports_hyperlinks: bool,
+    }
+
+    impl OrderedColorWriter {
+        fn new(
+            fail_at: Option<usize>,
+            supports_hyperlinks: bool,
+        ) -> OrderedColorWriter {
+            OrderedColorWriter {
+                ops: vec![],
+                fail_at,
+                supports_hyperlinks,
+            }
+        }
+
+        fn attempt(&mut self, op: OrderedColorOp) -> io::Result<()> {
+            let at = self.ops.len();
+            self.ops.push(op);
+            if self.fail_at == Some(at) {
+                return Err(io::Error::new(
+                    io::ErrorKind::Other,
+                    "ordered color writer failure",
+                ));
+            }
+            Ok(())
+        }
+    }
+
+    impl Write for OrderedColorWriter {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.attempt(OrderedColorOp::Write(buf.to_vec()))?;
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl WriteColor for OrderedColorWriter {
+        fn supports_color(&self) -> bool {
+            true
+        }
+
+        fn supports_hyperlinks(&self) -> bool {
+            self.supports_hyperlinks
+        }
+
+        fn set_color(&mut self, spec: &ColorSpec) -> io::Result<()> {
+            self.attempt(OrderedColorOp::SetColor(spec.clone()))
+        }
+
+        fn reset(&mut self) -> io::Result<()> {
+            self.attempt(OrderedColorOp::Reset)
+        }
+
+        fn set_hyperlink(&mut self, _link: &HyperlinkSpec) -> io::Result<()> {
+            self.attempt(OrderedColorOp::SetHyperlink)
+        }
+    }
+
+    fn prefixed_only_matching_operations(
+        force_fallback: bool,
+        fail_at: Option<usize>,
+        supports_hyperlinks: bool,
+    ) -> (io::Result<()>, Vec<OrderedColorOp>) {
+        let matcher = RegexMatcher::new("foo").unwrap();
+        let mut builder = direct_only_matching_builder();
+        builder.color_specs(ColorSpecs::new(&[
+            "path:fg:magenta".parse().unwrap(),
+            "line:fg:green".parse().unwrap(),
+        ]));
+        if force_fallback {
+            let format = "test://{path}".parse::<HyperlinkFormat>().unwrap();
+            builder.hyperlink(
+                format.into_config(HyperlinkEnvironment::new()),
+            );
+        }
+        let mut printer = builder.build(OrderedColorWriter::new(
+            fail_at,
+            supports_hyperlinks,
+        ));
+        let path = std::env::current_dir().unwrap();
+        let result = SearcherBuilder::new()
+            .line_number(true)
+            .build()
+            .search_reader(
+                &matcher,
+                &b"skip\nfoo foo\n"[..],
+                printer.sink_with_path(&matcher, &path),
+            );
+        (result, printer.get_mut().ops.clone())
     }
 
     #[derive(Debug)]
@@ -2384,6 +2564,182 @@ and exhibited clearly, with a label attached.\
         assert_eq!(
             vec![b"foo".to_vec(), b"\n".to_vec(), b"foo".to_vec()],
             printer.get_mut().get_ref().attempts,
+        );
+    }
+
+    #[test]
+    fn prefixed_only_matching_preserves_writer_operations() {
+        let (direct_result, direct_ops) =
+            prefixed_only_matching_operations(false, None, false);
+        direct_result.unwrap();
+        let (fallback_result, fallback_ops) =
+            prefixed_only_matching_operations(true, None, false);
+        fallback_result.unwrap();
+
+        // A nonempty hyperlink format forces the canonical implementation,
+        // while a writer without hyperlink support keeps its writer operation
+        // sequence otherwise identical.
+        assert_eq!(fallback_ops, direct_ops);
+        let path = std::env::current_dir().unwrap();
+        let path = path.to_string_lossy().as_bytes().to_vec();
+        let writes: Vec<Vec<u8>> = direct_ops
+            .iter()
+            .filter_map(|op| match *op {
+                OrderedColorOp::Write(ref bytes) => Some(bytes.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            vec![
+                path.clone(),
+                b":".to_vec(),
+                b"2".to_vec(),
+                b":".to_vec(),
+                b"foo".to_vec(),
+                b"\n".to_vec(),
+                path,
+                b":".to_vec(),
+                b"2".to_vec(),
+                b":".to_vec(),
+                b"foo".to_vec(),
+                b"\n".to_vec(),
+            ],
+            writes,
+        );
+    }
+
+    #[test]
+    fn prefixed_only_matching_preserves_every_failure_boundary() {
+        let (result, complete_ops) =
+            prefixed_only_matching_operations(false, None, false);
+        result.unwrap();
+        for fail_at in 0..complete_ops.len() {
+            let (direct_result, direct_ops) =
+                prefixed_only_matching_operations(
+                    false,
+                    Some(fail_at),
+                    false,
+                );
+            let (fallback_result, fallback_ops) =
+                prefixed_only_matching_operations(
+                    true,
+                    Some(fail_at),
+                    false,
+                );
+            assert_eq!(io::ErrorKind::Other, direct_result.unwrap_err().kind());
+            assert_eq!(
+                io::ErrorKind::Other,
+                fallback_result.unwrap_err().kind(),
+            );
+            assert_eq!(fallback_ops, direct_ops);
+            assert_eq!(fail_at + 1, direct_ops.len());
+        }
+    }
+
+    #[test]
+    fn prefixed_only_matching_keeps_raw_writer_path() {
+        let matcher = RegexMatcher::new("foo").unwrap();
+        let mut printer = direct_only_matching_builder()
+            .build(OrderedColorWriter::new(None, false));
+        SearcherBuilder::new()
+            .line_number(false)
+            .build()
+            .search_reader(&matcher, &b"foo foo\n"[..], printer.sink(&matcher))
+            .unwrap();
+
+        assert_eq!(
+            vec![
+                OrderedColorOp::Write(b"foo".to_vec()),
+                OrderedColorOp::Write(b"\n".to_vec()),
+                OrderedColorOp::Write(b"foo".to_vec()),
+                OrderedColorOp::Write(b"\n".to_vec()),
+            ],
+            printer.get_mut().ops,
+        );
+    }
+
+    #[test]
+    fn prefixed_only_matching_preserves_plain_formatting() {
+        let matcher =
+            RegexMatcherBuilder::new().crlf(true).build("foo").unwrap();
+        let mut builder = direct_only_matching_builder();
+        builder
+            .separator_field_match(b"::".to_vec())
+            .path_terminator(Some(b'|'));
+        let mut printer = builder.build(NoColor::new(vec![]));
+        SearcherBuilder::new()
+            .line_number(true)
+            .line_terminator(LineTerminator::crlf())
+            .build()
+            .search_reader(
+                &matcher,
+                &b"skip\r\nfoo foo\r\n"[..],
+                printer.sink_with_path(&matcher, "fixture"),
+            )
+            .unwrap();
+        assert_eq!(
+            "fixture|2::foo\r\nfixture|2::foo\r\n",
+            printer_contents(&mut printer),
+        );
+
+        let mut builder = direct_only_matching_builder();
+        builder.heading(true);
+        let mut printer = builder.build(NoColor::new(vec![]));
+        SearcherBuilder::new()
+            .line_number(true)
+            .line_terminator(LineTerminator::crlf())
+            .build()
+            .search_reader(
+                &matcher,
+                &b"skip\r\nfoo foo\r\n"[..],
+                printer.sink_with_path(&matcher, "fixture"),
+            )
+            .unwrap();
+        assert_eq!(
+            "fixture\r\n2:foo\r\n2:foo\r\n",
+            printer_contents(&mut printer),
+        );
+    }
+
+    #[test]
+    fn prefixed_only_matching_preserves_invert_context_separators() {
+        let matcher = RegexMatcher::new("foo").unwrap();
+        let mut builder = direct_only_matching_builder();
+        builder
+            .separator_field_match(b"::".to_vec())
+            .separator_field_context(b"--".to_vec());
+        let mut printer = builder.build(NoColor::new(vec![]));
+        SearcherBuilder::new()
+            .line_number(true)
+            .invert_match(true)
+            .before_context(1)
+            .after_context(1)
+            .build()
+            .search_reader(
+                &matcher,
+                &b"foo\nbar\nbaz\nfoo\n"[..],
+                printer.sink_with_path(&matcher, "fixture"),
+            )
+            .unwrap();
+        assert_eq!(
+            "fixture--1--foo\n\
+             fixture::2::bar\n\
+             fixture::3::baz\n\
+             fixture--4--foo\n",
+            printer_contents(&mut printer),
+        );
+    }
+
+    #[test]
+    fn prefixed_only_matching_nonempty_hyperlink_falls_back() {
+        let (result, ops) =
+            prefixed_only_matching_operations(true, None, true);
+        result.unwrap();
+        assert_eq!(
+            4,
+            ops.iter()
+                .filter(|op| matches!(op, OrderedColorOp::SetHyperlink))
+                .count(),
         );
     }
 
