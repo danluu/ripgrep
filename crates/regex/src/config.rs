@@ -174,55 +174,20 @@ impl Config {
         {
             return None;
         }
-        let mut non_matching_bytes = ByteSet::full();
-        let mut all_single_character = true;
-        for &pattern in patterns {
-            let bytes = pattern.as_bytes();
-            if bytes.is_empty() {
-                return None;
-            }
-            let mut characters = pattern.chars();
-            let _first = characters.next()?;
-            all_single_character &= characters.next().is_none();
-            for &byte in bytes {
-                // All regex meta characters are ASCII, so this byte test is
-                // equivalent to the character test in `is_fixed_strings`.
-                if byte.is_ascii()
-                    && regex_syntax::is_meta_character(char::from(byte))
-                {
-                    return None;
-                }
-                if self
-                    .line_terminator
-                    .is_some_and(|term| term.as_bytes().contains(&byte))
-                    || self.ban == Some(byte)
-                {
-                    // Preserve the configured-HIR error path for forbidden
-                    // bytes rather than reproducing its diagnostic here.
-                    return None;
-                }
-                non_matching_bytes.remove(byte);
-            }
-        }
-        if all_single_character {
-            // `Hir::alternation` collapses this exact shape into one Unicode
-            // class. Preserve that configured-HIR route and its report.
-            return None;
-        }
-        Some(FreStandardLiterals { patterns, non_matching_bytes })
+        Some(FreStandardLiterals { patterns, forbidden_byte: self.ban })
     }
 }
 
-/// Borrowed fixed strings certified for ripgrep's standard FRE integration.
+/// Borrowed strings selected for ripgrep's standard FRE integration.
 ///
 /// This value is deliberately tied to the original pattern slice. It is only
-/// produced for nonempty, metacharacter-free strings under the exact ordinary
-/// case-sensitive LF configuration used by `grep-fre`.
+/// produced under the exact ordinary case-sensitive LF configuration used by
+/// `grep-fre`. FRE remains responsible for validating every pattern value.
 #[doc(hidden)]
 #[derive(Debug)]
 pub struct FreStandardLiterals<'a> {
     patterns: &'a [&'a str],
-    non_matching_bytes: ByteSet,
+    forbidden_byte: Option<u8>,
 }
 
 impl<'a> FreStandardLiterals<'a> {
@@ -231,9 +196,9 @@ impl<'a> FreStandardLiterals<'a> {
         self.patterns
     }
 
-    /// Return the exact bytes that cannot occur in any literal match.
-    pub fn non_matching_bytes(&self) -> ByteSet {
-        self.non_matching_bytes.clone()
+    /// Return the optional byte excluded by the standard configuration.
+    pub fn forbidden_byte(&self) -> Option<u8> {
+        self.forbidden_byte
     }
 
     /// Return the LF line terminator certified by this handoff.
@@ -718,31 +683,28 @@ mod tests {
     }
 
     #[test]
-    fn fre_standard_literal_bytes_are_borrowed_and_censused_once() {
+    fn fre_standard_literal_candidates_borrow_patterns_and_configuration() {
         let owned = (0..FRE_STANDARD_LITERAL_MIN_PATTERNS)
             .map(|index| format!("value{index:04}"))
             .collect::<Vec<_>>();
         let patterns = owned.iter().map(String::as_str).collect::<Vec<_>>();
-        let certified = standard()
+        let candidate = standard()
             .fre_standard_literals(&patterns)
-            .expect("standard fixed strings are certified");
-        assert!(core::ptr::eq(certified.patterns(), patterns.as_slice()));
-        assert_eq!(certified.line_terminator(), LineTerminator::byte(b'\n'));
+            .expect("standard configuration selects a literal candidate");
+        assert!(core::ptr::eq(candidate.patterns(), patterns.as_slice()));
+        assert_eq!(candidate.line_terminator(), LineTerminator::byte(b'\n'));
+        assert_eq!(candidate.forbidden_byte(), None);
 
-        let configured = standard().build_many(&patterns).unwrap();
-        let selected = certified.non_matching_bytes();
-        let walked = configured.non_matching_bytes();
-        for byte in 0..=u8::MAX {
-            assert_eq!(
-                selected.contains(byte),
-                walked.contains(byte),
-                "literal census differs for {byte:#04x}",
-            );
-        }
+        let mut banned = standard();
+        banned.ban = Some(b'\0');
+        let candidate = banned
+            .fre_standard_literals(&patterns)
+            .expect("standard NUL ban selects a literal candidate");
+        assert_eq!(candidate.forbidden_byte(), Some(b'\0'));
     }
 
     #[test]
-    fn fre_standard_literal_bytes_decline_to_every_existing_fallback() {
+    fn fre_standard_literal_gate_defers_value_checks_to_fre() {
         let standard_patterns = (0..FRE_STANDARD_LITERAL_MIN_PATTERNS)
             .map(|index| format!("value{index:04}"))
             .collect::<Vec<_>>();
@@ -762,14 +724,14 @@ mod tests {
                     "x";
                     FRE_STANDARD_LITERAL_MIN_PATTERNS
                 ])
-                .is_none()
+                .is_some()
         );
         for replacement in ["", "a.b", "line\nfeed"] {
             let mut refused = standard_patterns.clone();
             refused[17] = replacement.to_owned();
             let refused =
                 refused.iter().map(String::as_str).collect::<Vec<_>>();
-            assert!(standard().fre_standard_literals(&refused).is_none());
+            assert!(standard().fre_standard_literals(&refused).is_some());
         }
 
         let mut banned = standard();
@@ -778,7 +740,7 @@ mod tests {
         banned_patterns[17] = "a\0b".to_owned();
         let banned_patterns =
             banned_patterns.iter().map(String::as_str).collect::<Vec<_>>();
-        assert!(banned.fre_standard_literals(&banned_patterns).is_none());
+        assert!(banned.fre_standard_literals(&banned_patterns).is_some());
         assert!(banned.build_many(&["a\0b"]).is_err());
 
         let patterns =

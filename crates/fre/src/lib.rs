@@ -225,11 +225,12 @@ impl RegexMatcherBuilder {
             self.configured.fre_standard_literals_many(snapshot)
         {
             let line_terminator = Some(literals.line_terminator());
-            if let Some(built) = self
+            if let Some((built, census)) = self
                 .portable_builder(String::new(), true, line_terminator)
-                .build_ripgrep_standard_literals_ordinary(
+                .build_ripgrep_standard_literals_ordinary_with_census(
                     literals.patterns(),
                     self.max_canonical_pattern_bytes,
+                    literals.forbidden_byte(),
                 )?
             {
                 let program = match built {
@@ -240,10 +241,16 @@ impl RegexMatcherBuilder {
                         RegexProgram::Portable(regex)
                     }
                 };
+                let mut non_matching_bytes = ByteSet::full();
+                for byte in 0..=u8::MAX {
+                    if census.contains(byte) {
+                        non_matching_bytes.remove(byte);
+                    }
+                }
                 return Ok(RegexMatcher {
                     regex: Arc::new(program),
                     line_terminator,
-                    non_matching_bytes: literals.non_matching_bytes(),
+                    non_matching_bytes,
                     matches_are_nonempty: true,
                     selected_match_owner: SelectedMatchOwner::new(),
                 });
@@ -864,6 +871,25 @@ mod tests {
                 span(fre, haystack),
                 span(reference, haystack),
                 "{haystack:?}"
+            );
+        }
+    }
+
+    fn assert_non_matching_byte_parity<M: Matcher, N: Matcher>(
+        actual: &M,
+        expected: &N,
+    ) {
+        let actual = actual
+            .non_matching_bytes()
+            .expect("actual matcher publishes a byte set");
+        let expected = expected
+            .non_matching_bytes()
+            .expect("reference matcher publishes a byte set");
+        for byte in 0..=u8::MAX {
+            assert_eq!(
+                actual.contains(byte),
+                expected.contains(byte),
+                "non-matching byte differs for {byte:#04x}",
             );
         }
     }
@@ -1874,6 +1900,142 @@ mod tests {
         let non_matching = worker.non_matching_bytes().unwrap();
         assert!(!non_matching.contains(b'a'));
         assert!(non_matching.contains(b'Z'));
+    }
+
+    #[test]
+    fn standard_literal_census_matches_hir_for_bytes_nul_and_unicode() {
+        fn padded(prefix: &str) -> String {
+            const WIDTH: usize = 254;
+            assert!(prefix.len() <= WIDTH);
+            let mut pattern = prefix.to_owned();
+            pattern.extend(core::iter::repeat_n('q', WIDTH - prefix.len()));
+            pattern
+        }
+
+        let mut patterns = (0..super::STANDARD_LITERAL_BYTES_MIN_PATTERNS)
+            .map(|index| padded(&format!("value{index:04}")))
+            .collect::<Vec<_>>();
+        patterns[0] = padded("nul\0byte");
+        patterns[1] = padded("é界");
+        patterns[2] = padded("controls\t\r\u{7f}");
+
+        let mut builder = RegexMatcherBuilder::new();
+        builder.multi_line(true);
+        let matcher =
+            builder.build_many(&patterns).expect("censused literal matcher");
+        assert!(matches!(
+            matcher.regex.as_ref(),
+            super::RegexProgram::RipgrepLiteral(_),
+        ));
+        let worker = matcher.worker().unwrap();
+
+        let reference = grep_regex::RegexMatcherBuilder::new()
+            .multi_line(true)
+            .line_terminator(Some(b'\n'))
+            .build_many(&patterns)
+            .expect("configured-HIR reference");
+        assert_non_matching_byte_parity(&worker, &reference);
+        assert_find_parity(
+            &worker,
+            &reference,
+            &[
+                patterns[0].as_bytes(),
+                patterns[1].as_bytes(),
+                patterns[2].as_bytes(),
+                b"absent",
+            ],
+        );
+
+        patterns[0] = padded("ordinary");
+        let mut builder = RegexMatcherBuilder::new();
+        builder.multi_line(true).ban_byte(Some(b'\0'));
+        let matcher = builder
+            .build_many(&patterns)
+            .expect("absent NUL preserves the censused handoff");
+        assert!(matches!(
+            matcher.regex.as_ref(),
+            super::RegexProgram::RipgrepLiteral(_),
+        ));
+        let worker = matcher.worker().unwrap();
+        let mut reference_builder = grep_regex::RegexMatcherBuilder::new();
+        reference_builder
+            .multi_line(true)
+            .line_terminator(Some(b'\n'))
+            .ban_byte(Some(b'\0'));
+        let reference = reference_builder
+            .build_many(&patterns)
+            .expect("configured-HIR binary reference");
+        assert_non_matching_byte_parity(&worker, &reference);
+        assert!(worker.non_matching_bytes().unwrap().contains(b'\0'));
+    }
+
+    #[test]
+    fn standard_literal_value_refusals_preserve_configured_hir_fallbacks() {
+        let standard = (0..super::STANDARD_LITERAL_BYTES_MIN_PATTERNS)
+            .map(|index| format!("value{index:04}"))
+            .collect::<Vec<_>>();
+
+        let mut meta = standard.clone();
+        meta[17] = "a.b".to_owned();
+        let mut builder = RegexMatcherBuilder::new();
+        builder.multi_line(true);
+        let matcher = builder.build_many(&meta).expect("meta fallback");
+        assert!(matches!(
+            matcher.regex.as_ref(),
+            super::RegexProgram::Portable(_),
+        ));
+        let reference = grep_regex::RegexMatcherBuilder::new()
+            .multi_line(true)
+            .line_terminator(Some(b'\n'))
+            .build_many(&meta)
+            .expect("meta reference");
+        let worker = matcher.worker().unwrap();
+        assert_non_matching_byte_parity(&worker, &reference);
+        assert_find_parity(&worker, &reference, &[b"aXb", b"a.b", b"absent"]);
+
+        let all_single = vec!["x"; super::STANDARD_LITERAL_BYTES_MIN_PATTERNS];
+        let matcher = builder
+            .build_many(&all_single)
+            .expect("single-scalar HIR fallback");
+        assert!(matches!(
+            matcher.regex.as_ref(),
+            super::RegexProgram::Portable(_),
+        ));
+        let reference = grep_regex::RegexMatcherBuilder::new()
+            .multi_line(true)
+            .line_terminator(Some(b'\n'))
+            .build_many(&all_single)
+            .expect("single-scalar reference");
+        assert_non_matching_byte_parity(
+            &matcher.worker().unwrap(),
+            &reference,
+        );
+
+        let mut line_feed = standard.clone();
+        line_feed[17] = "line\nfeed".to_owned();
+        assert!(matches!(
+            builder.build_many(&line_feed),
+            Err(Error::Regex(_))
+        ));
+        assert!(
+            grep_regex::RegexMatcherBuilder::new()
+                .multi_line(true)
+                .line_terminator(Some(b'\n'))
+                .build_many(&line_feed)
+                .is_err()
+        );
+
+        let mut nul = standard;
+        nul[17] = "nul\0byte".to_owned();
+        let mut builder = RegexMatcherBuilder::new();
+        builder.multi_line(true).ban_byte(Some(b'\0'));
+        assert!(matches!(builder.build_many(&nul), Err(Error::Regex(_))));
+        let mut reference = grep_regex::RegexMatcherBuilder::new();
+        reference
+            .multi_line(true)
+            .line_terminator(Some(b'\n'))
+            .ban_byte(Some(b'\0'));
+        assert!(reference.build_many(&nul).is_err());
     }
 
     #[test]

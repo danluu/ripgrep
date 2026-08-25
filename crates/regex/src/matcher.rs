@@ -102,11 +102,13 @@ impl RegexMatcherBuilder {
         Ok(chir)
     }
 
-    /// Certify the original strings for ripgrep's standard FRE handoff.
+    /// Select the original strings for ripgrep's standard FRE handoff.
     ///
-    /// This narrow integration seam does not construct an HIR. A refusal is
-    /// silent so the caller can use [`Self::configured_hir_many`] and preserve
-    /// the ordinary parser, transformation and diagnostic paths.
+    /// This narrow integration seam checks only the exact configuration and
+    /// pattern-count envelope. FRE independently validates values and returns
+    /// a transient byte census. A refusal is silent so the caller can use
+    /// [`Self::configured_hir_many`] and preserve the ordinary parser,
+    /// transformation and diagnostic paths.
     #[doc(hidden)]
     pub fn fre_standard_literals_many<'a>(
         &self,
