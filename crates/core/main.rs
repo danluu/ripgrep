@@ -125,7 +125,7 @@ fn search(args: &HiArgs, mode: SearchMode) -> anyhow::Result<bool> {
     let searcher = args.search_worker(
         args.matcher()?,
         args.searcher()?,
-        args.printer(mode, args.stdout()),
+        args.printer_with_stable_color_support(mode, args.stdout()),
     )?;
     let (matcher, mut searcher) = searcher.into_parts();
     let matcher = matcher.worker()?;
@@ -178,7 +178,7 @@ fn search_parallel(args: &HiArgs, mode: SearchMode) -> anyhow::Result<bool> {
     let mut searcher = args.search_worker(
         args.matcher()?,
         args.searcher()?,
-        args.printer(mode, bufwtr.buffer()),
+        args.printer_with_stable_color_support(mode, bufwtr.buffer()),
     )?;
     args.walk_builder()?.build_parallel().run(|| {
         let bufwtr = &bufwtr;

@@ -36,6 +36,7 @@ use crate::{
 #[derive(Debug, Clone)]
 struct Config {
     colors: ColorSpecs,
+    color_support_is_stable: bool,
     hyperlink: HyperlinkConfig,
     stats: bool,
     heading: bool,
@@ -61,6 +62,7 @@ impl Default for Config {
     fn default() -> Config {
         Config {
             colors: ColorSpecs::default(),
+            color_support_is_stable: false,
             hyperlink: HyperlinkConfig::default(),
             stats: false,
             heading: false,
@@ -164,6 +166,26 @@ impl StandardBuilder {
     /// builder.
     pub fn color_specs(&mut self, specs: ColorSpecs) -> &mut StandardBuilder {
         self.config.colors = specs;
+        self
+    }
+
+    /// Declare that [`WriteColor::supports_color`] will not change from any
+    /// capability query used to select or create a sink until that sink is
+    /// dropped.
+    ///
+    /// When enabled, color support is sampled once when each sink is created
+    /// and that observation is reused for the lifetime of the sink. Callers
+    /// should only enable this when their writer provides this stability
+    /// guarantee. A writer may still change its capability between sink
+    /// lifetimes.
+    ///
+    /// This is disabled by default, in which case color support continues to
+    /// be queried while output is written.
+    pub fn color_support_is_stable(
+        &mut self,
+        yes: bool,
+    ) -> &mut StandardBuilder {
+        self.config.color_support_is_stable = yes;
         self
     }
 
@@ -520,7 +542,11 @@ impl<W: WriteColor> Standard<W> {
         let interpolator =
             hyperlink::Interpolator::new(&self.config.hyperlink);
         let stats = if self.config.stats { Some(Stats::new()) } else { None };
-        let needs_match_granularity = self.needs_match_granularity();
+        let matches_are_colored = self.matches_are_colored();
+        let needs_match_granularity =
+            self.needs_match_granularity(matches_are_colored);
+        let stable_matches_are_colored =
+            self.config.color_support_is_stable.then_some(matches_are_colored);
         StandardSink {
             matcher,
             standard: self,
@@ -532,6 +558,7 @@ impl<W: WriteColor> Standard<W> {
             binary_byte_offset: None,
             stats,
             needs_match_granularity,
+            stable_matches_are_colored,
         }
     }
 
@@ -556,7 +583,11 @@ impl<W: WriteColor> Standard<W> {
         let stats = if self.config.stats { Some(Stats::new()) } else { None };
         let ppath = PrinterPath::new(path.as_ref())
             .with_separator(self.config.separator_path);
-        let needs_match_granularity = self.needs_match_granularity();
+        let matches_are_colored = self.matches_are_colored();
+        let needs_match_granularity =
+            self.needs_match_granularity(matches_are_colored);
+        let stable_matches_are_colored =
+            self.config.color_support_is_stable.then_some(matches_are_colored);
         StandardSink {
             matcher,
             standard: self,
@@ -568,6 +599,7 @@ impl<W: WriteColor> Standard<W> {
             binary_byte_offset: None,
             stats,
             needs_match_granularity,
+            stable_matches_are_colored,
         }
     }
 
@@ -615,12 +647,9 @@ impl<W: WriteColor> Standard<W> {
     ///
     /// We care about this distinction because finding each individual match
     /// costs more, so we only do it when we need to.
-    fn needs_match_granularity(&self) -> bool {
-        let supports_color = self.wtr.borrow().supports_color();
-        let match_colored = !self.config.colors.matched().is_none();
-
+    fn needs_match_granularity(&self, matches_are_colored: bool) -> bool {
         // Coloring requires identifying each individual match.
-        (supports_color && match_colored)
+        matches_are_colored
         // The column feature requires finding the position of the first match.
         || self.config.column
         // Requires finding each match for performing replacement.
@@ -631,6 +660,13 @@ impl<W: WriteColor> Standard<W> {
         || self.config.only_matching
         // Computing certain statistics requires finding each match.
         || self.config.stats
+    }
+
+    /// Returns true when matched text will be emitted with color.
+    fn matches_are_colored(&self) -> bool {
+        let supports_color = self.wtr.borrow().supports_color();
+        let match_colored = !self.config.colors.matched().is_none();
+        supports_color && match_colored
     }
 }
 
@@ -687,6 +723,7 @@ pub struct StandardSink<'p, 's, M: Matcher, W> {
     binary_byte_offset: Option<u64>,
     stats: Option<Stats>,
     needs_match_granularity: bool,
+    stable_matches_are_colored: Option<bool>,
 }
 
 impl<'p, 's, M: Matcher, W: WriteColor> StandardSink<'p, 's, M, W> {
@@ -1423,8 +1460,11 @@ impl<'a, M: Matcher, W: WriteColor> StandardImpl<'a, M, W> {
         bytes: &[u8],
     ) -> io::Result<()> {
         // If we know we aren't going to emit color, then we can go faster.
-        let spec = self.config().colors.matched();
-        if !self.wtr().borrow().supports_color() || spec.is_none() {
+        let matches_are_colored = match self.sink.stable_matches_are_colored {
+            Some(yes) => yes,
+            None => self.sink.standard.matches_are_colored(),
+        };
+        if !matches_are_colored {
             return self.write_line(bytes);
         }
 
@@ -1944,10 +1984,15 @@ impl<'a, M: Matcher, W: WriteColor> PreludeWriter<'a, M, W> {
 
 #[cfg(test)]
 mod tests {
+    use std::{
+        cell::Cell,
+        io::{self, Write},
+    };
+
     use grep_matcher::LineTerminator;
     use grep_regex::{RegexMatcher, RegexMatcherBuilder};
     use grep_searcher::SearcherBuilder;
-    use termcolor::{Ansi, NoColor};
+    use termcolor::{Ansi, ColorSpec, NoColor, WriteColor};
 
     use super::{ColorSpecs, Standard, StandardBuilder};
     use crate::util::{SeededRegexHint, SeededRegexMatcher};
@@ -1977,6 +2022,106 @@ and exhibited clearly, with a label attached.\
 
     fn printer_contents_ansi(printer: &mut Standard<Ansi<Vec<u8>>>) -> String {
         String::from_utf8(printer.get_mut().get_ref().to_owned()).unwrap()
+    }
+
+    #[derive(Debug)]
+    struct TogglingColorWriter {
+        bytes: Vec<u8>,
+        support: Vec<bool>,
+        support_calls: Cell<usize>,
+        set_color_calls: usize,
+        reset_calls: usize,
+    }
+
+    impl TogglingColorWriter {
+        fn new(support: Vec<bool>) -> TogglingColorWriter {
+            TogglingColorWriter {
+                bytes: vec![],
+                support,
+                support_calls: Cell::new(0),
+                set_color_calls: 0,
+                reset_calls: 0,
+            }
+        }
+    }
+
+    impl Write for TogglingColorWriter {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.bytes.extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl WriteColor for TogglingColorWriter {
+        fn supports_color(&self) -> bool {
+            let call = self.support_calls.get();
+            self.support_calls.set(call + 1);
+            self.support[call]
+        }
+
+        fn set_color(&mut self, _spec: &ColorSpec) -> io::Result<()> {
+            self.set_color_calls += 1;
+            Ok(())
+        }
+
+        fn reset(&mut self) -> io::Result<()> {
+            self.reset_calls += 1;
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn color_support_remains_dynamic_by_default() {
+        let matcher = RegexMatcher::new("foo").unwrap();
+        let mut printer = StandardBuilder::new()
+            .color_specs(ColorSpecs::default_with_color())
+            .only_matching(true)
+            .build(TogglingColorWriter::new(vec![true, false, true]));
+        SearcherBuilder::new()
+            .line_number(false)
+            .build()
+            .search_reader(&matcher, &b"foo foo\n"[..], printer.sink(&matcher))
+            .unwrap();
+
+        let probe = printer.get_mut();
+        assert_eq!(&b"foo\nfoo\n"[..], probe.bytes);
+        assert_eq!(3, probe.support_calls.get());
+        assert_eq!(1, probe.set_color_calls);
+        assert_eq!(1, probe.reset_calls);
+    }
+
+    #[test]
+    fn stable_color_support_is_sampled_once_per_sink() {
+        let matcher = RegexMatcher::new("foo").unwrap();
+        let mut builder = StandardBuilder::new();
+        builder
+            .color_specs(ColorSpecs::default_with_color())
+            .only_matching(true)
+            .color_support_is_stable(true);
+        let mut printer =
+            builder.build(TogglingColorWriter::new(vec![true, false]));
+
+        for _ in 0..2 {
+            SearcherBuilder::new()
+                .line_number(false)
+                .build()
+                .search_reader(
+                    &matcher,
+                    &b"foo foo\n"[..],
+                    printer.sink(&matcher),
+                )
+                .unwrap();
+        }
+
+        let probe = printer.get_mut();
+        assert_eq!(&b"foo\nfoo\nfoo\nfoo\n"[..], probe.bytes);
+        assert_eq!(2, probe.support_calls.get());
+        assert_eq!(2, probe.set_color_calls);
+        assert_eq!(2, probe.reset_calls);
     }
 
     #[test]

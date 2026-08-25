@@ -633,8 +633,12 @@ impl HiArgs {
     /// Returns a printer for the given search mode.
     ///
     /// This chooses which printer to build (JSON, summary or standard) based
-    /// on the search mode given.
-    pub(crate) fn printer<W: termcolor::WriteColor>(
+    /// on the search mode given. The writer must return a stable value from
+    /// `WriteColor::supports_color` from sink selection through the lifetime
+    /// of that sink.
+    pub(crate) fn printer_with_stable_color_support<
+        W: termcolor::WriteColor,
+    >(
         &self,
         search_mode: SearchMode,
         wtr: W,
@@ -688,6 +692,7 @@ impl HiArgs {
         let mut builder = grep::printer::StandardBuilder::new();
         builder
             .byte_offset(self.byte_offset)
+            .color_support_is_stable(true)
             .color_specs(self.colors.clone())
             .column(self.column)
             .heading(self.heading)
