@@ -22,6 +22,31 @@ struct FastLineMatch {
     selected_match: Option<Range>,
 }
 
+#[inline(always)]
+fn prepare_selected_line_match(
+    selected_match: Option<Range>,
+    confirmed_at: usize,
+    offset: usize,
+    window_len: usize,
+) -> (Range, Option<Range>) {
+    let selected_match = selected_match.and_then(|m| {
+        if m.is_empty() || m.end() > window_len {
+            None
+        } else {
+            // A confirmed position may be anywhere in its line. Only an
+            // equal endpoint binds this selected span tightly enough to use
+            // it for line location. A mismatch does not by itself make the
+            // selected match unusable by the sink.
+            Some((m.offset(offset), m.end() == confirmed_at))
+        }
+    });
+    let locate_range = match selected_match {
+        Some((m, true)) => m,
+        _ => Range::zero(confirmed_at).offset(offset),
+    };
+    (locate_range, selected_match.map(|(m, _)| m))
+}
+
 #[derive(Debug)]
 pub(crate) struct Core<'s, M: 's, S> {
     config: &'s Config,
@@ -508,10 +533,17 @@ impl<'s, M: Matcher, S: Sink> Core<'s, M, S> {
                 Err(err) => return Err(S::Error::error_message(err)),
                 Ok(None) => return Ok(None),
                 Ok(Some((LineMatchKind::Confirmed(i), selected_match))) => {
+                    let (locate_range, selected_match) =
+                        prepare_selected_line_match(
+                            selected_match,
+                            i,
+                            pos,
+                            buf.len() - pos,
+                        );
                     let line = lines::locate(
                         buf,
                         self.config.line_term.as_byte(),
-                        Range::zero(i).offset(pos),
+                        locate_range,
                     );
                     // If we matched beyond the end of the buffer, then we
                     // don't report this as a match.
@@ -521,7 +553,6 @@ impl<'s, M: Matcher, S: Sink> Core<'s, M, S> {
                     }
                     debug_assert!(pos <= line.start());
                     let selected_match = selected_match.and_then(|m| {
-                        let m = m.offset(pos);
                         // The matcher selected over `&buf[pos..]`, so a usable
                         // hint cannot consume left context before `pos`. The
                         // line containment checks establish that invariant
@@ -763,5 +794,76 @@ impl<'s, M: Matcher, S: Sink> Core<'s, M, S> {
 
     fn has_exceeded_match_limit(&self) -> bool {
         self.config.max_matches.map_or(false, |limit| self.count() >= limit)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn m(start: usize, end: usize) -> Range {
+        Range::new(start, end)
+    }
+
+    #[test]
+    fn selected_line_match_preserves_line_and_absolute_range() {
+        let buf = b"skip\nleft MATCH right\ntail\n";
+        let offset = 5;
+        let selected = m(5, 10);
+        let confirmed_at = selected.end();
+        let expected_selected = selected.offset(offset);
+        let expected_line = lines::locate(
+            buf,
+            b'\n',
+            Range::zero(confirmed_at).offset(offset),
+        );
+
+        let (locate_range, selected_match) = prepare_selected_line_match(
+            Some(selected),
+            confirmed_at,
+            offset,
+            buf.len() - offset,
+        );
+
+        assert_eq!(locate_range, expected_selected);
+        assert_eq!(selected_match, Some(expected_selected));
+        assert_eq!(lines::locate(buf, b'\n', locate_range), expected_line);
+        assert_eq!(&buf[expected_line], b"left MATCH right\n");
+    }
+
+    #[test]
+    fn selected_line_match_falls_back_for_unusable_locator_hints() {
+        let buf = b"skip\nleft MATCH right\ntail\n";
+        let offset = 5;
+        let confirmed_at = 10;
+        let fallback = Range::zero(confirmed_at).offset(offset);
+        let expected_line = lines::locate(buf, b'\n', fallback);
+
+        for selected in [
+            None,
+            Some(Range::zero(confirmed_at)),
+            Some(m(usize::MAX - 1, usize::MAX)),
+        ] {
+            let (locate_range, selected_match) = prepare_selected_line_match(
+                selected,
+                confirmed_at,
+                offset,
+                buf.len() - offset,
+            );
+            assert_eq!(locate_range, fallback);
+            assert_eq!(selected_match, None);
+            assert_eq!(lines::locate(buf, b'\n', locate_range), expected_line);
+        }
+
+        let mismatched = m(5, confirmed_at - 1);
+        let (locate_range, selected_match) = prepare_selected_line_match(
+            Some(mismatched),
+            confirmed_at,
+            offset,
+            buf.len() - offset,
+        );
+        assert_eq!(locate_range, fallback);
+        assert_eq!(selected_match, Some(mismatched.offset(offset)));
+        assert_eq!(lines::locate(buf, b'\n', locate_range), expected_line);
     }
 }
