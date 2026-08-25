@@ -703,6 +703,7 @@ pub(crate) struct SeededRegexMatcher {
     owner: grep_matcher::SelectedMatchOwner,
     hint: SeededRegexHint,
     selected_calls: std::cell::Cell<usize>,
+    find_at_calls: std::cell::Cell<usize>,
     iter_at: std::cell::Cell<Option<usize>>,
     iter_match_calls: std::cell::Cell<usize>,
     selected_end_count: bool,
@@ -718,6 +719,7 @@ impl SeededRegexMatcher {
             owner: grep_matcher::SelectedMatchOwner::new(),
             hint: SeededRegexHint::First,
             selected_calls: std::cell::Cell::new(0),
+            find_at_calls: std::cell::Cell::new(0),
             iter_at: std::cell::Cell::new(None),
             iter_match_calls: std::cell::Cell::new(0),
             selected_end_count: false,
@@ -743,6 +745,10 @@ impl SeededRegexMatcher {
 
     pub(crate) fn selected_calls(&self) -> usize {
         self.selected_calls.get()
+    }
+
+    pub(crate) fn find_at_calls(&self) -> usize {
+        self.find_at_calls.get()
     }
 
     pub(crate) fn iter_at(&self) -> Option<usize> {
@@ -792,6 +798,7 @@ impl Matcher for SeededRegexMatcher {
         haystack: &[u8],
         at: usize,
     ) -> Result<Option<Match>, Self::Error> {
+        self.find_at_calls.set(self.find_at_calls.get() + 1);
         self.inner.find_at(haystack, at)
     }
 

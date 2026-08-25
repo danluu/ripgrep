@@ -11,7 +11,8 @@ use {
     bstr::ByteSlice,
     grep_matcher::{Match, Matcher, SelectedMatchOwner},
     grep_searcher::{
-        LineStep, Searcher, Sink, SinkContext, SinkFinish, SinkMatch,
+        LineStep, Searcher, Sink, SinkContext, SinkError, SinkFinish,
+        SinkMatch,
     },
     termcolor::{ColorSpec, NoColor, WriteColor},
 };
@@ -22,9 +23,9 @@ use crate::{
     hyperlink::{self, HyperlinkConfig},
     stats::Stats,
     util::{
-        DecimalFormatter, PrinterPath, Replacer, Sunk,
+        DecimalFormatter, PrinterPath, Replacer, Sunk, context_haystack,
         find_iter_at_in_context_with_seed, match_relative_to_unchecked,
-        trim_ascii_prefix, trim_line_terminator,
+        trim_ascii_prefix, trim_line_terminator, validated_nonempty_seed,
     },
 };
 
@@ -1019,26 +1020,31 @@ impl<'p, 's, M: Matcher, W: WriteColor>
     ) -> io::Result<()> {
         let matches = &mut self.inner.standard.matches;
         matches.clear();
-        find_iter_at_in_context_with_seed(
+        let prepared = context_haystack(
             searcher,
             &self.inner.matcher,
             bytes,
-            range.clone(),
+            &range,
+        );
+        let matched = match validated_nonempty_seed(
+            prepared.len(),
+            &range,
             selected_match,
-            |m| {
-                // SAFETY: this has the same ranged-iteration invariants as
-                // StandardSink::record_matches.
-                matches.push(unsafe {
-                    match_relative_to_unchecked(m, range.start)
-                });
-                false
-            },
-        )?;
-        if !matches.is_empty()
-            && matches.last().unwrap().is_empty()
-            && matches.last().unwrap().start() >= range.end
-        {
-            matches.pop().unwrap();
+        ) {
+            Some(matched) => Some(matched),
+            None => self
+                .inner
+                .matcher
+                .find_at(prepared, range.start)
+                .map_err(io::Error::error_message)?,
+        };
+        if let Some(matched) = matched.filter(|m| m.start() < range.end) {
+            // SAFETY: a validated seed starts within `range`; fallback search
+            // begins at `range.start`; and Matcher's ranged find reports only
+            // matches at or after its starting offset.
+            matches.push(unsafe {
+                match_relative_to_unchecked(matched, range.start)
+            });
         }
         Ok(())
     }
@@ -2942,7 +2948,7 @@ and exhibited clearly, with a label attached.\
     }
 
     #[test]
-    fn first_match_sink_stops_match_iteration_after_first() {
+    fn first_match_sink_uses_one_find_without_a_shared_seed() {
         let search_matcher = SeededRegexMatcher::new("foo");
         let sink_matcher = SeededRegexMatcher::new("foo");
         let mut builder = StandardBuilder::new();
@@ -2961,8 +2967,9 @@ and exhibited clearly, with a label attached.\
             )
             .unwrap();
 
-        assert_eq!(sink_matcher.iter_at(), Some(0));
-        assert_eq!(sink_matcher.iter_match_calls(), 1);
+        assert_eq!(sink_matcher.find_at_calls(), 1);
+        assert_eq!(sink_matcher.iter_at(), None);
+        assert_eq!(sink_matcher.iter_match_calls(), 0);
         assert_eq!(printer_contents(&mut printer), "1:foo foo foo\n");
     }
 
@@ -2983,6 +2990,7 @@ and exhibited clearly, with a label attached.\
             .unwrap();
 
         assert!(matcher.selected_calls() > 0);
+        assert_eq!(matcher.find_at_calls(), 0);
         assert_eq!(matcher.iter_at(), None);
         assert_eq!(matcher.iter_match_calls(), 0);
         assert_eq!(printer_contents(&mut printer), "4:zz foo foo\n");
@@ -3012,8 +3020,9 @@ and exhibited clearly, with a label attached.\
                 .unwrap();
 
             assert!(matcher.selected_calls() > 0);
-            assert_eq!(matcher.iter_at(), Some(0));
-            assert_eq!(matcher.iter_match_calls(), 1);
+            assert_eq!(matcher.find_at_calls(), 1);
+            assert_eq!(matcher.iter_at(), None);
+            assert_eq!(matcher.iter_match_calls(), 0);
             assert_eq!(printer_contents(&mut printer), "4:zz foo foo\n");
         }
     }
