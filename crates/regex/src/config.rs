@@ -12,7 +12,7 @@ use crate::{
     strip::strip_from_match,
 };
 
-const FRE_STANDARD_LITERAL_MIN_PATTERNS: usize = 129;
+const FRE_STANDARD_LITERAL_MIN_PATTERNS: usize = 32;
 const FRE_STANDARD_LITERAL_MAX_PATTERNS: usize = 256;
 
 /// Config represents the configuration of a regex matcher in this crate.
@@ -709,7 +709,8 @@ mod tests {
             .map(|index| format!("value{index:04}"))
             .collect::<Vec<_>>();
         assert!(standard().fre_standard_literals(&[] as &[&str]).is_none());
-        let too_small = standard_patterns[..128]
+        let too_small = standard_patterns
+            [..FRE_STANDARD_LITERAL_MIN_PATTERNS - 1]
             .iter()
             .map(String::as_str)
             .collect::<Vec<_>>();

@@ -16,9 +16,9 @@ use grep_matcher::{
 use regex_syntax::hir::{Hir, HirKind};
 
 const DEFAULT_CANONICAL_PATTERN_LIMIT: usize = 8 * (1 << 20);
-// This is the exact current gap between FRE's packed ceiling and its bounded
-// flat-literal stack handoff. FRE independently refuses any drift.
-const STANDARD_LITERAL_BYTES_MIN_PATTERNS: usize = 129;
+// Public actual-ripgrep startup measurements qualify this packed-set floor;
+// FRE independently authenticates every value and resource boundary.
+const STANDARD_LITERAL_BYTES_MIN_PATTERNS: usize = 32;
 const STANDARD_LITERAL_BYTES_MAX_PATTERNS: usize = 256;
 
 #[inline(always)]
@@ -1741,6 +1741,102 @@ mod tests {
     }
 
     #[test]
+    fn standard_literal_bytes_bridge_preserves_small_terminals() {
+        for count in [32, 64, 128] {
+            let mut patterns = (0..u16::try_from(count).unwrap())
+                .map(|bits| {
+                    String::from_utf8(
+                        (0..8)
+                            .map(|shift| {
+                                if bits & (1 << shift) == 0 { b'q' } else { b'z' }
+                            })
+                            .collect::<Vec<_>>(),
+                    )
+                    .expect("small focused literals are UTF-8")
+                })
+                .collect::<Vec<_>>();
+            patterns[0] = "ab".to_owned();
+            patterns[1] = "a".to_owned();
+
+            let mut fre_builder = RegexMatcherBuilder::new();
+            fre_builder.multi_line(true);
+            let fre = fre_builder
+                .build_many(&patterns)
+                .expect("small borrowed literal matcher");
+            assert!(matches!(
+                fre.regex.as_ref(),
+                super::RegexProgram::Portable(_),
+            ));
+            let hir = Hir::alternation(
+                patterns
+                    .iter()
+                    .map(|pattern| Hir::literal(pattern.as_bytes()))
+                    .collect(),
+            );
+            let owned = fre_builder
+                .portable_builder(
+                    String::new(),
+                    true,
+                    Some(LineTerminator::byte(b'\n')),
+                )
+                .build_ripgrep_standard_literal_hir_owned(hir, usize::MAX)
+                .expect("small configured-HIR FRE construction");
+            let RipgrepStandardLiteralHirBuild::Built(owned) = owned else {
+                panic!("small configured-HIR FRE construction was refused");
+            };
+            assert_eq!(fre.regex.as_str(), owned.as_str(), "count={count}");
+            assert_eq!(
+                fre.regex.build_report(),
+                owned.build_report(),
+                "count={count}",
+            );
+            assert_eq!(
+                fre.regex.runtime_implementation_id(),
+                owned.runtime_implementation_id(),
+                "count={count}",
+            );
+
+            let mut reference_builder = grep_regex::RegexMatcherBuilder::new();
+            reference_builder.multi_line(true).line_terminator(Some(b'\n'));
+            let reference = reference_builder
+                .build_many(&patterns)
+                .expect("small configured-HIR reference");
+            let worker = fre.worker().expect("small FRE worker");
+            assert_non_matching_byte_parity(&worker, &reference);
+            assert_find_parity(
+                &worker,
+                &reference,
+                &[
+                    b"ab",
+                    b"za",
+                    b"no public literal",
+                    patterns[count - 1].as_bytes(),
+                ],
+            );
+
+            let haystack =
+                format!("xxab/{}yy", patterns[count - 1]).into_bytes();
+            let mut actual = Vec::new();
+            worker
+                .try_find_iter(&haystack, |matched| {
+                    actual.push((matched.start(), matched.end()));
+                    Ok::<bool, ()>(true)
+                })
+                .expect("small FRE span iteration runs")
+                .expect("small FRE visitor completes");
+            let mut expected = Vec::new();
+            reference
+                .try_find_iter(&haystack, |matched| {
+                    expected.push((matched.start(), matched.end()));
+                    Ok::<bool, ()>(true)
+                })
+                .expect("small reference span iteration runs")
+                .expect("small reference visitor completes");
+            assert_eq!(actual, expected, "count={count}");
+        }
+    }
+
+    #[test]
     fn default_regex_limits_admit_the_wide_compact_literal_owner() {
         let patterns = (0..256)
             .map(|index| {
@@ -1912,7 +2008,7 @@ mod tests {
             pattern
         }
 
-        let mut patterns = (0..super::STANDARD_LITERAL_BYTES_MIN_PATTERNS)
+        let mut patterns = (0..129)
             .map(|index| padded(&format!("value{index:04}")))
             .collect::<Vec<_>>();
         patterns[0] = padded("nul\0byte");
