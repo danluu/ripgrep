@@ -24,3 +24,7 @@ regex = "1.9.5"
 [[test]]
 name = "integration"
 path = "tests/tests.rs"
+
+[[test]]
+name = "selected_match_owner"
+path = "tests/selected_match_owner.rs"

@@ -36,7 +36,13 @@ implementations.
 
 #![deny(missing_docs)]
 
+#[cfg(not(target_has_atomic = "64"))]
 use std::sync::Arc;
+#[cfg(target_has_atomic = "64")]
+use std::{
+    num::NonZeroU64,
+    sync::atomic::{AtomicU64, Ordering},
+};
 
 use crate::interpolate::interpolate;
 
@@ -44,26 +50,70 @@ mod interpolate;
 
 /// An opaque identity token for the matcher that owns a selected-match hint.
 ///
-/// Searchers use pointer identity, not token contents, to ensure that a hint
-/// produced by one matcher is consumed only by a sink using the same matcher.
-/// Cloning this token preserves its identity.
+/// Searchers compare identities to ensure that a hint produced by one matcher
+/// is consumed only by a sink using the same matcher. Cloning this token
+/// preserves its identity.
 #[derive(Clone, Debug)]
-pub struct SelectedMatchOwner(Arc<SelectedMatchOwnerMarker>);
+pub struct SelectedMatchOwner(
+    #[cfg(target_has_atomic = "64")] NonZeroU64,
+    #[cfg(not(target_has_atomic = "64"))] Arc<SelectedMatchOwnerMarker>,
+);
 
+#[cfg(not(target_has_atomic = "64"))]
 #[derive(Debug)]
 struct SelectedMatchOwnerMarker;
 
+#[cfg(target_has_atomic = "64")]
+static NEXT_SELECTED_MATCH_OWNER_ID: AtomicU64 = AtomicU64::new(1);
+
+#[cfg(target_has_atomic = "64")]
+#[inline]
+fn next_selected_match_owner_id(counter: &AtomicU64) -> Option<NonZeroU64> {
+    // Reserve `u64::MAX` as the exhausted state. In particular, never wrap
+    // and reuse an identity while an older token might still be alive.
+    let current = counter
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+            current.checked_add(1)
+        })
+        .ok()?;
+    Some(
+        NonZeroU64::new(current)
+            .expect("selected-match owner counter is initialized nonzero"),
+    )
+}
+
 impl SelectedMatchOwner {
     /// Creates a new owner identity distinct from every existing identity.
+    ///
+    /// On targets with 64-bit atomics, this panics if one process exhausts
+    /// the available `u64` identity counter. Exhaustion never wraps or reuses
+    /// an identity.
     #[inline]
     pub fn new() -> SelectedMatchOwner {
-        SelectedMatchOwner(Arc::new(SelectedMatchOwnerMarker))
+        #[cfg(target_has_atomic = "64")]
+        {
+            let id =
+                next_selected_match_owner_id(&NEXT_SELECTED_MATCH_OWNER_ID)
+                    .expect("selected-match owner identity space exhausted");
+            SelectedMatchOwner(id)
+        }
+        #[cfg(not(target_has_atomic = "64"))]
+        {
+            SelectedMatchOwner(Arc::new(SelectedMatchOwnerMarker))
+        }
     }
 
     /// Returns true when both tokens identify the same matcher owner.
     #[inline]
     pub fn ptr_eq(&self, other: &SelectedMatchOwner) -> bool {
-        Arc::ptr_eq(&self.0, &other.0)
+        #[cfg(target_has_atomic = "64")]
+        {
+            self.0 == other.0
+        }
+        #[cfg(not(target_has_atomic = "64"))]
+        {
+            Arc::ptr_eq(&self.0, &other.0)
+        }
     }
 }
 
@@ -71,6 +121,22 @@ impl Default for SelectedMatchOwner {
     #[inline]
     fn default() -> SelectedMatchOwner {
         SelectedMatchOwner::new()
+    }
+}
+
+#[cfg(all(test, target_has_atomic = "64"))]
+mod selected_match_owner_tests {
+    #[test]
+    fn identity_generation_stops_before_wrapping() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        let counter = AtomicU64::new(u64::MAX - 1);
+        let final_identity = super::next_selected_match_owner_id(&counter)
+            .expect("last identity before exhaustion");
+        assert_eq!(final_identity.get(), u64::MAX - 1);
+        assert_eq!(counter.load(Ordering::Relaxed), u64::MAX);
+        assert!(super::next_selected_match_owner_id(&counter).is_none());
+        assert_eq!(counter.load(Ordering::Relaxed), u64::MAX);
     }
 }
 
