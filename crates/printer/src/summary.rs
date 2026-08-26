@@ -631,6 +631,35 @@ impl<'p, 's, M: Matcher, W: WriteColor> SummarySink<'p, 's, M, W> {
     }
 }
 
+/// Count matches in a context that may span multiple lines. Keep the
+/// context reconstruction fallback out of line so that the ordinary
+/// single-line count route remains compact and independently optimizable.
+#[inline(never)]
+fn count_matches_in_multi_line_context<M: Matcher>(
+    searcher: &Searcher,
+    matcher: M,
+    buf: &[u8],
+    range: std::ops::Range<usize>,
+    selected_match: Option<grep_matcher::Match>,
+) -> io::Result<u64> {
+    let mut count = 0;
+    find_iter_at_in_context_with_seed(
+        searcher,
+        matcher,
+        buf,
+        range,
+        selected_match,
+        |_| {
+            count += 1;
+            true
+        },
+    )?;
+    // Because of context-bounded iteration being a giant kludge internally,
+    // it's possible that it won't find *any* matches even though we clearly
+    // know that there is at least one. So make sure we record at least one.
+    Ok(count.max(1))
+}
+
 impl<'p, 's, M: Matcher, W: WriteColor> Sink for SummarySink<'p, 's, M, W> {
     type Error = io::Error;
 
@@ -661,23 +690,13 @@ impl<'p, 's, M: Matcher, W: WriteColor> Sink for SummarySink<'p, 's, M, W> {
             let buf = mat.buffer();
             let range = mat.bytes_range_in_buffer();
             if is_multi_line {
-                let mut count = 0;
-                find_iter_at_in_context_with_seed(
+                count_matches_in_multi_line_context(
                     searcher,
                     &self.matcher,
                     buf,
                     range,
                     mat.selected_match(),
-                    |_| {
-                        count += 1;
-                        true
-                    },
-                )?;
-                // Because of context-bounded iteration being a giant
-                // kludge internally, it's possible that it won't find
-                // *any* matches even though we clearly know that there is
-                // at least one. So make sure we record at least one here.
-                count.max(1)
+                )?
             } else {
                 // `is_multi_line` already proved that the terminator-trimmed
                 // context is correct. Prepare it once and validate the
