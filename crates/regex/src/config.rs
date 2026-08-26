@@ -12,7 +12,7 @@ use crate::{
     strip::strip_from_match,
 };
 
-const FRE_STANDARD_LITERAL_MIN_PATTERNS: usize = 32;
+const FRE_STANDARD_LITERAL_MIN_PATTERNS: usize = 16;
 const FRE_STANDARD_LITERAL_MAX_PATTERNS: usize = 256;
 
 /// Config represents the configuration of a regex matcher in this crate.
@@ -729,7 +729,8 @@ mod tests {
         );
         for replacement in ["", "a.b", "line\nfeed"] {
             let mut refused = standard_patterns.clone();
-            refused[17] = replacement.to_owned();
+            refused[FRE_STANDARD_LITERAL_MIN_PATTERNS / 2] =
+                replacement.to_owned();
             let refused =
                 refused.iter().map(String::as_str).collect::<Vec<_>>();
             assert!(standard().fre_standard_literals(&refused).is_some());
@@ -738,7 +739,8 @@ mod tests {
         let mut banned = standard();
         banned.ban = Some(b'\0');
         let mut banned_patterns = standard_patterns.clone();
-        banned_patterns[17] = "a\0b".to_owned();
+        banned_patterns[FRE_STANDARD_LITERAL_MIN_PATTERNS / 2] =
+            "a\0b".to_owned();
         let banned_patterns =
             banned_patterns.iter().map(String::as_str).collect::<Vec<_>>();
         assert!(banned.fre_standard_literals(&banned_patterns).is_some());

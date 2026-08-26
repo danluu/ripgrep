@@ -18,7 +18,7 @@ use regex_syntax::hir::{Hir, HirKind};
 const DEFAULT_CANONICAL_PATTERN_LIMIT: usize = 8 * (1 << 20);
 // Public actual-ripgrep startup measurements qualify this packed-set floor;
 // FRE independently authenticates every value and resource boundary.
-const STANDARD_LITERAL_BYTES_MIN_PATTERNS: usize = 32;
+const STANDARD_LITERAL_BYTES_MIN_PATTERNS: usize = 16;
 const STANDARD_LITERAL_BYTES_MAX_PATTERNS: usize = 256;
 
 #[inline(always)]
@@ -1742,13 +1742,17 @@ mod tests {
 
     #[test]
     fn standard_literal_bytes_bridge_preserves_small_terminals() {
-        for count in [32, 64, 128] {
+        for count in [16, 32, 64, 128] {
             let mut patterns = (0..u16::try_from(count).unwrap())
                 .map(|bits| {
                     String::from_utf8(
                         (0..8)
                             .map(|shift| {
-                                if bits & (1 << shift) == 0 { b'q' } else { b'z' }
+                                if bits & (1 << shift) == 0 {
+                                    b'q'
+                                } else {
+                                    b'z'
+                                }
                             })
                             .collect::<Vec<_>>(),
                     )
@@ -2067,12 +2071,13 @@ mod tests {
 
     #[test]
     fn standard_literal_value_refusals_preserve_configured_hir_fallbacks() {
+        let special = super::STANDARD_LITERAL_BYTES_MIN_PATTERNS / 2;
         let standard = (0..super::STANDARD_LITERAL_BYTES_MIN_PATTERNS)
             .map(|index| format!("value{index:04}"))
             .collect::<Vec<_>>();
 
         let mut meta = standard.clone();
-        meta[17] = "a.b".to_owned();
+        meta[special] = "a.b".to_owned();
         let mut builder = RegexMatcherBuilder::new();
         builder.multi_line(true);
         let matcher = builder.build_many(&meta).expect("meta fallback");
@@ -2108,7 +2113,7 @@ mod tests {
         );
 
         let mut line_feed = standard.clone();
-        line_feed[17] = "line\nfeed".to_owned();
+        line_feed[special] = "line\nfeed".to_owned();
         assert!(matches!(
             builder.build_many(&line_feed),
             Err(Error::Regex(_))
@@ -2122,7 +2127,7 @@ mod tests {
         );
 
         let mut nul = standard;
-        nul[17] = "nul\0byte".to_owned();
+        nul[special] = "nul\0byte".to_owned();
         let mut builder = RegexMatcherBuilder::new();
         builder.multi_line(true).ban_byte(Some(b'\0'));
         assert!(matches!(builder.build_many(&nul), Err(Error::Regex(_))));
@@ -2152,10 +2157,11 @@ mod tests {
 
         // The dot makes grep-regex decline literal certification. Its normal
         // configured-HIR route must consume the already captured values.
+        let special = super::STANDARD_LITERAL_BYTES_MIN_PATTERNS / 2;
         let patterns = (0..super::STANDARD_LITERAL_BYTES_MIN_PATTERNS)
             .map(|index| AlternatingPattern {
                 calls: Cell::new(0),
-                first: if index == 17 {
+                first: if index == special {
                     "a.b".to_owned()
                 } else {
                     format!("value{index:04}")
