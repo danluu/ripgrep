@@ -535,6 +535,40 @@ where
     )
 }
 
+/// Counts a validated non-empty seed and all following matches in an already
+/// prepared context haystack.
+///
+/// Iteration resumes at the seed's end. The adjacent-empty suppression bit is
+/// retained so that this has the same progress semantics as if the seed had
+/// been emitted by `Matcher::find_iter_at` in the same call.
+#[inline]
+pub(crate) fn count_matches_in_prepared_context_with_valid_seed<M>(
+    matcher: M,
+    bytes: &[u8],
+    range_end: usize,
+    seed: Match,
+) -> io::Result<u64>
+where
+    M: Matcher,
+{
+    debug_assert!(!seed.is_empty());
+    debug_assert!(seed.end() <= bytes.len());
+    debug_assert!(seed.end() <= range_end);
+    let mut count = 1;
+    find_iter_at_in_prepared_context(
+        matcher,
+        bytes,
+        range_end,
+        seed.end(),
+        Some(seed.end()),
+        |_| {
+            count += 1;
+            true
+        },
+    )?;
+    Ok(count)
+}
+
 /// Filter a caller-authenticated seed to one that is non-empty and wholly
 /// inside both the reported match range and the prepared context haystack.
 pub(crate) fn validated_nonempty_seed(
@@ -712,10 +746,9 @@ pub(crate) struct SeededRegexMatcher {
 
 #[cfg(test)]
 impl SeededRegexMatcher {
-    pub(crate) fn new(pattern: &str) -> SeededRegexMatcher {
+    fn from_inner(inner: grep_regex::RegexMatcher) -> SeededRegexMatcher {
         SeededRegexMatcher {
-            inner: grep_regex::RegexMatcher::new_line_matcher(pattern)
-                .unwrap(),
+            inner,
             owner: grep_matcher::SelectedMatchOwner::new(),
             hint: SeededRegexHint::First,
             selected_calls: std::cell::Cell::new(0),
@@ -725,6 +758,27 @@ impl SeededRegexMatcher {
             selected_end_count: false,
             selected_end_count_calls: std::cell::Cell::new(0),
         }
+    }
+
+    pub(crate) fn new(pattern: &str) -> SeededRegexMatcher {
+        SeededRegexMatcher::from_inner(
+            grep_regex::RegexMatcher::new_line_matcher(pattern).unwrap(),
+        )
+    }
+
+    pub(crate) fn new_multi_line(pattern: &str) -> SeededRegexMatcher {
+        SeededRegexMatcher::from_inner(
+            grep_regex::RegexMatcher::new(pattern).unwrap(),
+        )
+    }
+
+    pub(crate) fn new_crlf(pattern: &str) -> SeededRegexMatcher {
+        SeededRegexMatcher::from_inner(
+            grep_regex::RegexMatcherBuilder::new()
+                .crlf(true)
+                .build(pattern)
+                .unwrap(),
+        )
     }
 
     pub(crate) fn with_hint(
@@ -780,11 +834,11 @@ impl Matcher for SeededRegexMatcher {
         haystack: &[u8],
         at: usize,
     ) -> Result<Option<u64>, Self::Error> {
+        self.selected_end_count_calls
+            .set(self.selected_end_count_calls.get() + 1);
         if !self.selected_end_count {
             return Ok(None);
         }
-        self.selected_end_count_calls
-            .set(self.selected_end_count_calls.get() + 1);
         let mut count = 0_u64;
         self.inner.find_iter_at(haystack, at, |_| {
             count += 1;

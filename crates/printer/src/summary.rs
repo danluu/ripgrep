@@ -18,8 +18,9 @@ use crate::{
     hyperlink::{self, HyperlinkConfig},
     stats::Stats,
     util::{
-        PrinterPath, context_haystack, find_iter_at_in_context_with_seed,
-        validated_nonempty_seed,
+        PrinterPath, context_haystack,
+        count_matches_in_prepared_context_with_valid_seed,
+        find_iter_at_in_context_with_seed, validated_nonempty_seed,
     },
 };
 
@@ -671,21 +672,34 @@ impl<'p, 's, M: Matcher, W: WriteColor> Sink for SummarySink<'p, 's, M, W> {
                 );
                 match seed {
                     None => None,
-                    Some(seed) => self
-                        .matcher
-                        .count_positive_width_selected_ends_at(
-                            bytes,
-                            seed.end(),
-                        )
-                        .map_err(io::Error::error_message)?
-                        .map(|tail| {
-                            tail.checked_add(1).ok_or_else(|| {
-                                io::Error::error_message(
-                                    "selected-end match count overflowed",
-                                )
-                            })
+                    Some(seed) => {
+                        let tail = self
+                            .matcher
+                            .count_positive_width_selected_ends_at(
+                                bytes,
+                                seed.end(),
+                            )
+                            .map_err(io::Error::error_message)?;
+                        Some(match tail {
+                            Some(tail) => {
+                                tail.checked_add(1).ok_or_else(|| {
+                                    io::Error::error_message(
+                                        "selected-end match count overflowed",
+                                    )
+                                })?
+                            }
+                            None => {
+                                // Refusal occurs before search work. Reuse the
+                                // same prepared context and validated seed.
+                                count_matches_in_prepared_context_with_valid_seed(
+                                    &self.matcher,
+                                    bytes,
+                                    range.end,
+                                    seed,
+                                )?
+                            }
                         })
-                        .transpose()?,
+                    }
                 }
             };
             if let Some(count) = selected_end_count {
@@ -1189,6 +1203,29 @@ and exhibited clearly, with a label attached.
     }
 
     #[test]
+    fn count_matches_multiline_keeps_full_iteration_fallback() {
+        let matcher = SeededRegexMatcher::new_multi_line("(?s:a.*?b)");
+        let searcher = SearcherBuilder::new().multi_line(true).build();
+        let (got, _stats) =
+            count_matches_stats(&matcher, searcher, b"a\nb a\nb\n");
+        assert_eq_printed!("2\n", got);
+        assert_eq!(matcher.selected_end_count_calls(), 0);
+        assert!(matcher.iter_at().is_some());
+        assert!(matcher.iter_match_calls() > 0);
+    }
+
+    #[test]
+    fn count_matches_reuses_prepared_context_after_count_refusal() {
+        let matcher = SeededRegexMatcher::new("a");
+        let got = count_matches_with(&matcher, &matcher, b"aaa\n");
+        assert_eq_printed!("fixture:3\n", got);
+        assert!(matcher.selected_calls() > 0);
+        assert_eq!(matcher.selected_end_count_calls(), 1);
+        assert_eq!(matcher.iter_at(), Some(1));
+        assert_eq!(matcher.iter_match_calls(), 2);
+    }
+
+    #[test]
     fn count_matches_uses_positive_selected_end_tail_after_valid_seed() {
         let matcher = SeededRegexMatcher::with_selected_end_count("ab|a");
         let got = count_matches_with(&matcher, &matcher, b"ababa\n");
@@ -1196,6 +1233,7 @@ and exhibited clearly, with a label attached.
         assert!(matcher.selected_calls() > 0);
         assert_eq!(matcher.selected_end_count_calls(), 1);
         assert_eq!(matcher.iter_at(), None);
+        assert_eq!(matcher.iter_match_calls(), 0);
     }
 
     #[test]
@@ -1208,6 +1246,7 @@ and exhibited clearly, with a label attached.
         assert!(matcher.selected_calls() > 0);
         assert_eq!(matcher.selected_end_count_calls(), 1);
         assert_eq!(matcher.iter_at(), None);
+        assert_eq!(matcher.iter_match_calls(), 0);
     }
 
     #[test]
@@ -1216,7 +1255,24 @@ and exhibited clearly, with a label attached.
         let got = count_matches_with(&matcher, &matcher, b"a\n");
         assert_eq_printed!("fixture:1\n", got);
         assert!(matcher.selected_calls() > 0);
+        assert_eq!(matcher.selected_end_count_calls(), 1);
         assert_eq!(matcher.iter_at(), Some(1));
+        assert_eq!(matcher.iter_match_calls(), 1);
+    }
+
+    #[test]
+    fn count_matches_seed_tail_preserves_crlf_context() {
+        let matcher = SeededRegexMatcher::new_crlf("a");
+        let searcher = SearcherBuilder::new()
+            .line_terminator(LineTerminator::crlf())
+            .build();
+        let (got, stats) = count_matches_stats(&matcher, searcher, b"aa\r\n");
+        assert_eq_printed!("2\r\n", got);
+        assert_eq!(stats.matches(), 2);
+        assert_eq!(stats.matched_lines(), 1);
+        assert_eq!(matcher.selected_end_count_calls(), 1);
+        assert_eq!(matcher.iter_at(), Some(1));
+        assert_eq!(matcher.iter_match_calls(), 1);
     }
 
     #[test]
@@ -1226,6 +1282,7 @@ and exhibited clearly, with a label attached.
         let got = count_matches_with(&matcher, &matcher, b"a\n");
         assert_eq_printed!("fixture:1\n", got);
         assert!(matcher.selected_calls() > 0);
+        assert_eq!(matcher.selected_end_count_calls(), 0);
         assert_eq!(matcher.iter_at(), Some(0));
     }
 
@@ -1241,6 +1298,7 @@ and exhibited clearly, with a label attached.
             let got = count_matches_with(&matcher, &matcher, b"a\n");
             assert_eq_printed!("fixture:1\n", got);
             assert!(matcher.selected_calls() > 0, "{hint:?}");
+            assert_eq!(matcher.selected_end_count_calls(), 0, "{hint:?}");
             assert_eq!(matcher.iter_at(), Some(0), "{hint:?}");
         }
     }
@@ -1252,6 +1310,7 @@ and exhibited clearly, with a label attached.
         let got = count_matches_with(&search, &sink, b"aa\n");
         assert_eq_printed!("fixture:2\n", got);
         assert_eq!(search.selected_calls(), 0);
+        assert_eq!(sink.selected_end_count_calls(), 0);
         assert_eq!(sink.iter_at(), Some(0));
     }
 
