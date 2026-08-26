@@ -12,7 +12,7 @@ use crate::{
     strip::strip_from_match,
 };
 
-const FRE_STANDARD_LITERAL_MIN_PATTERNS: usize = 8;
+const FRE_STANDARD_LITERAL_MIN_PATTERNS: usize = 2;
 const FRE_STANDARD_LITERAL_MAX_PATTERNS: usize = 256;
 
 /// Config represents the configuration of a regex matcher in this crate.

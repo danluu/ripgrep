@@ -16,9 +16,9 @@ use grep_matcher::{
 use regex_syntax::hir::{Hir, HirKind};
 
 const DEFAULT_CANONICAL_PATTERN_LIMIT: usize = 8 * (1 << 20);
-// Public actual-ripgrep startup measurements qualify this packed-set floor;
-// FRE independently authenticates every value and resource boundary.
-const STANDARD_LITERAL_BYTES_MIN_PATTERNS: usize = 8;
+// Two patterns are the first distinct alternation shape. FRE independently
+// authenticates every value and resource boundary.
+const STANDARD_LITERAL_BYTES_MIN_PATTERNS: usize = 2;
 const STANDARD_LITERAL_BYTES_MAX_PATTERNS: usize = 256;
 
 #[inline(always)]
@@ -1742,7 +1742,7 @@ mod tests {
 
     #[test]
     fn standard_literal_bytes_bridge_preserves_small_terminals() {
-        for count in [8, 16, 32, 64, 128] {
+        for count in [2, 3, 4, 5, 6, 7, 8, 16, 32, 64, 128] {
             let mut patterns = (0..u16::try_from(count).unwrap())
                 .map(|bits| {
                     String::from_utf8(
