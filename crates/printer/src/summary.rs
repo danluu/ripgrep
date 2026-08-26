@@ -18,8 +18,8 @@ use crate::{
     hyperlink::{self, HyperlinkConfig},
     stats::Stats,
     util::{
-        PrinterPath, context_haystack,
-        count_matches_in_prepared_context_with_valid_seed,
+        PrinterPath, context_haystack_single_line,
+        count_matches_in_prepared_context_with_validated_seed,
         find_iter_at_in_context_with_seed, validated_nonempty_seed,
     },
 };
@@ -660,51 +660,7 @@ impl<'p, 's, M: Matcher, W: WriteColor> Sink for SummarySink<'p, 's, M, W> {
             // practice.
             let buf = mat.buffer();
             let range = mat.bytes_range_in_buffer();
-            let selected_end_count = if is_multi_line {
-                None
-            } else {
-                let bytes =
-                    context_haystack(searcher, &self.matcher, buf, &range);
-                let seed = validated_nonempty_seed(
-                    bytes.len(),
-                    &range,
-                    mat.selected_match(),
-                );
-                match seed {
-                    None => None,
-                    Some(seed) => {
-                        let tail = self
-                            .matcher
-                            .count_positive_width_selected_ends_at(
-                                bytes,
-                                seed.end(),
-                            )
-                            .map_err(io::Error::error_message)?;
-                        Some(match tail {
-                            Some(tail) => {
-                                tail.checked_add(1).ok_or_else(|| {
-                                    io::Error::error_message(
-                                        "selected-end match count overflowed",
-                                    )
-                                })?
-                            }
-                            None => {
-                                // Refusal occurs before search work. Reuse the
-                                // same prepared context and validated seed.
-                                count_matches_in_prepared_context_with_valid_seed(
-                                    &self.matcher,
-                                    bytes,
-                                    range.end,
-                                    seed,
-                                )?
-                            }
-                        })
-                    }
-                }
-            };
-            if let Some(count) = selected_end_count {
-                count
-            } else {
+            if is_multi_line {
                 let mut count = 0;
                 find_iter_at_in_context_with_seed(
                     searcher,
@@ -722,6 +678,59 @@ impl<'p, 's, M: Matcher, W: WriteColor> Sink for SummarySink<'p, 's, M, W> {
                 // *any* matches even though we clearly know that there is
                 // at least one. So make sure we record at least one here.
                 count.max(1)
+            } else {
+                // `is_multi_line` already proved that the terminator-trimmed
+                // context is correct. Prepare it once and validate the
+                // authenticated seed once for every single-line route.
+                let bytes =
+                    context_haystack_single_line(searcher, buf, &range);
+                let seed = validated_nonempty_seed(
+                    bytes.len(),
+                    &range,
+                    mat.selected_match(),
+                );
+                match seed {
+                    None => {
+                        let count =
+                            count_matches_in_prepared_context_with_validated_seed(
+                                &self.matcher,
+                                bytes,
+                                &range,
+                                None,
+                            )?;
+                        // Retain the established floor for context-bounded
+                        // iteration when the authenticated seed is unavailable.
+                        count.max(1)
+                    }
+                    Some(seed) => {
+                        let tail = self
+                            .matcher
+                            .count_positive_width_selected_ends_at(
+                                bytes,
+                                seed.end(),
+                            )
+                            .map_err(io::Error::error_message)?;
+                        match tail {
+                            Some(tail) => {
+                                tail.checked_add(1).ok_or_else(|| {
+                                    io::Error::error_message(
+                                        "selected-end match count overflowed",
+                                    )
+                                })?
+                            }
+                            None => {
+                                // Refusal occurs before search work. Reuse the
+                                // same prepared context and validated seed.
+                                count_matches_in_prepared_context_with_validated_seed(
+                                    &self.matcher,
+                                    bytes,
+                                    &range,
+                                    Some(seed),
+                                )?
+                            }
+                        }
+                    }
+                }
             }
         };
         if is_multi_line {
@@ -1226,7 +1235,7 @@ and exhibited clearly, with a label attached.
     }
 
     #[test]
-    fn count_matches_uses_positive_selected_end_tail_after_valid_seed() {
+    fn count_matches_native_count_bypasses_prepared_iteration() {
         let matcher = SeededRegexMatcher::with_selected_end_count("ab|a");
         let got = count_matches_with(&matcher, &matcher, b"ababa\n");
         assert_eq_printed!("fixture:3\n", got);
@@ -1261,6 +1270,21 @@ and exhibited clearly, with a label attached.
     }
 
     #[test]
+    fn count_matches_nullable_without_seed_reuses_single_line_context() {
+        let matcher =
+            SeededRegexMatcher::with_hint("a|", SeededRegexHint::None);
+        let searcher = SearcherBuilder::new().multi_line(true).build();
+        let (got, stats) = count_matches_stats(&matcher, searcher, b"a\n");
+        assert_eq_printed!("1\n", got);
+        assert_eq!(stats.matches(), 1);
+        assert_eq!(stats.matched_lines(), 1);
+        assert!(matcher.selected_calls() > 0);
+        assert_eq!(matcher.selected_end_count_calls(), 0);
+        assert_eq!(matcher.iter_at(), Some(0));
+        assert_eq!(matcher.iter_match_calls(), 1);
+    }
+
+    #[test]
     fn count_matches_seed_tail_preserves_crlf_context() {
         let matcher = SeededRegexMatcher::new_crlf("a");
         let searcher = SearcherBuilder::new()
@@ -1276,18 +1300,36 @@ and exhibited clearly, with a label attached.
     }
 
     #[test]
-    fn count_matches_rejects_seed_in_trimmed_terminator() {
+    fn count_matches_crlf_without_seed_reuses_prepared_context() {
         let matcher =
-            SeededRegexMatcher::with_hint("a", SeededRegexHint::TrailingByte);
-        let got = count_matches_with(&matcher, &matcher, b"a\n");
-        assert_eq_printed!("fixture:1\n", got);
+            SeededRegexMatcher::with_crlf_hint("a", SeededRegexHint::None);
+        let searcher = SearcherBuilder::new()
+            .line_terminator(LineTerminator::crlf())
+            .build();
+        let (got, stats) = count_matches_stats(&matcher, searcher, b"aa\r\n");
+        assert_eq_printed!("2\r\n", got);
+        assert_eq!(stats.matches(), 2);
+        assert_eq!(stats.matched_lines(), 1);
         assert!(matcher.selected_calls() > 0);
         assert_eq!(matcher.selected_end_count_calls(), 0);
         assert_eq!(matcher.iter_at(), Some(0));
+        assert_eq!(matcher.iter_match_calls(), 2);
     }
 
     #[test]
-    fn count_matches_invalid_hints_use_full_iteration_fallback() {
+    fn count_matches_rejects_seed_in_trimmed_terminator() {
+        let matcher =
+            SeededRegexMatcher::with_hint("a", SeededRegexHint::TrailingByte);
+        let got = count_matches_with(&matcher, &matcher, b"aa\n");
+        assert_eq_printed!("fixture:2\n", got);
+        assert!(matcher.selected_calls() > 0);
+        assert_eq!(matcher.selected_end_count_calls(), 0);
+        assert_eq!(matcher.iter_at(), Some(0));
+        assert_eq!(matcher.iter_match_calls(), 2);
+    }
+
+    #[test]
+    fn count_matches_invalid_hints_reuse_prepared_iteration_fallback() {
         for hint in [
             SeededRegexHint::None,
             SeededRegexHint::Empty,
@@ -1295,11 +1337,12 @@ and exhibited clearly, with a label attached.
             SeededRegexHint::Candidate,
         ] {
             let matcher = SeededRegexMatcher::with_hint("a", hint);
-            let got = count_matches_with(&matcher, &matcher, b"a\n");
-            assert_eq_printed!("fixture:1\n", got);
+            let got = count_matches_with(&matcher, &matcher, b"aa\n");
+            assert_eq_printed!("fixture:2\n", got);
             assert!(matcher.selected_calls() > 0, "{hint:?}");
             assert_eq!(matcher.selected_end_count_calls(), 0, "{hint:?}");
             assert_eq!(matcher.iter_at(), Some(0), "{hint:?}");
+            assert_eq!(matcher.iter_match_calls(), 2, "{hint:?}");
         }
     }
 
@@ -1312,6 +1355,7 @@ and exhibited clearly, with a label attached.
         assert_eq!(search.selected_calls(), 0);
         assert_eq!(sink.selected_end_count_calls(), 0);
         assert_eq!(sink.iter_at(), Some(0));
+        assert_eq!(sink.iter_match_calls(), 2);
     }
 
     #[test]

@@ -535,32 +535,40 @@ where
     )
 }
 
-/// Counts a validated non-empty seed and all following matches in an already
-/// prepared context haystack.
+/// Counts an optional validated non-empty seed and all following matches in an
+/// already prepared context haystack.
 ///
-/// Iteration resumes at the seed's end. The adjacent-empty suppression bit is
-/// retained so that this has the same progress semantics as if the seed had
-/// been emitted by `Matcher::find_iter_at` in the same call.
+/// A present seed must already have passed [`validated_nonempty_seed`].
+/// Iteration then resumes at its end, retaining the adjacent-empty suppression
+/// bit so that this has the same progress semantics as if the seed had been
+/// emitted by `Matcher::find_iter_at` in the same call. Without a seed,
+/// iteration starts at the reported range's beginning.
 #[inline]
-pub(crate) fn count_matches_in_prepared_context_with_valid_seed<M>(
+pub(crate) fn count_matches_in_prepared_context_with_validated_seed<M>(
     matcher: M,
     bytes: &[u8],
-    range_end: usize,
-    seed: Match,
+    range: &std::ops::Range<usize>,
+    seed: Option<Match>,
 ) -> io::Result<u64>
 where
     M: Matcher,
 {
-    debug_assert!(!seed.is_empty());
-    debug_assert!(seed.end() <= bytes.len());
-    debug_assert!(seed.end() <= range_end);
-    let mut count = 1;
+    let (mut count, at, suppress_empty_at) = match seed {
+        None => (0_u64, range.start, None),
+        Some(seed) => {
+            debug_assert!(!seed.is_empty());
+            debug_assert!(range.start <= seed.start());
+            debug_assert!(seed.end() <= range.end);
+            debug_assert!(seed.end() <= bytes.len());
+            (1_u64, seed.end(), Some(seed.end()))
+        }
+    };
     find_iter_at_in_prepared_context(
         matcher,
         bytes,
-        range_end,
-        seed.end(),
-        Some(seed.end()),
+        range.end,
+        at,
+        suppress_empty_at,
         |_| {
             count += 1;
             true
@@ -590,6 +598,7 @@ pub(crate) fn context_haystack<'b, M: Matcher>(
     mut bytes: &'b [u8],
     range: &std::ops::Range<usize>,
 ) -> &'b [u8] {
+    let is_multi_line = searcher.multi_line_with_matcher(matcher);
     // This strange dance is to account for the possibility of look-ahead in
     // the regex. The problem here is that mat.bytes() doesn't include the
     // lines beyond the match boundaries in multi-line mode, which means that
@@ -613,22 +622,30 @@ pub(crate) fn context_haystack<'b, M: Matcher>(
     // responsible for finding matches when necessary, and the printer
     // shouldn't be involved in this business in the first place. Sigh. Live
     // and learn. Abstraction boundaries are hard.
-    let is_multi_line = searcher.multi_line_with_matcher(matcher);
     if is_multi_line {
         if bytes[range.end..].len() >= MAX_LOOK_AHEAD {
             bytes = &bytes[..range.end + MAX_LOOK_AHEAD];
         }
     } else {
-        // When searching a single line, we should remove the line terminator.
-        // Otherwise, it's possible for the regex (via look-around) to observe
-        // the line terminator and not match because of it.
-        let mut m = Match::new(0, range.end);
-        // No need to remember the line terminator as we aren't doing a replace
-        // here.
-        trim_line_terminator(searcher, bytes, &mut m);
-        bytes = &bytes[..m.end()];
+        bytes = context_haystack_single_line(searcher, bytes, range);
     }
     bytes
+}
+
+/// Prepare context after the caller has already proved that the matcher cannot
+/// report a multi-line match.
+pub(crate) fn context_haystack_single_line<'b>(
+    searcher: &Searcher,
+    bytes: &'b [u8],
+    range: &std::ops::Range<usize>,
+) -> &'b [u8] {
+    // Remove the line terminator so that look-around cannot observe bytes that
+    // are outside this single-line match context.
+    let mut m = Match::new(0, range.end);
+    // No need to remember the line terminator as we aren't doing a replace
+    // here.
+    trim_line_terminator(searcher, bytes, &mut m);
+    &bytes[..m.end()]
 }
 
 fn find_iter_at_in_prepared_context<M, F>(
@@ -786,6 +803,13 @@ impl SeededRegexMatcher {
         hint: SeededRegexHint,
     ) -> SeededRegexMatcher {
         SeededRegexMatcher { hint, ..SeededRegexMatcher::new(pattern) }
+    }
+
+    pub(crate) fn with_crlf_hint(
+        pattern: &str,
+        hint: SeededRegexHint,
+    ) -> SeededRegexMatcher {
+        SeededRegexMatcher { hint, ..SeededRegexMatcher::new_crlf(pattern) }
     }
 
     pub(crate) fn with_selected_end_count(
