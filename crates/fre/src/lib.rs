@@ -641,7 +641,7 @@ impl Matcher for RegexMatcherWorker<'_> {
             .session
             .try_borrow_mut()
             .map_err(|_| MatchError::Reentrant)?;
-        session.is_match_at(haystack, 0).map_err(MatchError::from)
+        session.is_match(haystack).map_err(MatchError::from)
     }
 
     #[inline]
