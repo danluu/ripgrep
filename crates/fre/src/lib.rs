@@ -1119,7 +1119,7 @@ mod tests {
     }
 
     #[test]
-    fn count_matches_reuses_a_selected_match_from_the_same_owner() {
+    fn count_matches_reuses_a_selected_end_without_span_iteration() {
         let factory = RegexMatcher::new("a+").unwrap();
         let worker = factory.worker().unwrap();
         let matcher = ProbeMatcher::new(&worker, SelectedHint::Forward);
@@ -1128,7 +1128,8 @@ mod tests {
             b"2\n"
         );
         assert!(matcher.selected_calls.get() > 0);
-        assert_eq!(matcher.iter_at.get(), Some(4));
+        assert_eq!(matcher.selected_end_count_calls.get(), 1);
+        assert_eq!(matcher.iter_at.get(), None);
     }
 
     #[test]
@@ -1936,7 +1937,7 @@ mod tests {
     }
 
     #[test]
-    fn short_uniform_literal_set_keeps_the_portable_owner() {
+    fn short_uniform_literal_set_uses_the_ordinary_owner() {
         let patterns = (0..256)
             .map(|index| {
                 let prefix = format!("public{index:04}");
@@ -1952,7 +1953,7 @@ mod tests {
             .expect("short borrowed literal matcher");
         assert!(matches!(
             matcher.regex.as_ref(),
-            super::RegexProgram::Portable(_),
+            super::RegexProgram::RipgrepLiteral(_),
         ));
     }
 
