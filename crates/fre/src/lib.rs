@@ -1742,7 +1742,7 @@ mod tests {
 
     #[test]
     fn standard_literal_bytes_bridge_preserves_small_terminals() {
-        for count in [2, 3, 4, 5, 6, 7, 8, 16, 32, 64, 128] {
+        for count in [2, 3, 4, 5, 6, 7, 8, 16, 32, 64, 68, 128] {
             let mut patterns = (0..u16::try_from(count).unwrap())
                 .map(|bits| {
                     String::from_utf8(
@@ -1988,7 +1988,7 @@ mod tests {
             .map(|_| AlternatingPattern { calls: Cell::new(0) })
             .collect::<Vec<_>>();
         let mut builder = RegexMatcherBuilder::new();
-        builder.multi_line(true);
+        builder.multi_line(true).fixed_strings(true);
         let matcher = builder
             .build_many(&patterns)
             .expect("snapshotted literal matcher");
@@ -2252,6 +2252,181 @@ mod tests {
     }
 
     #[test]
+    fn fixed_string_handoff_preserves_values_metadata_and_output_modes() {
+        let roots = [b'B', b'F', b'J', b'N'];
+        let patterns = (0..68)
+            .map(|index| {
+                format!("{}public{index:010}", char::from(roots[index / 17]),)
+            })
+            .collect::<Vec<_>>();
+        let mut fre_builder = RegexMatcherBuilder::new();
+        fre_builder.multi_line(true).fixed_strings(true);
+        let fre = fre_builder
+            .build_many(&patterns)
+            .expect("fixed public literal-set matcher");
+        assert!(fre.matches_are_nonempty);
+        assert!(matches!(
+            fre.regex.as_ref(),
+            super::RegexProgram::Portable(_),
+        ));
+        assert_eq!(fre.regex.build_report().plan, PlanKind::LiteralSetDfa);
+        assert_eq!(fre.regex.runtime_implementation_id(), "literal-set-dfa");
+        let fre_profile = match &fre.regex.build_report().profile {
+            fre::CompatibilityProfile::RustBytes(profile) => profile,
+            _ => panic!("fixed handoff retained a non-byte profile"),
+        };
+        assert!(fre_profile.options.multi_line);
+
+        let mut reference_builder = grep_regex::RegexMatcherBuilder::new();
+        reference_builder
+            .multi_line(true)
+            .fixed_strings(true)
+            .line_terminator(Some(b'\n'));
+        let reference = reference_builder
+            .build_many(&patterns)
+            .expect("fixed public reference matcher");
+        let haystack = format!(
+            "xx{}/{}/{}/{}yy\n",
+            patterns[0], patterns[17], patterns[67], patterns[0],
+        )
+        .into_bytes();
+        let worker = fre.worker().expect("fixed public FRE worker");
+        assert_non_matching_byte_parity(&worker, &reference);
+        assert_find_parity(
+            &worker,
+            &reference,
+            &[haystack.as_slice(), b"absent", patterns[43].as_bytes()],
+        );
+        assert_eq!(
+            count_matches_with(&worker, &worker, &haystack),
+            count_matches_with(&reference, &reference, &haystack),
+        );
+        assert_eq!(
+            standard_only_matches_with(&worker, &worker, &haystack),
+            standard_only_matches_with(&reference, &reference, &haystack),
+        );
+
+        let literal_values = [
+            ".",
+            "[",
+            "]",
+            "(",
+            ")",
+            "{",
+            "}",
+            "*",
+            "+",
+            "?",
+            "|",
+            "^",
+            "$",
+            "\\",
+            r"\n",
+            r"\xZZ",
+            r"(?P<bad>",
+            "é界",
+            "nul\0byte",
+        ];
+        let literal_values = literal_values
+            .iter()
+            .enumerate()
+            .map(|(index, value)| format!("{value}fixed{index}"))
+            .collect::<Vec<_>>();
+        let mut fre_builder = RegexMatcherBuilder::new();
+        fre_builder.multi_line(true).fixed_strings(true);
+        let fre = fre_builder
+            .build_many(&literal_values)
+            .expect("fixed metacharacter matcher");
+        assert!(fre.matches_are_nonempty);
+        let fre_profile = match &fre.regex.build_report().profile {
+            fre::CompatibilityProfile::RustBytes(profile) => profile,
+            _ => panic!("fixed HIR handoff retained a non-byte profile"),
+        };
+        assert!(fre_profile.options.multi_line);
+        let mut reference_builder = grep_regex::RegexMatcherBuilder::new();
+        reference_builder
+            .multi_line(true)
+            .fixed_strings(true)
+            .line_terminator(Some(b'\n'));
+        let reference = reference_builder
+            .build_many(&literal_values)
+            .expect("fixed metacharacter reference");
+        let haystack = literal_values.join("/").into_bytes();
+        let worker = fre.worker().expect("fixed metacharacter FRE worker");
+        assert_non_matching_byte_parity(&worker, &reference);
+        assert_find_parity(
+            &worker,
+            &reference,
+            &[haystack.as_slice(), b"aXbfixed0", b"absent"],
+        );
+        assert_eq!(
+            count_matches_with(&worker, &worker, &haystack),
+            count_matches_with(&reference, &reference, &haystack),
+        );
+        assert_eq!(
+            standard_only_matches_with(&worker, &worker, &haystack),
+            standard_only_matches_with(&reference, &reference, &haystack),
+        );
+
+        let priority = ["ab", "a", "ab", "é"];
+        let fre =
+            fre_builder.build_many(&priority).expect("fixed priority matcher");
+        let reference = reference_builder
+            .build_many(&priority)
+            .expect("fixed priority reference");
+        assert_find_parity(
+            &fre.worker().unwrap(),
+            &reference,
+            &[b"ab", b"zab", "é".as_bytes(), b"absent"],
+        );
+        assert_eq!(span(&fre.worker().unwrap(), b"ab"), Some((0, 2)));
+
+        let nullable = ["", "x"];
+        let fre =
+            fre_builder.build_many(&nullable).expect("fixed nullable matcher");
+        assert!(!fre.matches_are_nonempty);
+        let reference = reference_builder
+            .build_many(&nullable)
+            .expect("fixed nullable reference");
+        assert_find_parity(
+            &fre.worker().unwrap(),
+            &reference,
+            &[b"", b"x", b"abc"],
+        );
+
+        let mut banned_fre = RegexMatcherBuilder::new();
+        banned_fre.multi_line(true).fixed_strings(true).ban_byte(Some(b'\0'));
+        let mut banned_reference = grep_regex::RegexMatcherBuilder::new();
+        banned_reference
+            .multi_line(true)
+            .fixed_strings(true)
+            .line_terminator(Some(b'\n'))
+            .ban_byte(Some(b'\0'));
+        assert!(banned_fre.build_many(&["ok", "nul\0byte"]).is_err());
+        assert!(banned_reference.build_many(&["ok", "nul\0byte"]).is_err());
+        assert!(fre_builder.build_many(&["ok", "line\nfeed"]).is_err());
+        assert!(reference_builder.build_many(&["ok", "line\nfeed"]).is_err());
+
+        let mut regex_builder = RegexMatcherBuilder::new();
+        regex_builder.multi_line(true);
+        let regex = regex_builder.build(".").expect("ordinary regex matcher");
+        let mut regex_reference = grep_regex::RegexMatcherBuilder::new();
+        regex_reference.multi_line(true).line_terminator(Some(b'\n'));
+        let regex_reference =
+            regex_reference.build(".").expect("ordinary regex reference");
+        assert_find_parity(
+            &regex.worker().unwrap(),
+            &regex_reference,
+            &[b"x", b".", "é".as_bytes()],
+        );
+        let profile = match &regex.regex.build_report().profile {
+            fre::CompatibilityProfile::RustBytes(profile) => profile,
+            _ => panic!("ordinary regex retained a non-byte profile"),
+        };
+        assert!(!profile.options.multi_line);
+    }
+
+    #[test]
     fn direct_literal_handoff_reauthenticates_values_profiles_and_limits() {
         let literal = PortableBuilder::new("")
             .multi_line(true)
@@ -2425,7 +2600,7 @@ mod tests {
     }
 
     #[test]
-    fn standard_hir_handoff_fails_closed_for_other_shapes_and_transforms() {
+    fn standard_hir_handoff_fails_closed_for_other_shapes() {
         let mut structural = RegexMatcherBuilder::new();
         structural.multi_line(true);
         let structural =
@@ -2445,7 +2620,7 @@ mod tests {
         else {
             panic!("portable byte matcher retained a non-byte profile");
         };
-        assert!(!profile.options.multi_line);
+        assert!(profile.options.multi_line);
     }
 
     #[test]

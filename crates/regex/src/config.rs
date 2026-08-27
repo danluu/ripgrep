@@ -159,7 +159,6 @@ impl Config {
             && matches!(self.ban, None | Some(b'\x00'))
             && !self.crlf
             && !self.word
-            && !self.fixed_strings
             && !self.whole_line
     }
 
@@ -662,9 +661,9 @@ mod tests {
         let mut changed = standard();
         changed.nest_limit -= 1;
         assert!(!eligible(changed));
-        let mut changed = standard();
-        changed.fixed_strings = true;
-        assert!(!eligible(changed));
+        let mut fixed = standard();
+        fixed.fixed_strings = true;
+        assert!(eligible(fixed));
         let mut changed = standard();
         changed.line_terminator = Some(LineTerminator::byte(b'\x00'));
         assert!(!eligible(changed));
@@ -755,9 +754,9 @@ mod tests {
         let mut changed = standard();
         changed.word = true;
         assert!(changed.fre_standard_literals(&patterns).is_none());
-        let mut changed = standard();
-        changed.fixed_strings = true;
-        assert!(changed.fre_standard_literals(&patterns).is_none());
+        let mut fixed = standard();
+        fixed.fixed_strings = true;
+        assert!(fixed.fre_standard_literals(&patterns).is_some());
         let mut changed = standard();
         changed.line_terminator = None;
         assert!(changed.fre_standard_literals(&patterns).is_none());
