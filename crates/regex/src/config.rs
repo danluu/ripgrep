@@ -13,7 +13,7 @@ use crate::{
 };
 
 const FRE_STANDARD_LITERAL_MIN_PATTERNS: usize = 2;
-const FRE_STANDARD_LITERAL_MAX_PATTERNS: usize = 256;
+const FRE_STANDARD_LITERAL_MAX_PATTERNS: usize = 4_096;
 
 /// Config represents the configuration of a regex matcher in this crate.
 /// The configuration is itself a rough combination of the knobs found in

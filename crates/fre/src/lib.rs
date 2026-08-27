@@ -19,7 +19,8 @@ const DEFAULT_CANONICAL_PATTERN_LIMIT: usize = 8 * (1 << 20);
 // Two patterns are the first distinct alternation shape. FRE independently
 // authenticates every value and resource boundary.
 const STANDARD_LITERAL_BYTES_MIN_PATTERNS: usize = 2;
-const STANDARD_LITERAL_BYTES_MAX_PATTERNS: usize = 256;
+const STANDARD_LITERAL_BYTES_STACK_PATTERNS: usize = 256;
+const STANDARD_LITERAL_BYTES_MAX_PATTERNS: usize = 4_096;
 
 #[inline(always)]
 fn grep_match_from_fre(matched: fre::Match) -> GrepMatch {
@@ -216,11 +217,17 @@ impl RegexMatcherBuilder {
                 ..=STANDARD_LITERAL_BYTES_MAX_PATTERNS)
                 .contains(&patterns.len())
         );
-        let mut borrowed = [""; STANDARD_LITERAL_BYTES_MAX_PATTERNS];
-        for (slot, pattern) in borrowed.iter_mut().zip(patterns) {
-            *slot = pattern.as_ref();
-        }
-        let snapshot = &borrowed[..patterns.len()];
+        let mut borrowed = [""; STANDARD_LITERAL_BYTES_STACK_PATTERNS];
+        let heap;
+        let snapshot = if patterns.len() <= borrowed.len() {
+            for (slot, pattern) in borrowed.iter_mut().zip(patterns) {
+                *slot = pattern.as_ref();
+            }
+            &borrowed[..patterns.len()]
+        } else {
+            heap = patterns.iter().map(AsRef::as_ref).collect::<Vec<_>>();
+            heap.as_slice()
+        };
         if let Some(literals) =
             self.configured.fre_standard_literals_many(snapshot)
         {
@@ -1971,7 +1978,7 @@ mod tests {
     }
 
     #[test]
-    fn standard_literal_bytes_snapshot_arbitrary_as_ref_once() {
+    fn standard_literal_bytes_heap_snapshot_arbitrary_as_ref_once() {
         struct AlternatingPattern {
             calls: Cell<usize>,
         }
@@ -1984,7 +1991,7 @@ mod tests {
             }
         }
 
-        let patterns = (0..super::STANDARD_LITERAL_BYTES_MIN_PATTERNS)
+        let patterns = (0..=super::STANDARD_LITERAL_BYTES_STACK_PATTERNS)
             .map(|_| AlternatingPattern { calls: Cell::new(0) })
             .collect::<Vec<_>>();
         let mut builder = RegexMatcherBuilder::new();
