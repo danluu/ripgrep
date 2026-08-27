@@ -232,14 +232,23 @@ impl RegexMatcherBuilder {
             self.configured.fre_standard_literals_many(snapshot)
         {
             let line_terminator = Some(literals.line_terminator());
-            if let Some((built, census)) = self
-                .portable_builder(String::new(), true, line_terminator)
-                .build_ripgrep_standard_literals_ordinary_with_census(
+            let portable =
+                self.portable_builder(String::new(), true, line_terminator);
+            let built = if literals.metacharacters_are_literals() {
+                portable.build_ripgrep_fixed_literals_ordinary_with_census(
                     literals.patterns(),
                     self.max_canonical_pattern_bytes,
                     literals.forbidden_byte(),
                 )?
-            {
+            } else {
+                portable
+                    .build_ripgrep_standard_literals_ordinary_with_census(
+                        literals.patterns(),
+                        self.max_canonical_pattern_bytes,
+                        literals.forbidden_byte(),
+                    )?
+            };
+            if let Some((built, census)) = built {
                 let program = match built {
                     RipgrepStandardLiteralsBuild::Ordinary(regex) => {
                         RegexProgram::RipgrepLiteral(regex)
@@ -2373,6 +2382,45 @@ mod tests {
         assert_eq!(
             standard_only_matches_with(&worker, &worker, &haystack),
             standard_only_matches_with(&reference, &reference, &haystack),
+        );
+
+        let metacharacters = [
+            '.', '[', ']', '(', ')', '{', '}', '*', '+', '?', '|', '^', '$',
+            '\\', '-', '&', '~', '#',
+        ];
+        let wide_literal_values = (0..129)
+            .map(|index| {
+                let mut pattern = format!(
+                    "{}fixed{index:04}",
+                    metacharacters[index % metacharacters.len()]
+                );
+                pattern.extend(core::iter::repeat_n('q', 254 - pattern.len()));
+                pattern
+            })
+            .collect::<Vec<_>>();
+        let fre = fre_builder
+            .build_many(&wide_literal_values)
+            .expect("wide fixed metacharacter matcher");
+        assert!(matches!(
+            fre.regex.as_ref(),
+            super::RegexProgram::RipgrepLiteral(_),
+        ));
+        assert_eq!(
+            fre.regex.runtime_implementation_id(),
+            "literal-set-compact-nfa",
+        );
+        let reference = reference_builder
+            .build_many(&wide_literal_values)
+            .expect("wide fixed metacharacter reference");
+        assert_non_matching_byte_parity(&fre.worker().unwrap(), &reference);
+        assert_find_parity(
+            &fre.worker().unwrap(),
+            &reference,
+            &[
+                wide_literal_values[0].as_bytes(),
+                wide_literal_values[128].as_bytes(),
+                b"absent",
+            ],
         );
 
         let priority = ["ab", "a", "ab", "é"];

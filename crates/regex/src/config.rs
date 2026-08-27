@@ -173,7 +173,11 @@ impl Config {
         {
             return None;
         }
-        Some(FreStandardLiterals { patterns, forbidden_byte: self.ban })
+        Some(FreStandardLiterals {
+            patterns,
+            forbidden_byte: self.ban,
+            metacharacters_are_literals: self.fixed_strings,
+        })
     }
 }
 
@@ -187,6 +191,7 @@ impl Config {
 pub struct FreStandardLiterals<'a> {
     patterns: &'a [&'a str],
     forbidden_byte: Option<u8>,
+    metacharacters_are_literals: bool,
 }
 
 impl<'a> FreStandardLiterals<'a> {
@@ -198,6 +203,12 @@ impl<'a> FreStandardLiterals<'a> {
     /// Return the optional byte excluded by the standard configuration.
     pub fn forbidden_byte(&self) -> Option<u8> {
         self.forbidden_byte
+    }
+
+    /// Whether explicit fixed-string configuration makes every regex
+    /// metacharacter in [`Self::patterns`] literal data.
+    pub fn metacharacters_are_literals(&self) -> bool {
+        self.metacharacters_are_literals
     }
 
     /// Return the LF line terminator certified by this handoff.
@@ -693,6 +704,7 @@ mod tests {
         assert!(core::ptr::eq(candidate.patterns(), patterns.as_slice()));
         assert_eq!(candidate.line_terminator(), LineTerminator::byte(b'\n'));
         assert_eq!(candidate.forbidden_byte(), None);
+        assert!(!candidate.metacharacters_are_literals());
 
         let mut banned = standard();
         banned.ban = Some(b'\0');
@@ -700,6 +712,13 @@ mod tests {
             .fre_standard_literals(&patterns)
             .expect("standard NUL ban selects a literal candidate");
         assert_eq!(candidate.forbidden_byte(), Some(b'\0'));
+
+        let mut fixed = standard();
+        fixed.fixed_strings = true;
+        let candidate = fixed
+            .fre_standard_literals(&patterns)
+            .expect("explicit fixed configuration selects a literal candidate");
+        assert!(candidate.metacharacters_are_literals());
     }
 
     #[test]
