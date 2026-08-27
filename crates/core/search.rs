@@ -452,7 +452,7 @@ impl<W: WriteColor> SearchWorkerRuntime<W> {
         match matcher {
             RustRegex(m) => search_path(m.as_ref(), searcher, printer, path),
             #[cfg(feature = "fre")]
-            FRE(m) => search_path(m, searcher, printer, path),
+            FRE(m) => search_path_fre(m, searcher, printer, path),
             #[cfg(feature = "pcre2")]
             PCRE2(m) => search_path(m.as_ref(), searcher, printer, path),
         }
@@ -481,7 +481,7 @@ impl<W: WriteColor> SearchWorkerRuntime<W> {
                 search_reader(m.as_ref(), searcher, printer, path, rdr)
             }
             #[cfg(feature = "fre")]
-            FRE(m) => search_reader(m, searcher, printer, path, rdr),
+            FRE(m) => search_reader_fre(m, searcher, printer, path, rdr),
             #[cfg(feature = "pcre2")]
             PCRE2(m) => {
                 search_reader(m.as_ref(), searcher, printer, path, rdr)
@@ -495,6 +495,8 @@ mod tests {
     use std::borrow::Cow;
 
     use super::{PatternMatcher, PatternMatcherWorker};
+    #[cfg(feature = "fre")]
+    use super::{Printer, search_reader_fre};
 
     #[test]
     fn rust_matcher_is_borrowed_sequentially_and_owned_in_parallel() {
@@ -527,6 +529,67 @@ mod tests {
             matcher.parallel_worker().expect("parallel worker"),
             PatternMatcherWorker::PCRE2(Cow::Owned(_)),
         ));
+    }
+
+    #[cfg(feature = "fre")]
+    fn fre_count_matches(
+        matcher: &grep::fre::RegexMatcherWorker<'_>,
+        mut searcher: grep::searcher::Searcher,
+        stats: bool,
+        haystack: &[u8],
+    ) -> (super::SearchResult, String) {
+        let mut builder = grep::printer::SummaryBuilder::new();
+        builder.kind(grep::printer::SummaryKind::CountMatches).stats(stats);
+        let mut printer = Printer::Summary(builder.build_no_color(vec![]));
+        let result = search_reader_fre(
+            matcher,
+            &mut searcher,
+            &mut printer,
+            std::path::Path::new("fixture"),
+            haystack,
+        )
+        .unwrap();
+        let output =
+            String::from_utf8(printer.get_mut().get_ref().clone()).unwrap();
+        (result, output)
+    }
+
+    #[cfg(feature = "fre")]
+    #[test]
+    fn fre_count_matches_routes_only_authenticated_stateless_totals() {
+        let mut builder = grep::fre::RegexMatcherBuilder::new();
+        builder.multi_line(true);
+        let factory = builder
+            .build_many(&["a", "bb"])
+            .expect("typed FRE literal matcher");
+        let matcher = factory.worker().expect("FRE worker");
+        let haystack = &b"a a\nbb\n"[..];
+        let (aggregate, output) = fre_count_matches(
+            &matcher,
+            grep::searcher::Searcher::new(),
+            false,
+            haystack,
+        );
+        assert!(aggregate.has_match());
+        assert!(aggregate.stats().is_none());
+        assert_eq!(output, "fixture:3\n");
+
+        let (explicit, output) = fre_count_matches(
+            &matcher,
+            grep::searcher::Searcher::new(),
+            true,
+            haystack,
+        );
+        assert!(explicit.stats().is_some());
+        assert_eq!(output, "fixture:3\n");
+
+        let limited_searcher = grep::searcher::SearcherBuilder::new()
+            .max_matches(Some(1))
+            .build();
+        let (limited, output) =
+            fre_count_matches(&matcher, limited_searcher, false, haystack);
+        assert!(limited.stats().is_some());
+        assert_eq!(output, "fixture:2\n");
     }
 }
 
@@ -621,4 +684,59 @@ fn search_reader<M: Matcher, R: io::Read, W: WriteColor>(
             })
         }
     }
+}
+
+#[cfg(feature = "fre")]
+fn search_path_fre<W: WriteColor>(
+    matcher: &grep::fre::RegexMatcherWorker<'_>,
+    searcher: &mut grep::searcher::Searcher,
+    printer: &mut Printer<W>,
+    path: &Path,
+) -> io::Result<SearchResult> {
+    if let Printer::Summary(ref mut p) = *printer {
+        if p.accepts_selected_match_total()
+            && let Some(receipt) = matcher.exact_lf_match_count_receipt()
+            && searcher.supports_selected_match_total_path()
+        {
+            let mut sink = p.sink_with_path(matcher, path);
+            searcher.search_reader_selected_match_total(
+                |buf| matcher.count_exact_lf_matches(receipt, buf),
+                std::fs::File::open(path)?,
+                &mut sink,
+            )?;
+            return Ok(SearchResult {
+                has_match: sink.has_match(),
+                stats: sink.stats().cloned(),
+            });
+        }
+    }
+    search_path(matcher, searcher, printer, path)
+}
+
+#[cfg(feature = "fre")]
+fn search_reader_fre<R: io::Read, W: WriteColor>(
+    matcher: &grep::fre::RegexMatcherWorker<'_>,
+    searcher: &mut grep::searcher::Searcher,
+    printer: &mut Printer<W>,
+    path: &Path,
+    mut rdr: R,
+) -> io::Result<SearchResult> {
+    if let Printer::Summary(ref mut p) = *printer {
+        if p.accepts_selected_match_total()
+            && let Some(receipt) = matcher.exact_lf_match_count_receipt()
+            && searcher.supports_selected_match_total_reader()
+        {
+            let mut sink = p.sink_with_path(matcher, path);
+            searcher.search_reader_selected_match_total(
+                |buf| matcher.count_exact_lf_matches(receipt, buf),
+                &mut rdr,
+                &mut sink,
+            )?;
+            return Ok(SearchResult {
+                has_match: sink.has_match(),
+                stats: sink.stats().cloned(),
+            });
+        }
+    }
+    search_reader(matcher, searcher, printer, path, rdr)
 }

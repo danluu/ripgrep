@@ -232,6 +232,22 @@ pub trait Sink {
     ) -> Result<(), Self::Error> {
         Ok(())
     }
+
+    /// Accept an authoritative total from a specialized count-only search.
+    ///
+    /// No individual matches accompany this callback. The default rejects
+    /// the specialized result so a sink cannot silently discard it.
+    #[doc(hidden)]
+    #[inline]
+    fn selected_match_total(
+        &mut self,
+        _searcher: &Searcher,
+        _total: u64,
+    ) -> Result<(), Self::Error> {
+        Err(Self::Error::error_message(
+            "sink does not accept selected-match totals",
+        ))
+    }
 }
 
 impl<'a, S: Sink> Sink for &'a mut S {
@@ -290,6 +306,15 @@ impl<'a, S: Sink> Sink for &'a mut S {
     ) -> Result<(), S::Error> {
         (**self).finish(searcher, sink_finish)
     }
+
+    #[inline]
+    fn selected_match_total(
+        &mut self,
+        searcher: &Searcher,
+        total: u64,
+    ) -> Result<(), S::Error> {
+        (**self).selected_match_total(searcher, total)
+    }
 }
 
 impl<S: Sink + ?Sized> Sink for Box<S> {
@@ -347,6 +372,15 @@ impl<S: Sink + ?Sized> Sink for Box<S> {
         sink_finish: &SinkFinish,
     ) -> Result<(), S::Error> {
         (**self).finish(searcher, sink_finish)
+    }
+
+    #[inline]
+    fn selected_match_total(
+        &mut self,
+        searcher: &Searcher,
+        total: u64,
+    ) -> Result<(), S::Error> {
+        (**self).selected_match_total(searcher, total)
     }
 }
 

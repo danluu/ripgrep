@@ -4,7 +4,7 @@ use crate::{
     line_buffer::{DEFAULT_BUFFER_CAPACITY, LineBufferReader},
     lines::{self, LineStep},
     searcher::{Config, Range, Searcher, core::Core},
-    sink::{Sink, SinkError},
+    sink::{Sink, SinkError, SinkFinish},
 };
 
 #[derive(Debug)]
@@ -347,6 +347,98 @@ impl<'s, M: Matcher, S: Sink> MultiLine<'s, M, S> {
             Some(offset) if offset < self.core.pos() as u64 => offset,
             _ => self.core.pos() as u64,
         }
+    }
+}
+
+/// Separate aggregate reader loop for authenticated LF-disjoint matchers.
+#[derive(Debug)]
+pub(crate) struct ReadByLineAggregate<'s, A, C, R, S> {
+    searcher: &'s Searcher,
+    aggregate: A,
+    reduce: C,
+    sink: S,
+    rdr: LineBufferReader<'s, R>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AggregateStep {
+    More,
+    Complete,
+    Stopped,
+}
+
+impl<'s, A, C, R, S> ReadByLineAggregate<'s, A, C, R, S>
+where
+    R: std::io::Read,
+    S: Sink,
+{
+    pub(crate) fn new(
+        searcher: &'s Searcher,
+        aggregate: A,
+        reduce: C,
+        read_from: LineBufferReader<'s, R>,
+        write_to: S,
+    ) -> ReadByLineAggregate<'s, A, C, R, S> {
+        ReadByLineAggregate {
+            searcher,
+            aggregate,
+            reduce,
+            sink: write_to,
+            rdr: read_from,
+        }
+    }
+
+    pub(crate) fn run<F>(mut self, finish: F) -> Result<(), S::Error>
+    where
+        C: FnMut(&mut A, &[u8]) -> Result<(), S::Error>,
+        F: FnOnce(&mut S, &Searcher, A) -> Result<(), S::Error>,
+    {
+        if self.sink.begin(self.searcher)? {
+            loop {
+                match self.fill()? {
+                    AggregateStep::More => {
+                        (self.reduce)(&mut self.aggregate, self.rdr.buffer())?;
+                        let consumed = self.rdr.buffer().len();
+                        self.rdr.consume(consumed);
+                    }
+                    AggregateStep::Complete => {
+                        finish(&mut self.sink, self.searcher, self.aggregate)?;
+                        break;
+                    }
+                    AggregateStep::Stopped => break,
+                }
+            }
+        }
+        self.sink.finish(
+            self.searcher,
+            &SinkFinish {
+                byte_count: self.rdr.absolute_byte_offset(),
+                binary_byte_offset: self.rdr.binary_byte_offset(),
+            },
+        )
+    }
+
+    fn fill(&mut self) -> Result<AggregateStep, S::Error> {
+        debug_assert!(self.rdr.buffer().is_empty());
+
+        let already_binary = self.rdr.binary_byte_offset().is_some();
+        let didread = self.rdr.fill().map_err(S::Error::error_io)?;
+        if !already_binary {
+            if let Some(offset) = self.rdr.binary_byte_offset() {
+                if !self.sink.binary_data(self.searcher, offset)? {
+                    return Ok(AggregateStep::Stopped);
+                }
+            }
+        }
+        if self.rdr.binary_byte_offset().is_some()
+            && self.searcher.binary_detection().quit_byte().is_some()
+        {
+            return Ok(AggregateStep::Stopped);
+        }
+        if !didread {
+            return Ok(AggregateStep::Complete);
+        }
+        Ok(AggregateStep::More)
     }
 }
 

@@ -16,7 +16,9 @@ use crate::{
         self, BufferAllocation, DEFAULT_BUFFER_CAPACITY, LineBuffer,
         LineBufferBuilder, LineBufferReader, alloc_error,
     },
-    searcher::glue::{MultiLine, ReadByLine, SliceByLine},
+    searcher::glue::{
+        MultiLine, ReadByLine, ReadByLineAggregate, SliceByLine,
+    },
     sink::{Sink, SinkError},
 };
 
@@ -1028,6 +1030,86 @@ impl Searcher {
     }
 }
 
+impl Searcher {
+    /// Count selected matches in each stable LF-bounded reader buffer.
+    ///
+    /// The callback must come from a construction receipt proving positive
+    /// width, LF exclusion and exact leftmost-first selected-end counting. A
+    /// callback error after counting starts is authoritative; this method
+    /// never retries with ordinary span matching.
+    #[doc(hidden)]
+    pub fn search_reader_selected_match_total<C, E, R, S>(
+        &mut self,
+        count: C,
+        read_from: R,
+        write_to: S,
+    ) -> Result<(), S::Error>
+    where
+        C: FnMut(&[u8]) -> Result<u64, E>,
+        E: std::fmt::Display,
+        R: io::Read,
+        S: Sink,
+    {
+        if !self.supports_selected_match_total_reader() {
+            return Err(S::Error::error_message(
+                "search configuration does not support selected-match totals",
+            ));
+        }
+
+        let mut decode_buffer = self.decode_buffer.borrow_mut();
+        let decoder = self
+            .decode_builder
+            .build_with_buffer(read_from, &mut *decode_buffer)
+            .map_err(S::Error::error_io)?;
+        let mut line_buffer = self.line_buffer.borrow_mut();
+        let rdr = LineBufferReader::new(decoder, &mut *line_buffer);
+        log::trace!(
+            "generic reader: counting selected matches via roll buffer strategy"
+        );
+        let mut count = count;
+        ReadByLineAggregate::new(
+            self,
+            0_u64,
+            move |total: &mut u64, buf: &[u8]| {
+                let count = count(buf).map_err(S::Error::error_message)?;
+                *total = total.checked_add(count).ok_or_else(|| {
+                    S::Error::error_message(
+                        "selected-match total overflowed while reading",
+                    )
+                })?;
+                Ok(())
+            },
+            rdr,
+            write_to,
+        )
+        .run(|sink, searcher, total| {
+            sink.selected_match_total(searcher, total)
+        })
+    }
+
+    /// Whether this configuration admits authenticated reader match totals.
+    #[doc(hidden)]
+    #[inline]
+    pub fn supports_selected_match_total_reader(&self) -> bool {
+        self.config.line_term == LineTerminator::byte(b'\n')
+            && !self.config.invert_match
+            && self.config.max_context() == 0
+            && !self.config.passthru
+            && !self.config.multi_line
+            && !self.config.stop_on_nonmatch
+            && self.config.max_matches.is_none()
+            && self.config.heap_limit != Some(0)
+    }
+
+    /// Whether this configuration admits file-path totals without an mmap.
+    #[doc(hidden)]
+    #[inline]
+    pub fn supports_selected_match_total_path(&self) -> bool {
+        self.supports_selected_match_total_reader()
+            && (cfg!(target_os = "macos") || !self.config.mmap.is_enabled())
+    }
+}
+
 /// Returns true if and only if the given slice begins with a UTF-8 or UTF-16
 /// BOM.
 ///
@@ -1045,9 +1127,70 @@ fn slice_has_bom(slice: &[u8]) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use std::io;
+
     use crate::testutil::{KitchenSink, RegexMatcher};
+    use crate::{Sink, SinkMatch};
 
     use super::*;
+
+    #[derive(Default)]
+    struct MatchTotalSink {
+        matched: usize,
+        total: Option<u64>,
+        stop_on_binary: bool,
+    }
+
+    impl Sink for MatchTotalSink {
+        type Error = io::Error;
+
+        fn matched(
+            &mut self,
+            _searcher: &Searcher,
+            _mat: &SinkMatch<'_>,
+        ) -> Result<bool, Self::Error> {
+            self.matched += 1;
+            Ok(true)
+        }
+
+        fn selected_match_total(
+            &mut self,
+            _searcher: &Searcher,
+            total: u64,
+        ) -> Result<(), Self::Error> {
+            self.total = Some(total);
+            Ok(())
+        }
+
+        fn binary_data(
+            &mut self,
+            _searcher: &Searcher,
+            _binary_byte_offset: u64,
+        ) -> Result<bool, Self::Error> {
+            Ok(!self.stop_on_binary)
+        }
+    }
+
+    struct BeginFalseSink;
+
+    impl Sink for BeginFalseSink {
+        type Error = io::Error;
+
+        fn begin(
+            &mut self,
+            _searcher: &Searcher,
+        ) -> Result<bool, Self::Error> {
+            Ok(false)
+        }
+
+        fn matched(
+            &mut self,
+            _searcher: &Searcher,
+            _mat: &SinkMatch<'_>,
+        ) -> Result<bool, Self::Error> {
+            unreachable!("begin=false must skip matching")
+        }
+    }
 
     #[test]
     fn config_error_heap_limit() {
@@ -1084,5 +1227,123 @@ mod tests {
 
         let sink_output = String::from_utf8(sink.as_bytes().to_vec()).unwrap();
         assert_eq!(sink_output, "1:0:foo\nbyte count:3\n");
+    }
+
+    #[test]
+    fn selected_match_total_reader_is_separate_and_authoritative() {
+        let mut sink = MatchTotalSink::default();
+        SearcherBuilder::new()
+            .heap_limit(Some(4))
+            .build()
+            .search_reader_selected_match_total(
+                |buf| {
+                    Ok::<u64, &'static str>(
+                        buf.iter().filter(|&&byte| byte == b'a').count()
+                            as u64,
+                    )
+                },
+                &b"a\nb\na\n"[..],
+                &mut sink,
+            )
+            .unwrap();
+        assert_eq!(sink.total, Some(2));
+        assert_eq!(sink.matched, 0);
+
+        let mut failed = MatchTotalSink::default();
+        let result = Searcher::new().search_reader_selected_match_total(
+            |_| Err::<u64, _>("authoritative count failure"),
+            &b"a\n"[..],
+            &mut failed,
+        );
+        assert!(result.is_err());
+        assert_eq!(failed.total, None);
+
+        for (haystack, total) in [(&b""[..], 0), (&b"a"[..], 1)] {
+            let mut boundary = MatchTotalSink::default();
+            Searcher::new()
+                .search_reader_selected_match_total(
+                    |buf| {
+                        Ok::<u64, &'static str>(
+                            buf.iter().filter(|&&byte| byte == b'a').count()
+                                as u64,
+                        )
+                    },
+                    haystack,
+                    &mut boundary,
+                )
+                .unwrap();
+            assert_eq!(boundary.total, Some(total));
+        }
+
+        let mut decoded = MatchTotalSink::default();
+        Searcher::new()
+            .search_reader_selected_match_total(
+                |buf| Ok::<u64, &'static str>(buf.len() as u64),
+                &b"\xFF\xFEa\0\n\0"[..],
+                &mut decoded,
+            )
+            .unwrap();
+        assert_eq!(decoded.total, Some(2));
+
+        let mut sink_stopped = MatchTotalSink {
+            stop_on_binary: true,
+            ..MatchTotalSink::default()
+        };
+        SearcherBuilder::new()
+            .binary_detection(BinaryDetection::convert(b'\0'))
+            .build()
+            .search_reader_selected_match_total(
+                |_| Ok::<u64, &'static str>(1),
+                &b"a\n\0\n"[..],
+                &mut sink_stopped,
+            )
+            .unwrap();
+        assert_eq!(sink_stopped.total, None);
+
+        let mut binary_stopped = MatchTotalSink::default();
+        SearcherBuilder::new()
+            .binary_detection(BinaryDetection::quit(b'\0'))
+            .build()
+            .search_reader_selected_match_total(
+                |_| Ok::<u64, &'static str>(1),
+                &b"a\n\0\n"[..],
+                &mut binary_stopped,
+            )
+            .unwrap();
+        assert_eq!(binary_stopped.total, None);
+
+        let mut counted = false;
+        Searcher::new()
+            .search_reader_selected_match_total(
+                |_| {
+                    counted = true;
+                    Ok::<u64, &'static str>(0)
+                },
+                &b"a\n"[..],
+                BeginFalseSink,
+            )
+            .unwrap();
+        assert!(!counted);
+    }
+
+    #[test]
+    fn selected_match_total_gates_mmap_and_stateful_modes() {
+        let plain = Searcher::new();
+        assert!(plain.supports_selected_match_total_reader());
+        assert!(plain.supports_selected_match_total_path());
+
+        let mut mmap_builder = SearcherBuilder::new();
+        mmap_builder.memory_map(unsafe { MmapChoice::auto() });
+        let mmap = mmap_builder.build();
+        assert!(mmap.supports_selected_match_total_reader());
+        assert_eq!(
+            mmap.supports_selected_match_total_path(),
+            cfg!(target_os = "macos"),
+        );
+
+        let limited = SearcherBuilder::new().max_matches(Some(1)).build();
+        assert!(!limited.supports_selected_match_total_reader());
+        let inverted = SearcherBuilder::new().invert_match(true).build();
+        assert!(!inverted.supports_selected_match_total_reader());
     }
 }

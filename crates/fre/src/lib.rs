@@ -202,6 +202,7 @@ impl RegexMatcherBuilder {
             line_terminator,
             non_matching_bytes,
             matches_are_nonempty,
+            exact_lf_match_count: false,
             selected_match_owner: SelectedMatchOwner::new(),
         })
     }
@@ -268,6 +269,8 @@ impl RegexMatcherBuilder {
                     line_terminator,
                     non_matching_bytes,
                     matches_are_nonempty: true,
+                    exact_lf_match_count: line_terminator
+                        == Some(LineTerminator::byte(b'\n')),
                     selected_match_owner: SelectedMatchOwner::new(),
                 });
             }
@@ -482,6 +485,7 @@ pub struct RegexMatcher {
     line_terminator: Option<LineTerminator>,
     non_matching_bytes: ByteSet,
     matches_are_nonempty: bool,
+    exact_lf_match_count: bool,
     selected_match_owner: SelectedMatchOwner,
 }
 
@@ -499,14 +503,29 @@ impl RegexMatcher {
     /// Construct independent mutable state for one ripgrep search worker.
     pub fn worker(&self) -> Result<RegexMatcherWorker<'_>, MatchError> {
         let session = self.regex.ordinary_session()?;
+        let exact_lf_match_count = self.exact_lf_match_count
+            && session.supports_literal_set_selected_end_count();
         Ok(RegexMatcherWorker {
             session: RefCell::new(session),
             line_terminator: self.line_terminator,
             non_matching_bytes: &self.non_matching_bytes,
             matches_are_nonempty: self.matches_are_nonempty,
+            exact_lf_match_count,
             selected_match_owner: self.selected_match_owner.clone(),
         })
     }
+}
+
+/// Construction receipt for exact positive LF-disjoint match counting.
+///
+/// This is emitted only for the typed ripgrep literal handoff after both
+/// grep-regex and FRE have authenticated the complete pattern set. The
+/// receipt contains no source and is valid across every input searched by
+/// the worker that produced it.
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug)]
+pub struct ExactLfMatchCountReceipt {
+    _private: (),
 }
 
 /// A thread-confined adapter retaining one FRE session across worker files.
@@ -516,6 +535,7 @@ pub struct RegexMatcherWorker<'r> {
     line_terminator: Option<LineTerminator>,
     non_matching_bytes: &'r ByteSet,
     matches_are_nonempty: bool,
+    exact_lf_match_count: bool,
     selected_match_owner: SelectedMatchOwner,
 }
 
@@ -525,6 +545,7 @@ pub enum MatchError {
     Search(SearchError),
     Iter(PortableFindIterError),
     Reentrant,
+    ExactLfMatchCountUnavailable,
 }
 
 impl fmt::Display for MatchError {
@@ -539,6 +560,9 @@ impl fmt::Display for MatchError {
             Self::Reentrant => {
                 formatter.write_str("reentrant use of one FRE worker session")
             }
+            Self::ExactLfMatchCountUnavailable => formatter.write_str(
+                "FRE exact LF match-count receipt was not available",
+            ),
         }
     }
 }
@@ -548,7 +572,7 @@ impl std::error::Error for MatchError {
         match self {
             Self::Search(error) => Some(error),
             Self::Iter(error) => Some(error),
-            Self::Reentrant => None,
+            Self::Reentrant | Self::ExactLfMatchCountUnavailable => None,
         }
     }
 }
@@ -709,6 +733,46 @@ impl Matcher for RegexMatcherWorker<'_> {
         Ok(self.find_at(haystack, 0)?.map(|matched| {
             (LineMatchKind::Confirmed(matched.end()), Some(matched))
         }))
+    }
+}
+
+impl RegexMatcherWorker<'_> {
+    /// Return a stable receipt for exact whole-buffer selected-match counts.
+    ///
+    /// The receipt proves that every selected match is positive-width, no
+    /// match can consume LF, and the retained ordinary session has a direct
+    /// selected-end count implementation.
+    #[doc(hidden)]
+    #[inline]
+    pub fn exact_lf_match_count_receipt(
+        &self,
+    ) -> Option<ExactLfMatchCountReceipt> {
+        self.exact_lf_match_count
+            .then_some(ExactLfMatchCountReceipt { _private: () })
+    }
+
+    /// Count selected matches in one LF-bounded stable buffer.
+    ///
+    /// A receipt from an ineligible worker is rejected before inspecting the
+    /// buffer. Once counting starts, every error is authoritative.
+    #[doc(hidden)]
+    #[inline]
+    pub fn count_exact_lf_matches(
+        &self,
+        _receipt: ExactLfMatchCountReceipt,
+        haystack: &[u8],
+    ) -> Result<u64, MatchError> {
+        if !self.exact_lf_match_count {
+            return Err(MatchError::ExactLfMatchCountUnavailable);
+        }
+        let mut session = self
+            .session
+            .try_borrow_mut()
+            .map_err(|_| MatchError::Reentrant)?;
+        session
+            .count_positive_width_selected_ends_at(haystack, 0)
+            .map_err(MatchError::from)?
+            .ok_or(MatchError::ExactLfMatchCountUnavailable)
     }
 }
 
@@ -1854,6 +1918,14 @@ mod tests {
                 .expect("small reference span iteration runs")
                 .expect("small reference visitor completes");
             assert_eq!(actual, expected, "count={count}");
+            let receipt = worker
+                .exact_lf_match_count_receipt()
+                .expect("small typed count receipt");
+            assert_eq!(
+                worker.count_exact_lf_matches(receipt, &haystack).unwrap(),
+                u64::try_from(expected.len()).unwrap(),
+                "count={count}",
+            );
         }
     }
 
@@ -1930,6 +2002,13 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(actual, expected);
+        let receipt = worker
+            .exact_lf_match_count_receipt()
+            .expect("wide compact count receipt");
+        assert_eq!(
+            worker.count_exact_lf_matches(receipt, &haystack).unwrap(),
+            u64::try_from(expected.len()).unwrap(),
+        );
         assert_eq!(
             count_matches_with(&worker, &worker, &haystack),
             count_matches_with(&reference, &reference, &haystack),
@@ -2014,6 +2093,13 @@ mod tests {
         let worker = matcher.worker().unwrap();
         assert!(worker.is_match(b"abcdefgh").unwrap());
         assert!(!worker.is_match(b"ZZZZZZZZ").unwrap());
+        let receipt = worker
+            .exact_lf_match_count_receipt()
+            .expect("heap-snapshot count receipt");
+        assert_eq!(
+            worker.count_exact_lf_matches(receipt, b"abcdefgh").unwrap(),
+            1,
+        );
         let non_matching = worker.non_matching_bytes().unwrap();
         assert!(!non_matching.contains(b'a'));
         assert!(non_matching.contains(b'Z'));
@@ -2901,6 +2987,43 @@ mod tests {
         let searcher = SearcherBuilder::new().multi_line(true).build();
 
         assert!(!searcher.multi_line_with_matcher(&worker));
+    }
+
+    #[test]
+    fn exact_lf_match_count_receipt_is_tied_to_typed_handoff() {
+        let mut builder = RegexMatcherBuilder::new();
+        builder.multi_line(true);
+        let factory =
+            builder.build_many(&["aba", "ba"]).expect("typed literal matcher");
+        let worker = factory.worker().expect("typed literal worker");
+        let receipt = worker
+            .exact_lf_match_count_receipt()
+            .expect("typed handoff receipt");
+        assert_eq!(
+            worker.count_exact_lf_matches(receipt, b"ababa\nba\n").unwrap(),
+            3,
+        );
+
+        let single = builder.build("aba").expect("single literal matcher");
+        assert!(
+            single.worker().unwrap().exact_lf_match_count_receipt().is_none()
+        );
+        builder.case_insensitive(true);
+        let folded = builder
+            .build_many(&["aba", "ba"])
+            .expect("folded fallback matcher");
+        assert!(
+            folded.worker().unwrap().exact_lf_match_count_receipt().is_none()
+        );
+
+        let mut nul = RegexMatcherBuilder::new();
+        nul.multi_line(true).line_terminator(Some(b'\0'));
+        let nul = nul
+            .build_many(&["aba", "ba"])
+            .expect("NUL-delimited typed literal matcher");
+        assert!(
+            nul.worker().unwrap().exact_lf_match_count_receipt().is_none()
+        );
     }
 
     #[test]

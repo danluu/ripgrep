@@ -469,6 +469,16 @@ impl<W> Summary<W> {
     pub fn into_inner(self) -> W {
         self.wtr.into_inner().into_inner()
     }
+
+    /// Whether this printer can consume an authoritative selected-match total.
+    ///
+    /// This internal opt-in excludes explicitly requested statistics. Public
+    /// CountMatches sinks retain their established implicit statistics unless
+    /// a specialized search reports an exact total at finish.
+    #[doc(hidden)]
+    pub fn accepts_selected_match_total(&self) -> bool {
+        self.config.kind == SummaryKind::CountMatches && !self.config.stats
+    }
 }
 
 /// An implementation of `Sink` associated with a matcher and an optional file
@@ -858,11 +868,11 @@ impl<'p, 's, M: Matcher, W: WriteColor> Sink for SummarySink<'p, 's, M, W> {
             SummaryKind::CountMatches => {
                 if show_count {
                     self.write_path_field()?;
-                    let stats = self
+                    let count = self
                         .stats
                         .as_ref()
-                        .expect("CountMatches should enable stats tracking");
-                    self.write(stats.matches().to_string().as_bytes())?;
+                        .map_or(self.match_count, Stats::matches);
+                    self.write(count.to_string().as_bytes())?;
                     self.write_line_term(searcher)?;
                 }
             }
@@ -880,13 +890,28 @@ impl<'p, 's, M: Matcher, W: WriteColor> Sink for SummarySink<'p, 's, M, W> {
         }
         Ok(())
     }
+
+    fn selected_match_total(
+        &mut self,
+        _searcher: &Searcher,
+        total: u64,
+    ) -> Result<(), io::Error> {
+        if !self.summary.accepts_selected_match_total() {
+            return Err(io::Error::error_message(
+                "summary printer rejected an authoritative match total",
+            ));
+        }
+        self.match_count = total;
+        self.stats = None;
+        Ok(())
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use grep_matcher::LineTerminator;
     use grep_regex::{RegexMatcher, RegexMatcherBuilder};
-    use grep_searcher::{Searcher, SearcherBuilder};
+    use grep_searcher::{BinaryDetection, Searcher, SearcherBuilder};
     use termcolor::NoColor;
 
     use super::{Summary, SummaryBuilder, SummaryKind};
@@ -1179,6 +1204,78 @@ and exhibited clearly, with a label attached.
 
         let got = printer_contents(&mut printer);
         assert_eq_printed!("sherlock:4\n", got);
+    }
+
+    #[test]
+    fn count_matches_accepts_only_authoritative_implicit_total() {
+        fn count_a(buf: &[u8]) -> Result<u64, &'static str> {
+            Ok(buf.iter().filter(|&&byte| byte == b'a').count() as u64)
+        }
+
+        fn run(
+            matcher: &RegexMatcher,
+            mut searcher: Searcher,
+            haystack: &[u8],
+            path: bool,
+            count: fn(&[u8]) -> Result<u64, &'static str>,
+        ) -> (String, bool, Option<u64>, bool) {
+            let mut printer = SummaryBuilder::new()
+                .kind(SummaryKind::CountMatches)
+                .build_no_color(vec![]);
+            let state = {
+                let mut sink = if path {
+                    printer.sink_with_path(matcher, "fixture")
+                } else {
+                    printer.sink(matcher)
+                };
+                searcher
+                    .search_reader_selected_match_total(
+                        count, haystack, &mut sink,
+                    )
+                    .unwrap();
+                (
+                    sink.has_match(),
+                    sink.binary_byte_offset(),
+                    sink.stats().is_none(),
+                )
+            };
+            let output = printer_contents(&mut printer);
+            (output, state.0, state.1, state.2)
+        }
+
+        let matcher = RegexMatcher::new("a").unwrap();
+        let printer = SummaryBuilder::new()
+            .kind(SummaryKind::CountMatches)
+            .build_no_color(vec![]);
+        assert!(printer.accepts_selected_match_total());
+        assert_eq!(
+            run(&matcher, Searcher::new(), b"aa\nb\na\n", true, count_a),
+            ("fixture:3\n".to_owned(), true, None, true),
+        );
+
+        let binary = SearcherBuilder::new()
+            .heap_limit(Some(4))
+            .binary_detection(BinaryDetection::quit(b'\0'))
+            .build();
+        assert_eq!(
+            run(&matcher, binary, b"a\na\n\0\n", false, count_a),
+            (String::new(), false, Some(4), false),
+        );
+
+        let converted = SearcherBuilder::new()
+            .binary_detection(BinaryDetection::convert(b'\0'))
+            .build();
+        assert_eq!(
+            run(&matcher, converted, b"a\0a\n", false, |buf| {
+                Ok(buf.iter().filter(|&&byte| byte == b'\n').count() as u64)
+            },),
+            ("2\n".to_owned(), true, Some(1), true),
+        );
+
+        let mut explicit_builder = SummaryBuilder::new();
+        explicit_builder.kind(SummaryKind::CountMatches).stats(true);
+        let explicit = explicit_builder.build_no_color(vec![]);
+        assert!(!explicit.accepts_selected_match_total());
     }
 
     #[test]
