@@ -264,13 +264,15 @@ impl RegexMatcherBuilder {
                         non_matching_bytes.remove(byte);
                     }
                 }
+                let exact_lf_match_count = line_terminator
+                    == Some(LineTerminator::byte(b'\n'))
+                    && non_matching_bytes.contains(b'\n');
                 return Ok(RegexMatcher {
                     regex: Arc::new(program),
                     line_terminator,
                     non_matching_bytes,
                     matches_are_nonempty: true,
-                    exact_lf_match_count: line_terminator
-                        == Some(LineTerminator::byte(b'\n')),
+                    exact_lf_match_count,
                     selected_match_owner: SelectedMatchOwner::new(),
                 });
             }
@@ -505,12 +507,15 @@ impl RegexMatcher {
         let session = self.regex.ordinary_session()?;
         let exact_lf_match_count = self.exact_lf_match_count
             && session.supports_literal_set_selected_end_count();
+        let exact_lf_matching_line_count = self.exact_lf_match_count
+            && session.supports_compact_matching_lf_line_count();
         Ok(RegexMatcherWorker {
             session: RefCell::new(session),
             line_terminator: self.line_terminator,
             non_matching_bytes: &self.non_matching_bytes,
             matches_are_nonempty: self.matches_are_nonempty,
             exact_lf_match_count,
+            exact_lf_matching_line_count,
             selected_match_owner: self.selected_match_owner.clone(),
         })
     }
@@ -528,6 +533,13 @@ pub struct ExactLfMatchCountReceipt {
     _private: (),
 }
 
+/// Construction receipt for exact LF-delimited matching-line counts.
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug)]
+pub struct ExactLfMatchingLineCountReceipt {
+    _private: (),
+}
+
 /// A thread-confined adapter retaining one FRE session across worker files.
 #[derive(Debug)]
 pub struct RegexMatcherWorker<'r> {
@@ -536,6 +548,7 @@ pub struct RegexMatcherWorker<'r> {
     non_matching_bytes: &'r ByteSet,
     matches_are_nonempty: bool,
     exact_lf_match_count: bool,
+    exact_lf_matching_line_count: bool,
     selected_match_owner: SelectedMatchOwner,
 }
 
@@ -546,6 +559,7 @@ pub enum MatchError {
     Iter(PortableFindIterError),
     Reentrant,
     ExactLfMatchCountUnavailable,
+    ExactLfMatchingLineCountUnavailable,
 }
 
 impl fmt::Display for MatchError {
@@ -563,6 +577,9 @@ impl fmt::Display for MatchError {
             Self::ExactLfMatchCountUnavailable => formatter.write_str(
                 "FRE exact LF match-count receipt was not available",
             ),
+            Self::ExactLfMatchingLineCountUnavailable => formatter.write_str(
+                "FRE exact LF matching-line count receipt was not available",
+            ),
         }
     }
 }
@@ -572,7 +589,9 @@ impl std::error::Error for MatchError {
         match self {
             Self::Search(error) => Some(error),
             Self::Iter(error) => Some(error),
-            Self::Reentrant | Self::ExactLfMatchCountUnavailable => None,
+            Self::Reentrant
+            | Self::ExactLfMatchCountUnavailable
+            | Self::ExactLfMatchingLineCountUnavailable => None,
         }
     }
 }
@@ -773,6 +792,37 @@ impl RegexMatcherWorker<'_> {
             .count_positive_width_selected_ends_at(haystack, 0)
             .map_err(MatchError::from)?
             .ok_or(MatchError::ExactLfMatchCountUnavailable)
+    }
+
+    /// Return a stable receipt for exact LF-delimited matching-line counts.
+    #[doc(hidden)]
+    #[inline]
+    pub fn exact_lf_matching_line_count_receipt(
+        &self,
+    ) -> Option<ExactLfMatchingLineCountReceipt> {
+        self.exact_lf_matching_line_count
+            .then_some(ExactLfMatchingLineCountReceipt { _private: () })
+    }
+
+    /// Count LF-delimited lines containing at least one selected match.
+    #[doc(hidden)]
+    #[inline]
+    pub fn count_exact_lf_matching_lines(
+        &self,
+        _receipt: ExactLfMatchingLineCountReceipt,
+        haystack: &[u8],
+    ) -> Result<u64, MatchError> {
+        if !self.exact_lf_matching_line_count {
+            return Err(MatchError::ExactLfMatchingLineCountUnavailable);
+        }
+        let mut session = self
+            .session
+            .try_borrow_mut()
+            .map_err(|_| MatchError::Reentrant)?;
+        session
+            .count_matching_lf_lines(haystack, true)
+            .map_err(MatchError::from)?
+            .ok_or(MatchError::ExactLfMatchingLineCountUnavailable)
     }
 }
 
@@ -2009,6 +2059,22 @@ mod tests {
             worker.count_exact_lf_matches(receipt, &haystack).unwrap(),
             u64::try_from(expected.len()).unwrap(),
         );
+        let line_receipt = worker
+            .exact_lf_matching_line_count_receipt()
+            .expect("wide compact matching-line receipt");
+        let line_haystack = format!(
+            "absent\n{}{}\n\n{}\n{}",
+            patterns[7], patterns[255], patterns[19], patterns[91],
+        );
+        assert_eq!(
+            worker
+                .count_exact_lf_matching_lines(
+                    line_receipt,
+                    line_haystack.as_bytes(),
+                )
+                .unwrap(),
+            3,
+        );
         assert_eq!(
             count_matches_with(&worker, &worker, &haystack),
             count_matches_with(&reference, &reference, &haystack),
@@ -2999,6 +3065,7 @@ mod tests {
         let receipt = worker
             .exact_lf_match_count_receipt()
             .expect("typed handoff receipt");
+        assert!(worker.exact_lf_matching_line_count_receipt().is_none());
         assert_eq!(
             worker.count_exact_lf_matches(receipt, b"ababa\nba\n").unwrap(),
             3,

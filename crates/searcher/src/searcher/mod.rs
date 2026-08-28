@@ -1056,19 +1056,8 @@ impl Searcher {
             ));
         }
 
-        let mut decode_buffer = self.decode_buffer.borrow_mut();
-        let decoder = self
-            .decode_builder
-            .build_with_buffer(read_from, &mut *decode_buffer)
-            .map_err(S::Error::error_io)?;
-        let mut line_buffer = self.line_buffer.borrow_mut();
-        let rdr = LineBufferReader::new(decoder, &mut *line_buffer);
-        log::trace!(
-            "generic reader: counting selected matches via roll buffer strategy"
-        );
         let mut count = count;
-        ReadByLineAggregate::new(
-            self,
+        self.search_reader_aggregate(
             0_u64,
             move |total: &mut u64, buf: &[u8]| {
                 let count = count(buf).map_err(S::Error::error_message)?;
@@ -1079,12 +1068,78 @@ impl Searcher {
                 })?;
                 Ok(())
             },
-            rdr,
+            read_from,
             write_to,
+            |sink, searcher, total| sink.selected_match_total(searcher, total),
         )
-        .run(|sink, searcher, total| {
-            sink.selected_match_total(searcher, total)
-        })
+    }
+
+    /// Count matching lines in each stable LF-bounded reader buffer.
+    ///
+    /// The callback must come from a construction receipt proving positive
+    /// width, LF exclusion and exact matching-line reduction. Once counting
+    /// begins, every error is authoritative.
+    #[doc(hidden)]
+    pub fn search_reader_matching_line_total<C, E, R, S>(
+        &mut self,
+        count: C,
+        read_from: R,
+        write_to: S,
+    ) -> Result<(), S::Error>
+    where
+        C: FnMut(&[u8]) -> Result<u64, E>,
+        E: std::fmt::Display,
+        R: io::Read,
+        S: Sink,
+    {
+        if !self.supports_selected_match_total_reader() {
+            return Err(S::Error::error_message(
+                "search configuration does not support matching-line totals",
+            ));
+        }
+
+        let mut count = count;
+        self.search_reader_aggregate(
+            0_u64,
+            move |total: &mut u64, buf: &[u8]| {
+                let count = count(buf).map_err(S::Error::error_message)?;
+                *total = total.checked_add(count).ok_or_else(|| {
+                    S::Error::error_message(
+                        "matching-line total overflowed while reading",
+                    )
+                })?;
+                Ok(())
+            },
+            read_from,
+            write_to,
+            |sink, searcher, total| sink.matching_line_total(searcher, total),
+        )
+    }
+
+    fn search_reader_aggregate<A, C, F, R, S>(
+        &mut self,
+        aggregate: A,
+        reduce: C,
+        read_from: R,
+        write_to: S,
+        finish: F,
+    ) -> Result<(), S::Error>
+    where
+        C: FnMut(&mut A, &[u8]) -> Result<(), S::Error>,
+        F: FnOnce(&mut S, &Searcher, A) -> Result<(), S::Error>,
+        R: io::Read,
+        S: Sink,
+    {
+        let mut decode_buffer = self.decode_buffer.borrow_mut();
+        let decoder = self
+            .decode_builder
+            .build_with_buffer(read_from, &mut *decode_buffer)
+            .map_err(S::Error::error_io)?;
+        let mut line_buffer = self.line_buffer.borrow_mut();
+        let rdr = LineBufferReader::new(decoder, &mut *line_buffer);
+        log::trace!("generic reader: reducing via roll buffer strategy");
+        ReadByLineAggregate::new(self, aggregate, reduce, rdr, write_to)
+            .run(finish)
     }
 
     /// Whether this configuration admits authenticated reader match totals.
@@ -1138,6 +1193,7 @@ mod tests {
     struct MatchTotalSink {
         matched: usize,
         total: Option<u64>,
+        matching_lines: Option<u64>,
         stop_on_binary: bool,
     }
 
@@ -1159,6 +1215,15 @@ mod tests {
             total: u64,
         ) -> Result<(), Self::Error> {
             self.total = Some(total);
+            Ok(())
+        }
+
+        fn matching_line_total(
+            &mut self,
+            _searcher: &Searcher,
+            total: u64,
+        ) -> Result<(), Self::Error> {
+            self.matching_lines = Some(total);
             Ok(())
         }
 
@@ -1248,6 +1313,25 @@ mod tests {
             .unwrap();
         assert_eq!(sink.total, Some(2));
         assert_eq!(sink.matched, 0);
+
+        let mut lines = MatchTotalSink::default();
+        SearcherBuilder::new()
+            .heap_limit(Some(4))
+            .build()
+            .search_reader_matching_line_total(
+                |buf| {
+                    Ok::<u64, &'static str>(
+                        buf.split_inclusive(|&byte| byte == b'\n')
+                            .filter(|line| line.contains(&b'a'))
+                            .count() as u64,
+                    )
+                },
+                &b"a a\nb\na"[..],
+                &mut lines,
+            )
+            .unwrap();
+        assert_eq!(lines.matching_lines, Some(2));
+        assert_eq!(lines.matched, 0);
 
         let mut failed = MatchTotalSink::default();
         let result = Searcher::new().search_reader_selected_match_total(

@@ -555,6 +555,29 @@ mod tests {
     }
 
     #[cfg(feature = "fre")]
+    fn fre_count_lines(
+        matcher: &grep::fre::RegexMatcherWorker<'_>,
+        mut searcher: grep::searcher::Searcher,
+        stats: bool,
+        haystack: &[u8],
+    ) -> (super::SearchResult, String) {
+        let mut builder = grep::printer::SummaryBuilder::new();
+        builder.kind(grep::printer::SummaryKind::Count).stats(stats);
+        let mut printer = Printer::Summary(builder.build_no_color(vec![]));
+        let result = search_reader_fre(
+            matcher,
+            &mut searcher,
+            &mut printer,
+            std::path::Path::new("fixture"),
+            haystack,
+        )
+        .unwrap();
+        let output =
+            String::from_utf8(printer.get_mut().get_ref().clone()).unwrap();
+        (result, output)
+    }
+
+    #[cfg(feature = "fre")]
     #[test]
     fn fre_count_matches_routes_only_authenticated_stateless_totals() {
         let mut builder = grep::fre::RegexMatcherBuilder::new();
@@ -590,6 +613,149 @@ mod tests {
             fre_count_matches(&matcher, limited_searcher, false, haystack);
         assert!(limited.stats().is_some());
         assert_eq!(output, "fixture:2\n");
+    }
+
+    #[cfg(feature = "fre")]
+    #[test]
+    fn fre_count_routes_only_authenticated_matching_line_totals() {
+        let patterns = (0..256)
+            .map(|index| {
+                let prefix = format!("public{index:04}");
+                let mut pattern = prefix;
+                pattern.extend(core::iter::repeat_n('q', 256 - pattern.len()));
+                pattern
+            })
+            .collect::<Vec<_>>();
+        let mut builder = grep::fre::RegexMatcherBuilder::new();
+        builder.multi_line(true);
+        let factory = builder
+            .build_many(&patterns)
+            .expect("typed compact FRE literal matcher");
+        let matcher = factory.worker().expect("FRE worker");
+        assert!(matcher.exact_lf_matching_line_count_receipt().is_some());
+        let haystack = format!(
+            "miss\n{}{}\n\n{}\n{}",
+            patterns[7], patterns[255], patterns[19], patterns[91],
+        );
+
+        let (aggregate, output) = fre_count_lines(
+            &matcher,
+            grep::searcher::Searcher::new(),
+            false,
+            haystack.as_bytes(),
+        );
+        assert!(aggregate.has_match());
+        assert!(aggregate.stats().is_none());
+        assert_eq!(output, "fixture:3\n");
+
+        let (explicit, output) = fre_count_lines(
+            &matcher,
+            grep::searcher::Searcher::new(),
+            true,
+            haystack.as_bytes(),
+        );
+        assert!(explicit.stats().is_some());
+        assert_eq!(output, "fixture:3\n");
+
+        let limited = grep::searcher::SearcherBuilder::new()
+            .max_matches(Some(1))
+            .build();
+        let (_, output) =
+            fre_count_lines(&matcher, limited, false, haystack.as_bytes());
+        assert_eq!(output, "fixture:1\n");
+
+        let inverted =
+            grep::searcher::SearcherBuilder::new().invert_match(true).build();
+        assert!(!inverted.supports_selected_match_total_reader());
+        let (_, output) =
+            fre_count_lines(&matcher, inverted, false, haystack.as_bytes());
+        assert_eq!(output, "fixture:2\n");
+
+        let context =
+            grep::searcher::SearcherBuilder::new().before_context(1).build();
+        assert!(!context.supports_selected_match_total_reader());
+        let (_, output) =
+            fre_count_lines(&matcher, context, false, haystack.as_bytes());
+        assert_eq!(output, "fixture:3\n");
+
+        let mut utf16le = vec![0xFF, 0xFE];
+        for unit in haystack.encode_utf16() {
+            utf16le.extend_from_slice(&unit.to_le_bytes());
+        }
+        let (_, output) = fre_count_lines(
+            &matcher,
+            grep::searcher::Searcher::new(),
+            false,
+            &utf16le,
+        );
+        assert_eq!(output, "fixture:3\n");
+
+        let converted = grep::searcher::SearcherBuilder::new()
+            .binary_detection(grep::searcher::BinaryDetection::convert(b'\0'))
+            .build();
+        let converted_haystack =
+            format!("{}\0{}\n", patterns[7], patterns[19]);
+        let (_, output) = fre_count_lines(
+            &matcher,
+            converted,
+            false,
+            converted_haystack.as_bytes(),
+        );
+        assert_eq!(output, "fixture:2\n");
+
+        let quit = grep::searcher::SearcherBuilder::new()
+            .binary_detection(grep::searcher::BinaryDetection::quit(b'\0'))
+            .build();
+        let quit_haystack =
+            format!("{}\nmiss\0{}\n", patterns[7], patterns[19]);
+        let (quit_result, output) =
+            fre_count_lines(&matcher, quit, false, quit_haystack.as_bytes());
+        assert!(!quit_result.has_match());
+        assert_eq!(output, "");
+
+        let mut crlf_builder = grep::fre::RegexMatcherBuilder::new();
+        crlf_builder.multi_line(true).crlf(true);
+        let crlf_factory = crlf_builder
+            .build_many(&patterns)
+            .expect("typed CRLF FRE literal matcher");
+        let crlf_matcher = crlf_factory.worker().expect("CRLF FRE worker");
+        assert!(crlf_matcher.exact_lf_matching_line_count_receipt().is_none());
+        let crlf_searcher = grep::searcher::SearcherBuilder::new()
+            .line_terminator(grep::matcher::LineTerminator::crlf())
+            .build();
+        let crlf_haystack = format!(
+            "miss\r\n{}{}\r\n\r\n{}\r\n{}",
+            patterns[7], patterns[255], patterns[19], patterns[91],
+        );
+        let (_, output) = fre_count_lines(
+            &crlf_matcher,
+            crlf_searcher,
+            false,
+            crlf_haystack.as_bytes(),
+        );
+        assert_eq!(output, "fixture:3\r\n");
+
+        let mut nul_builder = grep::fre::RegexMatcherBuilder::new();
+        nul_builder.multi_line(true).line_terminator(Some(b'\0'));
+        let nul_factory = nul_builder
+            .build_many(&patterns)
+            .expect("typed NUL-delimited FRE literal matcher");
+        let nul_matcher = nul_factory.worker().expect("NUL FRE worker");
+        assert!(nul_matcher.exact_lf_matching_line_count_receipt().is_none());
+        let nul_searcher = grep::searcher::SearcherBuilder::new()
+            .line_terminator(grep::matcher::LineTerminator::byte(b'\0'))
+            .build();
+        let nul_haystack = format!(
+            "miss\0{}{}\0\0{}\0{}",
+            patterns[7], patterns[255], patterns[19], patterns[91],
+        );
+        let (_, output) = fre_count_lines(
+            &nul_matcher,
+            nul_searcher,
+            false,
+            nul_haystack.as_bytes(),
+        );
+        assert_eq!(output, "fixture:3\0");
     }
 }
 
@@ -694,6 +860,22 @@ fn search_path_fre<W: WriteColor>(
     path: &Path,
 ) -> io::Result<SearchResult> {
     if let Printer::Summary(ref mut p) = *printer {
+        if p.accepts_matching_line_total()
+            && let Some(receipt) =
+                matcher.exact_lf_matching_line_count_receipt()
+            && searcher.supports_selected_match_total_path()
+        {
+            let mut sink = p.sink_with_path(matcher, path);
+            searcher.search_reader_matching_line_total(
+                |buf| matcher.count_exact_lf_matching_lines(receipt, buf),
+                std::fs::File::open(path)?,
+                &mut sink,
+            )?;
+            return Ok(SearchResult {
+                has_match: sink.has_match(),
+                stats: sink.stats().cloned(),
+            });
+        }
         if p.accepts_selected_match_total()
             && let Some(receipt) = matcher.exact_lf_match_count_receipt()
             && searcher.supports_selected_match_total_path()
@@ -722,6 +904,22 @@ fn search_reader_fre<R: io::Read, W: WriteColor>(
     mut rdr: R,
 ) -> io::Result<SearchResult> {
     if let Printer::Summary(ref mut p) = *printer {
+        if p.accepts_matching_line_total()
+            && let Some(receipt) =
+                matcher.exact_lf_matching_line_count_receipt()
+            && searcher.supports_selected_match_total_reader()
+        {
+            let mut sink = p.sink_with_path(matcher, path);
+            searcher.search_reader_matching_line_total(
+                |buf| matcher.count_exact_lf_matching_lines(receipt, buf),
+                &mut rdr,
+                &mut sink,
+            )?;
+            return Ok(SearchResult {
+                has_match: sink.has_match(),
+                stats: sink.stats().cloned(),
+            });
+        }
         if p.accepts_selected_match_total()
             && let Some(receipt) = matcher.exact_lf_match_count_receipt()
             && searcher.supports_selected_match_total_reader()

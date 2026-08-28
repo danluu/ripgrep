@@ -479,6 +479,12 @@ impl<W> Summary<W> {
     pub fn accepts_selected_match_total(&self) -> bool {
         self.config.kind == SummaryKind::CountMatches && !self.config.stats
     }
+
+    /// Whether this printer can consume an authoritative matching-line total.
+    #[doc(hidden)]
+    pub fn accepts_matching_line_total(&self) -> bool {
+        self.config.kind == SummaryKind::Count && !self.config.stats
+    }
 }
 
 /// An implementation of `Sink` associated with a matcher and an optional file
@@ -899,6 +905,21 @@ impl<'p, 's, M: Matcher, W: WriteColor> Sink for SummarySink<'p, 's, M, W> {
         if !self.summary.accepts_selected_match_total() {
             return Err(io::Error::error_message(
                 "summary printer rejected an authoritative match total",
+            ));
+        }
+        self.match_count = total;
+        self.stats = None;
+        Ok(())
+    }
+
+    fn matching_line_total(
+        &mut self,
+        _searcher: &Searcher,
+        total: u64,
+    ) -> Result<(), io::Error> {
+        if !self.summary.accepts_matching_line_total() {
+            return Err(io::Error::error_message(
+                "summary printer rejected an authoritative matching-line total",
             ));
         }
         self.match_count = total;

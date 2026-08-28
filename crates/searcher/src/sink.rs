@@ -248,6 +248,19 @@ pub trait Sink {
             "sink does not accept selected-match totals",
         ))
     }
+
+    /// Accept an authoritative matching-line total from a specialized search.
+    #[doc(hidden)]
+    #[inline]
+    fn matching_line_total(
+        &mut self,
+        _searcher: &Searcher,
+        _total: u64,
+    ) -> Result<(), Self::Error> {
+        Err(Self::Error::error_message(
+            "sink does not accept matching-line totals",
+        ))
+    }
 }
 
 impl<'a, S: Sink> Sink for &'a mut S {
@@ -315,6 +328,15 @@ impl<'a, S: Sink> Sink for &'a mut S {
     ) -> Result<(), S::Error> {
         (**self).selected_match_total(searcher, total)
     }
+
+    #[inline]
+    fn matching_line_total(
+        &mut self,
+        searcher: &Searcher,
+        total: u64,
+    ) -> Result<(), S::Error> {
+        (**self).matching_line_total(searcher, total)
+    }
 }
 
 impl<S: Sink + ?Sized> Sink for Box<S> {
@@ -381,6 +403,15 @@ impl<S: Sink + ?Sized> Sink for Box<S> {
         total: u64,
     ) -> Result<(), S::Error> {
         (**self).selected_match_total(searcher, total)
+    }
+
+    #[inline]
+    fn matching_line_total(
+        &mut self,
+        searcher: &Searcher,
+        total: u64,
+    ) -> Result<(), S::Error> {
+        (**self).matching_line_total(searcher, total)
     }
 }
 
