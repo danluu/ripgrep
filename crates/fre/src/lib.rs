@@ -3130,7 +3130,7 @@ mod tests {
     }
 
     #[test]
-    fn exact_lf_matching_line_receipt_covers_packed_and_dfa_literal_sets() {
+    fn exact_lf_matching_line_receipt_admits_packed_and_declines_dfas() {
         fn assert_count(factory: &RegexMatcher, haystack: &[u8], expected: u64) {
             let worker = factory.worker().expect("ordinary FRE worker");
             let receipt = worker
@@ -3166,10 +3166,13 @@ mod tests {
             .build_many(&uniform_patterns)
             .expect("uniform DFA typed literal matcher");
         assert_eq!(uniform.regex.build_report().plan, PlanKind::LiteralSetDfa);
-        assert_count(
-            &uniform,
-            b"p000p001\nmiss\n\np128\np042",
-            3,
+        assert!(
+            uniform
+                .worker()
+                .unwrap()
+                .exact_lf_matching_line_count_receipt()
+                .is_none(),
+            "the uniform DFA keeps its established per-line route",
         );
 
         let mut nonuniform_patterns = uniform_patterns;
@@ -3181,10 +3184,13 @@ mod tests {
             nonuniform.regex.build_report().plan,
             PlanKind::LiteralSetDfa,
         );
-        assert_count(
-            &nonuniform,
-            b"p000p001\nmiss\n\np128x\np042",
-            3,
+        assert!(
+            nonuniform
+                .worker()
+                .unwrap()
+                .exact_lf_matching_line_count_receipt()
+                .is_none(),
+            "the nonuniform DFA keeps its established per-line route",
         );
     }
 
