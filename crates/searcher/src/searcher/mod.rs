@@ -7,6 +7,7 @@ use std::{
 };
 
 use {
+    bstr::ByteSlice,
     encoding_rs_io::DecodeReaderBytesBuilder,
     grep_matcher::{LineTerminator, Match, Matcher},
 };
@@ -17,7 +18,8 @@ use crate::{
         LineBufferBuilder, LineBufferReader, alloc_error,
     },
     searcher::glue::{
-        MultiLine, ReadByLine, ReadByLineAggregate, SliceByLine,
+        MultiLine, ReadByLine, ReadByLineAggregate, SliceAggregate,
+        SliceByLine,
     },
     sink::{Sink, SinkError},
 };
@@ -32,6 +34,111 @@ mod mmap;
 /// type, but in practice, we use it for arbitrary ranges, so give it a more
 /// accurate name. This is only used in the searcher's internals.
 type Range = Match;
+
+/// The outcome of an authenticated aggregate search over a file path.
+///
+/// `None` from [`SearchPathTotalOutcome::canonical_bytes`] means the aggregate
+/// search completed; the caller must not run an ordinary continuation. `Some`
+/// means the search is incomplete, and neither the aggregate counter nor any
+/// [`Sink`] callback has run. The mapped bytes keep the opened file contents
+/// alive without reopening the path.
+///
+/// For `Some`, the caller must run exactly one canonical
+/// [`Searcher::search_slice`] continuation over those bytes, using the
+/// unchanged `Searcher`, the same receipt-bearing matcher from which the
+/// counter was constructed, and the same sink borrowed by the aggregate call.
+/// The continuation's result, including any error, is authoritative and must
+/// not be retried.
+#[doc(hidden)]
+#[must_use = "canonical mapped bytes must be searched when present"]
+pub struct SearchPathTotalOutcome(Option<memmap::Mmap>);
+
+impl SearchPathTotalOutcome {
+    /// Return bytes requiring a canonical slice search, when present.
+    ///
+    /// `None` means the aggregate search completed and must not be continued.
+    /// `Some` retains the memory map opened by the aggregate path search; no
+    /// aggregate-counter or sink callback has run. The caller must perform the
+    /// exactly-once canonical continuation described on this outcome type.
+    #[doc(hidden)]
+    pub fn canonical_bytes(&self) -> Option<&[u8]> {
+        self.0.as_deref()
+    }
+}
+
+type AggregateCount<'a, E> =
+    dyn FnMut(&[u8]) -> Result<u64, E> + 'a;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SliceTotalOutcome {
+    Completed,
+    Canonical,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AggregateTotalKind {
+    SelectedMatches,
+    MatchingLines,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AggregateTotalSource {
+    Path,
+    Reader,
+}
+
+impl AggregateTotalKind {
+    fn reduce<E: SinkError>(
+        self,
+        source: AggregateTotalSource,
+        count: &mut AggregateCount<'_, E>,
+        total: &mut u64,
+        buf: &[u8],
+    ) -> Result<(), E> {
+        let count = count(buf)?;
+        *total = total.checked_add(count).ok_or_else(|| {
+            E::error_message(self.overflow_message(source))
+        })?;
+        Ok(())
+    }
+
+    fn publish<E: SinkError>(
+        self,
+        sink: &mut dyn Sink<Error = E>,
+        searcher: &Searcher,
+        total: u64,
+    ) -> Result<(), E> {
+        match self {
+            AggregateTotalKind::SelectedMatches => {
+                sink.selected_match_total(searcher, total)
+            }
+            AggregateTotalKind::MatchingLines => {
+                sink.matching_line_total(searcher, total)
+            }
+        }
+    }
+
+    fn overflow_message(self, source: AggregateTotalSource) -> &'static str {
+        match (self, source) {
+            (
+                AggregateTotalKind::SelectedMatches,
+                AggregateTotalSource::Path,
+            ) => "selected-match total overflowed while searching a path",
+            (
+                AggregateTotalKind::MatchingLines,
+                AggregateTotalSource::Path,
+            ) => "matching-line total overflowed while searching a path",
+            (
+                AggregateTotalKind::SelectedMatches,
+                AggregateTotalSource::Reader,
+            ) => "selected-match total overflowed while reading",
+            (
+                AggregateTotalKind::MatchingLines,
+                AggregateTotalSource::Reader,
+            ) => "matching-line total overflowed while reading",
+        }
+    }
+}
 
 /// The behavior of binary detection while searching.
 ///
@@ -1031,6 +1138,200 @@ impl Searcher {
 }
 
 impl Searcher {
+    /// Count selected matches in a file using the searcher's ordinary path
+    /// ownership and memory-map choice.
+    ///
+    /// The callback must come from a construction receipt proving positive
+    /// width, LF exclusion and exact leftmost-first selected-end counting. A
+    /// mapped byte slice is reduced as one stable buffer. If mapping is
+    /// disabled, unavailable or unsuitable because the slice needs
+    /// transcoding, this retains the authenticated reader aggregate.
+    ///
+    /// On success, `None` from the outcome's `canonical_bytes` means this
+    /// aggregate search completed and must not be continued. `Some` means
+    /// neither `count` nor any callback on `write_to` ran. For `Some`, the
+    /// caller must run exactly one canonical `Searcher::search_slice` over the
+    /// returned bytes, using this unchanged `Searcher`, the same
+    /// receipt-bearing matcher that authorized `count`, and this same
+    /// `write_to` sink. Any error from either call is authoritative and must
+    /// be returned without retrying or falling back.
+    #[doc(hidden)]
+    pub fn search_path_selected_match_total<C, E, P, S>(
+        &mut self,
+        count: C,
+        path: P,
+        write_to: &mut S,
+    ) -> Result<SearchPathTotalOutcome, S::Error>
+    where
+        C: FnMut(&[u8]) -> Result<u64, E>,
+        E: std::fmt::Display,
+        P: AsRef<Path>,
+        S: Sink + ?Sized,
+    {
+        if !self.supports_selected_match_total_reader() {
+            return Err(S::Error::error_message(
+                "search configuration does not support path selected-match totals",
+            ));
+        }
+
+        let mut count = count;
+        let mut count = move |buf: &[u8]| {
+            count(buf).map_err(S::Error::error_message)
+        };
+        let path = path.as_ref();
+        // Reborrow to reuse the erased `&mut S` sink family used by reader
+        // totals while retaining the caller's sink for canonical continuation.
+        let mut write_to = write_to;
+        self.search_path_total(
+            AggregateTotalKind::SelectedMatches,
+            &mut count,
+            path,
+            &mut write_to,
+        )
+    }
+
+    /// Count matching lines in a file using the searcher's ordinary path
+    /// ownership and memory-map choice.
+    ///
+    /// The callback must come from a construction receipt proving positive
+    /// width, LF exclusion and exact matching-line reduction.
+    ///
+    /// On success, `None` from the outcome's `canonical_bytes` means this
+    /// aggregate search completed and must not be continued. `Some` means
+    /// neither `count` nor any callback on `write_to` ran. For `Some`, the
+    /// caller must run exactly one canonical `Searcher::search_slice` over the
+    /// returned bytes, using this unchanged `Searcher`, the same
+    /// receipt-bearing matcher that authorized `count`, and this same
+    /// `write_to` sink. Any error from either call is authoritative and must
+    /// be returned without retrying or falling back.
+    #[doc(hidden)]
+    pub fn search_path_matching_line_total<C, E, P, S>(
+        &mut self,
+        count: C,
+        path: P,
+        write_to: &mut S,
+    ) -> Result<SearchPathTotalOutcome, S::Error>
+    where
+        C: FnMut(&[u8]) -> Result<u64, E>,
+        E: std::fmt::Display,
+        P: AsRef<Path>,
+        S: Sink + ?Sized,
+    {
+        if !self.supports_selected_match_total_reader() {
+            return Err(S::Error::error_message(
+                "search configuration does not support path matching-line totals",
+            ));
+        }
+
+        let mut count = count;
+        let mut count = move |buf: &[u8]| {
+            count(buf).map_err(S::Error::error_message)
+        };
+        let path = path.as_ref();
+        // Reborrow to reuse the erased `&mut S` sink family used by reader
+        // totals while retaining the caller's sink for canonical continuation.
+        let mut write_to = write_to;
+        self.search_path_total(
+            AggregateTotalKind::MatchingLines,
+            &mut count,
+            path,
+            &mut write_to,
+        )
+    }
+
+    #[inline(never)]
+    fn search_path_total<E>(
+        &mut self,
+        kind: AggregateTotalKind,
+        count: &mut AggregateCount<'_, E>,
+        path: &Path,
+        write_to: &mut dyn Sink<Error = E>,
+    ) -> Result<SearchPathTotalOutcome, E>
+    where
+        E: SinkError,
+    {
+        let mut file = File::open(path).map_err(E::error_io)?;
+        if let Some(mmap) = self.config.mmap.open(&file, Some(path)) {
+            if self.slice_needs_transcoding(&mmap) {
+                log::trace!(
+                    "{path:?}: aggregate mmap needs transcoding, using generic reader"
+                );
+                let mut mapped_reader = &mmap[..];
+                self.search_reader_total(
+                    kind,
+                    AggregateTotalSource::Path,
+                    count,
+                    &mut mapped_reader,
+                    write_to,
+                )?;
+                return Ok(SearchPathTotalOutcome(None));
+            }
+            log::trace!("{path:?}: reducing aggregate via memory map");
+            let outcome = self.search_slice_total(
+                kind,
+                AggregateTotalSource::Path,
+                count,
+                &mmap,
+                write_to,
+            )?;
+            return Ok(match outcome {
+                SliceTotalOutcome::Completed => SearchPathTotalOutcome(None),
+                SliceTotalOutcome::Canonical => {
+                    SearchPathTotalOutcome(Some(mmap))
+                }
+            });
+        }
+        log::trace!("{path:?}: reducing aggregate via generic reader");
+        self.search_reader_total(
+            kind,
+            AggregateTotalSource::Path,
+            count,
+            &mut file,
+            write_to,
+        )?;
+        Ok(SearchPathTotalOutcome(None))
+    }
+
+    #[inline(never)]
+    fn search_slice_total<E>(
+        &mut self,
+        kind: AggregateTotalKind,
+        source: AggregateTotalSource,
+        count: &mut AggregateCount<'_, E>,
+        slice: &[u8],
+        write_to: &mut dyn Sink<Error = E>,
+    ) -> Result<SliceTotalOutcome, E>
+    where
+        E: SinkError,
+    {
+        let detection = self.binary_detection();
+        let convert_after_initial_probe = detection
+            .convert_byte()
+            .and_then(|byte| slice.find_byte(byte))
+            .is_some_and(|offset| {
+                offset >= std::cmp::min(slice.len(), DEFAULT_BUFFER_CAPACITY)
+            });
+        if detection.quit_byte().is_some() || convert_after_initial_probe {
+            log::trace!(
+                "aggregate mmap requires canonical slice binary handling"
+            );
+            return Ok(SliceTotalOutcome::Canonical);
+        }
+        SliceAggregate::new(
+            self,
+            0_u64,
+            move |total: &mut u64, buf: &[u8]| {
+                kind.reduce(source, count, total, buf)
+            },
+            slice,
+            write_to,
+        )
+        .run(move |sink, searcher, total| {
+            kind.publish(&mut **sink, searcher, total)
+        })
+        .map(|()| SliceTotalOutcome::Completed)
+    }
+
     /// Count selected matches in each stable LF-bounded reader buffer.
     ///
     /// The callback must come from a construction receipt proving positive
@@ -1056,21 +1357,18 @@ impl Searcher {
             ));
         }
 
+        let mut read_from = read_from;
         let mut count = count;
-        self.search_reader_aggregate(
-            0_u64,
-            move |total: &mut u64, buf: &[u8]| {
-                let count = count(buf).map_err(S::Error::error_message)?;
-                *total = total.checked_add(count).ok_or_else(|| {
-                    S::Error::error_message(
-                        "selected-match total overflowed while reading",
-                    )
-                })?;
-                Ok(())
-            },
-            read_from,
-            write_to,
-            |sink, searcher, total| sink.selected_match_total(searcher, total),
+        let mut count = move |buf: &[u8]| {
+            count(buf).map_err(S::Error::error_message)
+        };
+        let mut write_to = write_to;
+        self.search_reader_total(
+            AggregateTotalKind::SelectedMatches,
+            AggregateTotalSource::Reader,
+            &mut count,
+            &mut read_from,
+            &mut write_to,
         )
     }
 
@@ -1098,48 +1396,53 @@ impl Searcher {
             ));
         }
 
+        let mut read_from = read_from;
         let mut count = count;
-        self.search_reader_aggregate(
-            0_u64,
-            move |total: &mut u64, buf: &[u8]| {
-                let count = count(buf).map_err(S::Error::error_message)?;
-                *total = total.checked_add(count).ok_or_else(|| {
-                    S::Error::error_message(
-                        "matching-line total overflowed while reading",
-                    )
-                })?;
-                Ok(())
-            },
-            read_from,
-            write_to,
-            |sink, searcher, total| sink.matching_line_total(searcher, total),
+        let mut count = move |buf: &[u8]| {
+            count(buf).map_err(S::Error::error_message)
+        };
+        let mut write_to = write_to;
+        self.search_reader_total(
+            AggregateTotalKind::MatchingLines,
+            AggregateTotalSource::Reader,
+            &mut count,
+            &mut read_from,
+            &mut write_to,
         )
     }
 
-    fn search_reader_aggregate<A, C, F, R, S>(
+    #[inline(never)]
+    fn search_reader_total<E>(
         &mut self,
-        aggregate: A,
-        reduce: C,
-        read_from: R,
-        write_to: S,
-        finish: F,
-    ) -> Result<(), S::Error>
+        kind: AggregateTotalKind,
+        source: AggregateTotalSource,
+        count: &mut AggregateCount<'_, E>,
+        read_from: &mut dyn io::Read,
+        write_to: &mut dyn Sink<Error = E>,
+    ) -> Result<(), E>
     where
-        C: FnMut(&mut A, &[u8]) -> Result<(), S::Error>,
-        F: FnOnce(&mut S, &Searcher, A) -> Result<(), S::Error>,
-        R: io::Read,
-        S: Sink,
+        E: SinkError,
     {
         let mut decode_buffer = self.decode_buffer.borrow_mut();
         let decoder = self
             .decode_builder
             .build_with_buffer(read_from, &mut *decode_buffer)
-            .map_err(S::Error::error_io)?;
+            .map_err(E::error_io)?;
         let mut line_buffer = self.line_buffer.borrow_mut();
         let rdr = LineBufferReader::new(decoder, &mut *line_buffer);
         log::trace!("generic reader: reducing via roll buffer strategy");
-        ReadByLineAggregate::new(self, aggregate, reduce, rdr, write_to)
-            .run(finish)
+        ReadByLineAggregate::new(
+            self,
+            0_u64,
+            move |total: &mut u64, buf: &[u8]| {
+                kind.reduce(source, count, total, buf)
+            },
+            rdr,
+            write_to,
+        )
+        .run(move |sink, searcher, total| {
+            kind.publish(&mut **sink, searcher, total)
+        })
     }
 
     /// Whether this configuration admits authenticated reader match totals.
@@ -1161,7 +1464,18 @@ impl Searcher {
     #[inline]
     pub fn supports_selected_match_total_path(&self) -> bool {
         self.supports_selected_match_total_reader()
-            && (cfg!(target_os = "macos") || !self.config.mmap.is_enabled())
+            && !self.selected_match_total_path_uses_mmap()
+    }
+
+    /// Whether an admitted authenticated file-path total should try mmap.
+    ///
+    /// Callers must first establish
+    /// [`Searcher::supports_selected_match_total_reader`].
+    #[doc(hidden)]
+    #[inline]
+    pub fn selected_match_total_path_uses_mmap(&self) -> bool {
+        !cfg!(target_os = "macos")
+            && self.config.mmap.is_enabled()
     }
 }
 
@@ -1182,12 +1496,54 @@ fn slice_has_bom(slice: &[u8]) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use std::io;
+    use std::{
+        fs::OpenOptions,
+        io,
+        path::PathBuf,
+        sync::atomic::{AtomicUsize, Ordering},
+    };
 
     use crate::testutil::{KitchenSink, RegexMatcher};
-    use crate::{Sink, SinkMatch};
+    use crate::{Sink, SinkFinish, SinkMatch};
 
     use super::*;
+
+    static NEXT_TEMP_FILE: AtomicUsize = AtomicUsize::new(0);
+
+    struct TempFile(PathBuf);
+
+    impl TempFile {
+        fn empty() -> Self {
+            loop {
+                let ordinal = NEXT_TEMP_FILE.fetch_add(1, Ordering::Relaxed);
+                let path = std::env::temp_dir().join(format!(
+                    "grep-searcher-mmap-total-{}-{ordinal}",
+                    std::process::id(),
+                ));
+                match OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(&path)
+                {
+                    Ok(_) => return Self(path),
+                    Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+                    Err(error) => {
+                        panic!("failed to create empty mmap test file: {error}")
+                    }
+                }
+            }
+        }
+
+        fn path(&self) -> &std::path::Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TempFile {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
 
     #[derive(Default)]
     struct MatchTotalSink {
@@ -1195,6 +1551,11 @@ mod tests {
         total: Option<u64>,
         matching_lines: Option<u64>,
         stop_on_binary: bool,
+        stop_at_begin: bool,
+        reject_total: bool,
+        binary_offsets: Vec<u64>,
+        finish: Option<(u64, Option<u64>)>,
+        events: Vec<&'static str>,
     }
 
     impl Sink for MatchTotalSink {
@@ -1205,6 +1566,7 @@ mod tests {
             _searcher: &Searcher,
             _mat: &SinkMatch<'_>,
         ) -> Result<bool, Self::Error> {
+            self.events.push("matched");
             self.matched += 1;
             Ok(true)
         }
@@ -1214,6 +1576,10 @@ mod tests {
             _searcher: &Searcher,
             total: u64,
         ) -> Result<(), Self::Error> {
+            self.events.push("total");
+            if self.reject_total {
+                return Err(io::Error::other("selected total rejected"));
+            }
             self.total = Some(total);
             Ok(())
         }
@@ -1223,6 +1589,7 @@ mod tests {
             _searcher: &Searcher,
             total: u64,
         ) -> Result<(), Self::Error> {
+            self.events.push("matching-lines");
             self.matching_lines = Some(total);
             Ok(())
         }
@@ -1230,9 +1597,32 @@ mod tests {
         fn binary_data(
             &mut self,
             _searcher: &Searcher,
-            _binary_byte_offset: u64,
+            binary_byte_offset: u64,
         ) -> Result<bool, Self::Error> {
+            self.events.push("binary");
+            self.binary_offsets.push(binary_byte_offset);
             Ok(!self.stop_on_binary)
+        }
+
+        fn begin(
+            &mut self,
+            _searcher: &Searcher,
+        ) -> Result<bool, Self::Error> {
+            self.events.push("begin");
+            Ok(!self.stop_at_begin)
+        }
+
+        fn finish(
+            &mut self,
+            _searcher: &Searcher,
+            finish: &SinkFinish,
+        ) -> Result<(), Self::Error> {
+            self.events.push("finish");
+            self.finish = Some((
+                finish.byte_count(),
+                finish.binary_byte_offset(),
+            ));
+            Ok(())
         }
     }
 
@@ -1295,6 +1685,40 @@ mod tests {
     }
 
     #[test]
+    fn aggregate_total_overflow_messages_are_stable() {
+        for (kind, source, message) in [
+            (
+                AggregateTotalKind::SelectedMatches,
+                AggregateTotalSource::Path,
+                "selected-match total overflowed while searching a path",
+            ),
+            (
+                AggregateTotalKind::MatchingLines,
+                AggregateTotalSource::Path,
+                "matching-line total overflowed while searching a path",
+            ),
+            (
+                AggregateTotalKind::SelectedMatches,
+                AggregateTotalSource::Reader,
+                "selected-match total overflowed while reading",
+            ),
+            (
+                AggregateTotalKind::MatchingLines,
+                AggregateTotalSource::Reader,
+                "matching-line total overflowed while reading",
+            ),
+        ] {
+            let mut count = |_: &[u8]| Ok::<u64, io::Error>(1);
+            let mut total = u64::MAX;
+            let error = kind
+                .reduce(source, &mut count, &mut total, b"x")
+                .unwrap_err();
+            assert_eq!(error.to_string(), message);
+            assert_eq!(total, u64::MAX);
+        }
+    }
+
+    #[test]
     fn selected_match_total_reader_is_separate_and_authoritative() {
         let mut sink = MatchTotalSink::default();
         SearcherBuilder::new()
@@ -1312,6 +1736,7 @@ mod tests {
             )
             .unwrap();
         assert_eq!(sink.total, Some(2));
+        assert_eq!(sink.matching_lines, None);
         assert_eq!(sink.matched, 0);
 
         let mut lines = MatchTotalSink::default();
@@ -1330,6 +1755,7 @@ mod tests {
                 &mut lines,
             )
             .unwrap();
+        assert_eq!(lines.total, None);
         assert_eq!(lines.matching_lines, Some(2));
         assert_eq!(lines.matched, 0);
 
@@ -1411,10 +1837,548 @@ mod tests {
     }
 
     #[test]
+    fn selected_match_total_slice_publishes_only_a_clean_reduction() {
+        let searcher = Searcher::new();
+        let mut sink = MatchTotalSink::default();
+        let mut calls = 0_usize;
+        SliceAggregate::new(
+            &searcher,
+            0_u64,
+            |total: &mut u64, buf: &[u8]| {
+                calls += 1;
+                *total += buf.iter().filter(|&&byte| byte == b'a').count()
+                    as u64;
+                Ok::<(), io::Error>(())
+            },
+            b"a\nb\na",
+            &mut sink,
+        )
+        .run(|sink, searcher, total| {
+            sink.selected_match_total(searcher, total)
+        })
+        .unwrap();
+        assert_eq!(calls, 1);
+        assert_eq!(sink.total, Some(2));
+        assert_eq!(sink.matched, 0);
+        assert_eq!(sink.binary_offsets, Vec::<u64>::new());
+        assert_eq!(sink.finish, Some((5, None)));
+        assert_eq!(sink.events, vec!["begin", "total", "finish"]);
+
+        let mut empty = MatchTotalSink::default();
+        let mut empty_calls = 0_usize;
+        SliceAggregate::new(
+            &searcher,
+            0_u64,
+            |_: &mut u64, _: &[u8]| {
+                empty_calls += 1;
+                Ok::<(), io::Error>(())
+            },
+            b"",
+            &mut empty,
+        )
+        .run(|sink, searcher, total| {
+            sink.selected_match_total(searcher, total)
+        })
+        .unwrap();
+        assert_eq!(empty_calls, 0);
+        assert_eq!(empty.total, Some(0));
+        assert_eq!(empty.finish, Some((0, None)));
+        assert_eq!(empty.events, vec!["begin", "total", "finish"]);
+
+        let mut failed = MatchTotalSink::default();
+        let result = SliceAggregate::new(
+            &searcher,
+            0_u64,
+            |_: &mut u64, _: &[u8]| {
+                Err::<(), _>(io::Error::other("authoritative slice failure"))
+            },
+            b"a\n",
+            &mut failed,
+        )
+        .run(|sink, searcher, total| {
+            sink.selected_match_total(searcher, total)
+        });
+        assert!(result.is_err());
+        assert_eq!(failed.total, None);
+        assert_eq!(failed.finish, None);
+        assert_eq!(failed.events, vec!["begin"]);
+    }
+
+    #[test]
+    fn selected_match_total_slice_preserves_initial_binary_lifecycle() {
+        let convert = SearcherBuilder::new()
+            .binary_detection(BinaryDetection::convert(b'\0'))
+            .build();
+        let mut converted = MatchTotalSink::default();
+        SliceAggregate::new(
+            &convert,
+            0_u64,
+            |total: &mut u64, buf: &[u8]| {
+                *total = buf.iter().filter(|&&byte| byte == b'a').count()
+                    as u64;
+                Ok::<(), io::Error>(())
+            },
+            b"a\0a\n",
+            &mut converted,
+        )
+        .run(|sink, searcher, total| {
+            sink.selected_match_total(searcher, total)
+        })
+        .unwrap();
+        assert_eq!(converted.total, Some(2));
+        assert_eq!(converted.binary_offsets, vec![1]);
+        assert_eq!(converted.finish, Some((1, Some(1))));
+
+        let quit = SearcherBuilder::new()
+            .binary_detection(BinaryDetection::quit(b'\0'))
+            .build();
+        let mut quit_sink = MatchTotalSink::default();
+        let mut reduced = false;
+        SliceAggregate::new(
+            &quit,
+            0_u64,
+            |_: &mut u64, _: &[u8]| {
+                reduced = true;
+                Ok::<(), io::Error>(())
+            },
+            b"a\0a\n",
+            &mut quit_sink,
+        )
+        .run(|sink, searcher, total| {
+            sink.selected_match_total(searcher, total)
+        })
+        .unwrap();
+        assert!(!reduced);
+        assert_eq!(quit_sink.total, None);
+        assert_eq!(quit_sink.binary_offsets, vec![1]);
+        assert_eq!(quit_sink.finish, Some((0, Some(1))));
+
+        let mut stopped = MatchTotalSink {
+            stop_on_binary: true,
+            ..MatchTotalSink::default()
+        };
+        SliceAggregate::new(
+            &convert,
+            0_u64,
+            |_: &mut u64, _: &[u8]| {
+                panic!("a sink-stopped binary slice must not be reduced")
+            },
+            b"a\0a\n",
+            &mut stopped,
+        )
+        .run(|sink, searcher, total| {
+            sink.selected_match_total(searcher, total)
+        })
+        .unwrap();
+        assert_eq!(stopped.total, None);
+        assert_eq!(stopped.finish, Some((0, Some(1))));
+    }
+
+    #[test]
+    fn selected_match_total_raw_slice_admission_is_exact() {
+        fn haystack_with_binary_line(
+            offset: usize,
+            line_matches: bool,
+        ) -> Vec<u8> {
+            assert!(offset > 0);
+            let mut haystack = vec![b'x'; offset + 2];
+            if line_matches {
+                haystack[offset - 1] = b'a';
+            }
+            haystack[offset] = b'\0';
+            haystack[offset + 1] = b'\n';
+            haystack
+        }
+
+        let convert = SearcherBuilder::new()
+            .binary_detection(BinaryDetection::convert(b'\0'))
+            .build();
+
+        let mut absent_searcher = convert.clone();
+        let mut absent = MatchTotalSink::default();
+        let mut absent_reductions = 0_usize;
+        let outcome = absent_searcher
+            .search_slice_total(
+                AggregateTotalKind::SelectedMatches,
+                AggregateTotalSource::Path,
+                &mut |buf: &[u8]| {
+                    absent_reductions += 1;
+                    Ok::<u64, io::Error>(
+                        buf.iter().filter(|&&byte| byte == b'a').count()
+                            as u64,
+                    )
+                },
+                b"a\nx\n",
+                &mut absent,
+            )
+            .unwrap();
+        assert_eq!(outcome, SliceTotalOutcome::Completed);
+        assert_eq!(absent_reductions, 1);
+        assert_eq!(absent.total, Some(1));
+        assert_eq!(absent.matched, 0);
+        assert_eq!(absent.finish, Some((4, None)));
+
+        let mut initial_searcher = convert.clone();
+        let mut initial = MatchTotalSink::default();
+        let mut initial_reductions = 0_usize;
+        let outcome = initial_searcher
+            .search_slice_total(
+                AggregateTotalKind::SelectedMatches,
+                AggregateTotalSource::Path,
+                &mut |buf: &[u8]| {
+                    initial_reductions += 1;
+                    Ok::<u64, io::Error>(
+                        buf.iter().filter(|&&byte| byte == b'a').count()
+                            as u64,
+                    )
+                },
+                b"a\0\n",
+                &mut initial,
+            )
+            .unwrap();
+        assert_eq!(outcome, SliceTotalOutcome::Completed);
+        assert_eq!(initial_reductions, 1);
+        assert_eq!(initial.total, Some(1));
+        assert_eq!(initial.matched, 0);
+        assert_eq!(initial.binary_offsets, vec![1]);
+        assert_eq!(initial.finish, Some((1, Some(1))));
+
+        for offset in [
+            DEFAULT_BUFFER_CAPACITY,
+            DEFAULT_BUFFER_CAPACITY + 17,
+        ] {
+            let mut matching_searcher = convert.clone();
+            let matching_haystack =
+                haystack_with_binary_line(offset, true);
+            let mut matching = MatchTotalSink::default();
+            let mut matching_reductions = 0_usize;
+            let outcome = matching_searcher
+                .search_slice_total(
+                    AggregateTotalKind::SelectedMatches,
+                    AggregateTotalSource::Path,
+                    &mut |_: &[u8]| {
+                        matching_reductions += 1;
+                        Ok::<u64, io::Error>(0)
+                    },
+                    &matching_haystack,
+                    &mut matching,
+                )
+                .unwrap();
+            assert_eq!(outcome, SliceTotalOutcome::Canonical);
+            assert_eq!(matching_reductions, 0);
+            assert_eq!(matching.total, None);
+            assert_eq!(matching.matched, 0);
+            assert!(matching.binary_offsets.is_empty());
+            assert_eq!(matching.finish, None);
+            assert!(matching.events.is_empty());
+            matching_searcher
+                .search_slice(
+                    RegexMatcher::new("a"),
+                    &matching_haystack,
+                    &mut matching,
+                )
+                .unwrap();
+            assert_eq!(matching.matched, 1);
+            assert_eq!(matching.binary_offsets, vec![offset as u64]);
+            assert_eq!(
+                matching.finish,
+                Some((offset as u64, Some(offset as u64))),
+            );
+
+            let mut unmatched_searcher = convert.clone();
+            let mut unmatched_haystack =
+                haystack_with_binary_line(offset, false);
+            unmatched_haystack.extend_from_slice(b"a\n");
+            let mut unmatched = MatchTotalSink::default();
+            let mut unmatched_reductions = 0_usize;
+            let outcome = unmatched_searcher
+                .search_slice_total(
+                    AggregateTotalKind::SelectedMatches,
+                    AggregateTotalSource::Path,
+                    &mut |_: &[u8]| {
+                        unmatched_reductions += 1;
+                        Ok::<u64, io::Error>(0)
+                    },
+                    &unmatched_haystack,
+                    &mut unmatched,
+                )
+                .unwrap();
+            assert_eq!(outcome, SliceTotalOutcome::Canonical);
+            assert_eq!(unmatched_reductions, 0);
+            assert_eq!(unmatched.total, None);
+            assert_eq!(unmatched.matched, 0);
+            assert!(unmatched.binary_offsets.is_empty());
+            assert_eq!(unmatched.finish, None);
+            assert!(unmatched.events.is_empty());
+            unmatched_searcher
+                .search_slice(
+                    RegexMatcher::new("a"),
+                    &unmatched_haystack,
+                    &mut unmatched,
+                )
+                .unwrap();
+            assert_eq!(unmatched.matched, 1);
+            assert_eq!(unmatched.binary_offsets, Vec::<u64>::new());
+            assert_eq!(
+                unmatched.finish,
+                Some((unmatched_haystack.len() as u64, None)),
+            );
+        }
+    }
+
+    #[test]
+    fn selected_match_total_raw_slice_keeps_quit_canonical() {
+        let mut searcher = SearcherBuilder::new()
+            .binary_detection(BinaryDetection::quit(b'\0'))
+            .build();
+        let offset = DEFAULT_BUFFER_CAPACITY + 11;
+        let mut haystack = vec![b'x'; offset + 2];
+        haystack[offset - 1] = b'a';
+        haystack[offset] = b'\0';
+        haystack[offset + 1] = b'\n';
+        let mut sink = MatchTotalSink::default();
+        let mut reductions = 0_usize;
+        let outcome = searcher
+            .search_slice_total(
+                AggregateTotalKind::SelectedMatches,
+                AggregateTotalSource::Path,
+                &mut |_: &[u8]| {
+                    reductions += 1;
+                    Ok::<u64, io::Error>(0)
+                },
+                &haystack,
+                &mut sink,
+            )
+            .unwrap();
+        assert_eq!(outcome, SliceTotalOutcome::Canonical);
+        assert_eq!(reductions, 0);
+        assert_eq!(sink.total, None);
+        assert_eq!(sink.matched, 0);
+        assert!(sink.binary_offsets.is_empty());
+        assert_eq!(sink.finish, None);
+        assert!(sink.events.is_empty());
+        searcher
+            .search_slice(RegexMatcher::new("a"), &haystack, &mut sink)
+            .unwrap();
+        assert_eq!(sink.total, None);
+        assert!(!sink.events.contains(&"total"));
+        assert_eq!(sink.matched, 0);
+        assert_eq!(sink.binary_offsets, vec![offset as u64]);
+        assert_eq!(
+            sink.finish,
+            Some((offset as u64, Some(offset as u64))),
+        );
+    }
+
+    #[test]
+    fn matching_line_total_raw_slice_fallback_is_canonical() {
+        let mut aggregate_searcher = Searcher::new();
+        let mut aggregate = MatchTotalSink::default();
+        let mut aggregate_reductions = 0_usize;
+        let outcome = aggregate_searcher
+            .search_slice_total(
+                AggregateTotalKind::MatchingLines,
+                AggregateTotalSource::Path,
+                &mut |buf: &[u8]| {
+                    aggregate_reductions += 1;
+                    Ok::<u64, io::Error>(
+                        buf.split_inclusive(|&byte| byte == b'\n')
+                            .filter(|line| line.contains(&b'a'))
+                            .count() as u64,
+                    )
+                },
+                b"a\nb\na\n",
+                &mut aggregate,
+            )
+            .unwrap();
+        assert_eq!(outcome, SliceTotalOutcome::Completed);
+        assert_eq!(aggregate_reductions, 1);
+        assert_eq!(aggregate.total, None);
+        assert_eq!(aggregate.matching_lines, Some(2));
+        assert_eq!(aggregate.matched, 0);
+        assert_eq!(aggregate.finish, Some((6, None)));
+
+        let mut searcher = SearcherBuilder::new()
+            .binary_detection(BinaryDetection::convert(b'\0'))
+            .build();
+        let offset = DEFAULT_BUFFER_CAPACITY + 7;
+        let mut haystack = vec![b'x'; offset + 2];
+        haystack[offset - 1] = b'a';
+        haystack[offset] = b'\0';
+        haystack[offset + 1] = b'\n';
+        let mut sink = MatchTotalSink::default();
+        let mut reductions = 0_usize;
+        let outcome = searcher
+            .search_slice_total(
+                AggregateTotalKind::MatchingLines,
+                AggregateTotalSource::Path,
+                &mut |_: &[u8]| {
+                    reductions += 1;
+                    Ok::<u64, io::Error>(0)
+                },
+                &haystack,
+                &mut sink,
+            )
+            .unwrap();
+        assert_eq!(outcome, SliceTotalOutcome::Canonical);
+        assert_eq!(reductions, 0);
+        assert_eq!(sink.total, None);
+        assert_eq!(sink.matching_lines, None);
+        assert_eq!(sink.matched, 0);
+        assert!(sink.binary_offsets.is_empty());
+        assert_eq!(sink.finish, None);
+        assert!(sink.events.is_empty());
+        searcher
+            .search_slice(RegexMatcher::new("a"), &haystack, &mut sink)
+            .unwrap();
+        assert!(!sink.events.contains(&"total"));
+        assert!(!sink.events.contains(&"matching-lines"));
+        assert_eq!(sink.matched, 1);
+        assert_eq!(sink.binary_offsets, vec![offset as u64]);
+        assert_eq!(
+            sink.finish,
+            Some((offset as u64, Some(offset as u64))),
+        );
+    }
+
+    #[test]
+    fn selected_match_total_raw_slice_preserves_sink_boundaries() {
+        let mut begin_searcher = Searcher::new();
+        let mut begin_stopped = MatchTotalSink {
+            stop_at_begin: true,
+            ..MatchTotalSink::default()
+        };
+        let mut reduced = false;
+        let outcome = begin_searcher
+            .search_slice_total(
+                AggregateTotalKind::SelectedMatches,
+                AggregateTotalSource::Path,
+                &mut |_: &[u8]| {
+                    reduced = true;
+                    Ok::<u64, io::Error>(0)
+                },
+                b"a\n",
+                &mut begin_stopped,
+            )
+            .unwrap();
+        assert_eq!(outcome, SliceTotalOutcome::Completed);
+        assert!(!reduced);
+        assert_eq!(begin_stopped.total, None);
+        assert_eq!(begin_stopped.finish, Some((0, None)));
+
+        let mut reject_searcher = Searcher::new();
+        let mut rejected = MatchTotalSink {
+            reject_total: true,
+            ..MatchTotalSink::default()
+        };
+        let result = reject_searcher.search_slice_total(
+            AggregateTotalKind::SelectedMatches,
+            AggregateTotalSource::Path,
+            &mut |_: &[u8]| Ok::<u64, io::Error>(1),
+            b"a\n",
+            &mut rejected,
+        );
+        assert!(result.is_err());
+        assert_eq!(rejected.total, None);
+        assert_eq!(rejected.finish, None);
+    }
+
+    #[test]
+    fn selected_match_total_path_retains_reader_on_mmap_unavailable() {
+        // An empty regular file cannot produce a nonempty file-backed map.
+        // On platforms where mmap is categorically unavailable this exercises
+        // the same `MmapChoice::open` refusal. Either way, the already-opened
+        // file is handed directly to the authenticated reader aggregate.
+        let file = TempFile::empty();
+        let mut builder = SearcherBuilder::new();
+        builder.memory_map(unsafe { MmapChoice::auto() });
+        let mut searcher = builder.build();
+        let mut sink = MatchTotalSink::default();
+        let mut reductions = 0_usize;
+        let outcome = searcher
+            .search_path_selected_match_total(
+                |_: &[u8]| {
+                    reductions += 1;
+                    Ok::<u64, io::Error>(1)
+                },
+                file.path(),
+                &mut sink,
+            )
+            .unwrap();
+        assert!(outcome.canonical_bytes().is_none());
+        assert_eq!(reductions, 0);
+        assert_eq!(sink.total, Some(0));
+        assert_eq!(sink.matched, 0);
+        assert_eq!(sink.finish, Some((0, None)));
+        assert_eq!(sink.events, vec!["begin", "total", "finish"]);
+    }
+
+    #[cfg(all(unix, not(target_os = "macos")))]
+    #[test]
+    fn selected_match_total_path_retains_mmap_for_canonical_search() {
+        let offset = DEFAULT_BUFFER_CAPACITY + 11;
+        let mut haystack = vec![b'x'; offset + 2];
+        haystack[offset - 1] = b'a';
+        haystack[offset] = b'\0';
+        haystack[offset + 1] = b'\n';
+
+        let file = TempFile::empty();
+        std::fs::write(file.path(), &haystack).unwrap();
+        let mut builder = SearcherBuilder::new();
+        builder
+            .memory_map(unsafe { MmapChoice::auto() })
+            .binary_detection(BinaryDetection::convert(b'\0'));
+        let mut searcher = builder.build();
+        let matcher = RegexMatcher::new("a");
+        let mut sink = MatchTotalSink::default();
+        let mut reductions = 0_usize;
+        let outcome = searcher
+            .search_path_selected_match_total(
+                |buf: &[u8]| {
+                    reductions += 1;
+                    Ok::<u64, io::Error>(
+                        buf.iter().filter(|&&byte| byte == b'a').count()
+                            as u64,
+                    )
+                },
+                file.path(),
+                &mut sink,
+            )
+            .unwrap();
+
+        let canonical = outcome
+            .canonical_bytes()
+            .expect("nonempty Unix file should retain a real memory map");
+        assert_eq!(canonical, haystack.as_slice());
+        assert_eq!(reductions, 0);
+        assert_eq!(sink.total, None);
+        assert_eq!(sink.matched, 0);
+        assert!(sink.binary_offsets.is_empty());
+        assert_eq!(sink.finish, None);
+        assert!(sink.events.is_empty());
+
+        std::fs::remove_file(file.path()).unwrap();
+        assert!(!file.path().exists());
+        searcher.search_slice(&matcher, canonical, &mut sink).unwrap();
+        assert_eq!(sink.total, None);
+        assert_eq!(sink.matched, 1);
+        assert_eq!(sink.binary_offsets, vec![offset as u64]);
+        assert_eq!(
+            sink.finish,
+            Some((offset as u64, Some(offset as u64))),
+        );
+        assert_eq!(
+            sink.events,
+            vec!["begin", "binary", "matched", "finish"],
+        );
+    }
+
+    #[test]
     fn selected_match_total_gates_mmap_and_stateful_modes() {
         let plain = Searcher::new();
         assert!(plain.supports_selected_match_total_reader());
         assert!(plain.supports_selected_match_total_path());
+        assert!(!plain.selected_match_total_path_uses_mmap());
 
         let mut mmap_builder = SearcherBuilder::new();
         mmap_builder.memory_map(unsafe { MmapChoice::auto() });
@@ -1423,6 +2387,21 @@ mod tests {
         assert_eq!(
             mmap.supports_selected_match_total_path(),
             cfg!(target_os = "macos"),
+        );
+        assert_eq!(
+            mmap.selected_match_total_path_uses_mmap(),
+            !cfg!(target_os = "macos"),
+        );
+
+        let mut mmap_quit_builder = SearcherBuilder::new();
+        mmap_quit_builder
+            .memory_map(unsafe { MmapChoice::auto() })
+            .binary_detection(BinaryDetection::quit(b'\0'));
+        assert_eq!(
+            mmap_quit_builder
+                .build()
+                .selected_match_total_path_uses_mmap(),
+            !cfg!(target_os = "macos"),
         );
 
         let limited = SearcherBuilder::new().max_matches(Some(1)).build();

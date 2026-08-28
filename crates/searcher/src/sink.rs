@@ -263,7 +263,7 @@ pub trait Sink {
     }
 }
 
-impl<'a, S: Sink> Sink for &'a mut S {
+impl<'a, S: Sink + ?Sized> Sink for &'a mut S {
     type Error = S::Error;
 
     #[inline]

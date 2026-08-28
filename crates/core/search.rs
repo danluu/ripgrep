@@ -863,14 +863,29 @@ fn search_path_fre<W: WriteColor>(
         if p.accepts_matching_line_total()
             && let Some(receipt) =
                 matcher.exact_lf_matching_line_count_receipt()
-            && searcher.supports_selected_match_total_path()
+            && searcher.supports_selected_match_total_reader()
         {
-            let mut sink = p.sink_with_path(matcher, path);
-            searcher.search_reader_matching_line_total(
+            if !searcher.selected_match_total_path_uses_mmap() {
+                let mut sink = p.sink_with_path(matcher, path);
+                searcher.search_reader_matching_line_total(
+                    |buf| matcher.count_exact_lf_matching_lines(receipt, buf),
+                    std::fs::File::open(path)?,
+                    &mut sink,
+                )?;
+                return Ok(SearchResult {
+                    has_match: sink.has_match(),
+                    stats: sink.stats().cloned(),
+                });
+            }
+            let mut sink = p.sink_with_path(&matcher, path);
+            let outcome = searcher.search_path_matching_line_total(
                 |buf| matcher.count_exact_lf_matching_lines(receipt, buf),
-                std::fs::File::open(path)?,
+                path,
                 &mut sink,
             )?;
+            if let Some(bytes) = outcome.canonical_bytes() {
+                searcher.search_slice(&matcher, bytes, &mut sink)?;
+            }
             return Ok(SearchResult {
                 has_match: sink.has_match(),
                 stats: sink.stats().cloned(),
@@ -878,14 +893,29 @@ fn search_path_fre<W: WriteColor>(
         }
         if p.accepts_selected_match_total()
             && let Some(receipt) = matcher.exact_lf_match_count_receipt()
-            && searcher.supports_selected_match_total_path()
+            && searcher.supports_selected_match_total_reader()
         {
-            let mut sink = p.sink_with_path(matcher, path);
-            searcher.search_reader_selected_match_total(
+            if !searcher.selected_match_total_path_uses_mmap() {
+                let mut sink = p.sink_with_path(matcher, path);
+                searcher.search_reader_selected_match_total(
+                    |buf| matcher.count_exact_lf_matches(receipt, buf),
+                    std::fs::File::open(path)?,
+                    &mut sink,
+                )?;
+                return Ok(SearchResult {
+                    has_match: sink.has_match(),
+                    stats: sink.stats().cloned(),
+                });
+            }
+            let mut sink = p.sink_with_path(&matcher, path);
+            let outcome = searcher.search_path_selected_match_total(
                 |buf| matcher.count_exact_lf_matches(receipt, buf),
-                std::fs::File::open(path)?,
+                path,
                 &mut sink,
             )?;
+            if let Some(bytes) = outcome.canonical_bytes() {
+                searcher.search_slice(&matcher, bytes, &mut sink)?;
+            }
             return Ok(SearchResult {
                 has_match: sink.has_match(),
                 stats: sink.stats().cloned(),

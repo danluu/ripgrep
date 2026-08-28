@@ -1,3 +1,4 @@
+use bstr::ByteSlice;
 use grep_matcher::Matcher;
 
 use crate::{
@@ -97,6 +98,100 @@ where
 pub(crate) struct SliceByLine<'s, M, S> {
     core: Core<'s, M, S>,
     slice: &'s [u8],
+}
+
+/// Separate whole-slice reducer for authenticated LF-disjoint aggregates.
+///
+/// This mirrors the lifecycle of [`SliceByLine`] without constructing a
+/// matcher core. In particular, mapped input performs the same bounded binary
+/// probe before any search work, and only a complete reduction is published
+/// to the sink.
+#[derive(Debug)]
+pub(crate) struct SliceAggregate<'s, A, C, S> {
+    searcher: &'s Searcher,
+    aggregate: A,
+    reduce: C,
+    sink: S,
+    slice: &'s [u8],
+}
+
+impl<'s, A, C, S> SliceAggregate<'s, A, C, S>
+where
+    S: Sink,
+{
+    pub(crate) fn new(
+        searcher: &'s Searcher,
+        aggregate: A,
+        reduce: C,
+        slice: &'s [u8],
+        write_to: S,
+    ) -> SliceAggregate<'s, A, C, S> {
+        SliceAggregate {
+            searcher,
+            aggregate,
+            reduce,
+            sink: write_to,
+            slice,
+        }
+    }
+
+    #[inline(never)]
+    pub(crate) fn run<F>(mut self, finish: F) -> Result<(), S::Error>
+    where
+        C: FnMut(&mut A, &[u8]) -> Result<(), S::Error>,
+        F: FnOnce(&mut S, &Searcher, A) -> Result<(), S::Error>,
+    {
+        let mut byte_count = 0_u64;
+        let mut binary_byte_offset = None;
+        if self.sink.begin(self.searcher)? {
+            let binary_upto =
+                std::cmp::min(self.slice.len(), DEFAULT_BUFFER_CAPACITY);
+            let binary_byte = self
+                .searcher
+                .binary_detection()
+                .quit_byte()
+                .or_else(|| {
+                    self.searcher.binary_detection().convert_byte()
+                });
+            if let Some(byte) = binary_byte
+                && let Some(offset) = self.slice[..binary_upto].find_byte(byte)
+            {
+                let offset = offset as u64;
+                binary_byte_offset = Some(offset);
+                let keep_going =
+                    self.sink.binary_data(self.searcher, offset)?;
+                if !keep_going
+                    || self
+                        .searcher
+                        .binary_detection()
+                        .quit_byte()
+                        .is_some()
+                {
+                    return self.sink.finish(
+                        self.searcher,
+                        &SinkFinish {
+                            byte_count,
+                            binary_byte_offset,
+                        },
+                    );
+                }
+            }
+            // An empty reader reaches clean EOF without invoking its reducer.
+            // Preserve that boundary while still publishing the zero identity.
+            if !self.slice.is_empty() {
+                (self.reduce)(&mut self.aggregate, self.slice)?;
+            }
+            finish(&mut self.sink, self.searcher, self.aggregate)?;
+            byte_count = match binary_byte_offset {
+                Some(offset) if offset < self.slice.len() as u64 => offset,
+                _ => self.slice.len() as u64,
+            };
+        }
+        self.sink.finish(
+            self.searcher,
+            &SinkFinish { byte_count, binary_byte_offset },
+        )
+    }
 }
 
 impl<'s, M: Matcher, S: Sink> SliceByLine<'s, M, S> {

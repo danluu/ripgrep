@@ -87,7 +87,7 @@ pub use crate::{
     lines::{LineIter, LineStep},
     searcher::{
         BinaryDetection, ConfigError, Encoding, MmapChoice, Searcher,
-        SearcherBuilder,
+        SearchPathTotalOutcome, SearcherBuilder,
     },
     sink::{
         Sink, SinkContext, SinkContextKind, SinkError, SinkFinish, SinkMatch,
