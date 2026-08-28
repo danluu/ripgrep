@@ -172,7 +172,13 @@ impl RegexMatcherBuilder {
             .properties()
             .minimum_len()
             .map_or(false, |len| len > 0);
-        let regex = if configured.is_fre_standard_literal_handoff_config() {
+        let exact_literal_handoff =
+            configured.is_fre_standard_literal_handoff_config();
+        let exact_lf_matching_line_count = exact_literal_handoff
+            && matches_are_nonempty
+            && line_terminator == Some(LineTerminator::byte(b'\n'))
+            && non_matching_bytes.contains(b'\n');
+        let regex = if exact_literal_handoff {
             let hir = configured.into_hir();
             match self
                 .portable_builder(String::new(), true, line_terminator)
@@ -203,6 +209,7 @@ impl RegexMatcherBuilder {
             non_matching_bytes,
             matches_are_nonempty,
             exact_lf_match_count: false,
+            exact_lf_matching_line_count,
             selected_match_owner: SelectedMatchOwner::new(),
         })
     }
@@ -273,6 +280,7 @@ impl RegexMatcherBuilder {
                     non_matching_bytes,
                     matches_are_nonempty: true,
                     exact_lf_match_count,
+                    exact_lf_matching_line_count: exact_lf_match_count,
                     selected_match_owner: SelectedMatchOwner::new(),
                 });
             }
@@ -488,6 +496,7 @@ pub struct RegexMatcher {
     non_matching_bytes: ByteSet,
     matches_are_nonempty: bool,
     exact_lf_match_count: bool,
+    exact_lf_matching_line_count: bool,
     selected_match_owner: SelectedMatchOwner,
 }
 
@@ -507,8 +516,8 @@ impl RegexMatcher {
         let session = self.regex.ordinary_session()?;
         let exact_lf_match_count = self.exact_lf_match_count
             && session.supports_literal_set_selected_end_count();
-        let exact_lf_matching_line_count = self.exact_lf_match_count
-            && session.supports_compact_matching_lf_line_count();
+        let exact_lf_matching_line_count = self.exact_lf_matching_line_count
+            && session.supports_matching_lf_line_count();
         Ok(RegexMatcherWorker {
             session: RefCell::new(session),
             line_terminator: self.line_terminator,
@@ -534,6 +543,11 @@ pub struct ExactLfMatchCountReceipt {
 }
 
 /// Construction receipt for exact LF-delimited matching-line counts.
+///
+/// The configured HIR or typed literal census proves positive width and LF
+/// exclusion, while the bound FRE session proves that its selected ordinary
+/// plan exposes the matching-line endpoint reducer. The receipt contains no
+/// source and cannot be constructed outside this adapter.
 #[doc(hidden)]
 #[derive(Clone, Copy, Debug)]
 pub struct ExactLfMatchingLineCountReceipt {
@@ -3065,31 +3079,112 @@ mod tests {
         let receipt = worker
             .exact_lf_match_count_receipt()
             .expect("typed handoff receipt");
-        assert!(worker.exact_lf_matching_line_count_receipt().is_none());
+        let line_receipt = worker
+            .exact_lf_matching_line_count_receipt()
+            .expect("typed matching-line receipt");
         assert_eq!(
             worker.count_exact_lf_matches(receipt, b"ababa\nba\n").unwrap(),
             3,
         );
+        assert_eq!(
+            worker
+                .count_exact_lf_matching_lines(
+                    line_receipt,
+                    b"ababa\nba\n",
+                )
+                .unwrap(),
+            2,
+        );
 
         let single = builder.build("aba").expect("single literal matcher");
-        assert!(
-            single.worker().unwrap().exact_lf_match_count_receipt().is_none()
+        let single = single.worker().unwrap();
+        assert!(single.exact_lf_match_count_receipt().is_none());
+        let single_line = single
+            .exact_lf_matching_line_count_receipt()
+            .expect("configured exact literal retains its LF proof");
+        assert_eq!(
+            single
+                .count_exact_lf_matching_lines(
+                    single_line,
+                    b"abaaba\nmiss\naba",
+                )
+                .unwrap(),
+            2,
         );
         builder.case_insensitive(true);
         let folded = builder
             .build_many(&["aba", "ba"])
             .expect("folded fallback matcher");
-        assert!(
-            folded.worker().unwrap().exact_lf_match_count_receipt().is_none()
-        );
+        let folded = folded.worker().unwrap();
+        assert!(folded.exact_lf_match_count_receipt().is_none());
+        assert!(folded.exact_lf_matching_line_count_receipt().is_none());
 
         let mut nul = RegexMatcherBuilder::new();
         nul.multi_line(true).line_terminator(Some(b'\0'));
         let nul = nul
             .build_many(&["aba", "ba"])
             .expect("NUL-delimited typed literal matcher");
-        assert!(
-            nul.worker().unwrap().exact_lf_match_count_receipt().is_none()
+        let nul = nul.worker().unwrap();
+        assert!(nul.exact_lf_match_count_receipt().is_none());
+        assert!(nul.exact_lf_matching_line_count_receipt().is_none());
+    }
+
+    #[test]
+    fn exact_lf_matching_line_receipt_covers_packed_and_dfa_literal_sets() {
+        fn assert_count(factory: &RegexMatcher, haystack: &[u8], expected: u64) {
+            let worker = factory.worker().expect("ordinary FRE worker");
+            let receipt = worker
+                .exact_lf_matching_line_count_receipt()
+                .expect("authenticated matching-line receipt");
+            assert_eq!(
+                worker
+                    .count_exact_lf_matching_lines(receipt, haystack)
+                    .unwrap(),
+                expected,
+            );
+        }
+
+        let mut builder = RegexMatcherBuilder::new();
+        builder.multi_line(true);
+        let packed = builder
+            .build_many(&["alpha", "beta", "gamma"])
+            .expect("packed typed literal matcher");
+        assert_eq!(
+            packed.regex.build_report().plan,
+            PlanKind::PackedLiteralSet,
+        );
+        assert_count(
+            &packed,
+            b"alpha beta\nmiss\n\ngamma\nbetabeta",
+            3,
+        );
+
+        let uniform_patterns = (0..=128)
+            .map(|index| format!("p{index:03}"))
+            .collect::<Vec<_>>();
+        let uniform = builder
+            .build_many(&uniform_patterns)
+            .expect("uniform DFA typed literal matcher");
+        assert_eq!(uniform.regex.build_report().plan, PlanKind::LiteralSetDfa);
+        assert_count(
+            &uniform,
+            b"p000p001\nmiss\n\np128\np042",
+            3,
+        );
+
+        let mut nonuniform_patterns = uniform_patterns;
+        nonuniform_patterns[128].push('x');
+        let nonuniform = builder
+            .build_many(&nonuniform_patterns)
+            .expect("nonuniform DFA typed literal matcher");
+        assert_eq!(
+            nonuniform.regex.build_report().plan,
+            PlanKind::LiteralSetDfa,
+        );
+        assert_count(
+            &nonuniform,
+            b"p000p001\nmiss\n\np128x\np042",
+            3,
         );
     }
 
